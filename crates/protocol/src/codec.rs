@@ -260,10 +260,7 @@ fn validate_fields(frame: &Frame) -> Result<(), CodecError> {
             require(f::PUB_OUTCOME)?;
             let qos = frame.field(f::QOS).unwrap()[0];
             let outcome = frame.field(f::PUB_OUTCOME).unwrap()[0];
-            if (qos, outcome) != (0, 1)
-                && (qos, outcome) != (1, 2)
-                && (qos, outcome) != (2, 3)
-            {
+            if (qos, outcome) != (0, 1) && (qos, outcome) != (1, 2) && (qos, outcome) != (2, 3) {
                 return Err(CodecError::InvalidFieldValue(f::PUB_OUTCOME));
             }
             if qos != 0 {

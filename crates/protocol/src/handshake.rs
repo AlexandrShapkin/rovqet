@@ -48,7 +48,11 @@ pub fn negotiate_hello(
         return Err(NegotiationError::InvalidFrameLimit);
     }
     let mut capabilities = Vec::new();
-    for item in hello.fields.iter().filter(|item| item.id == field::CAPABILITIES) {
+    for item in hello
+        .fields
+        .iter()
+        .filter(|item| item.id == field::CAPABILITIES)
+    {
         let bytes: [u8; 4] = item.value.as_slice().try_into().map_err(|_| {
             NegotiationError::InvalidFields(CodecError::InvalidFieldValue(field::CAPABILITIES))
         })?;
@@ -75,16 +79,22 @@ mod tests {
 
     fn hello() -> Frame {
         let mut f = Frame::new(FrameType::Hello, 1);
-        f.fields.push(Field::required(field::PROTOCOL_MINOR, [0, 2]));
-        f.fields.push(Field::required(field::MAX_FRAME_BYTES, 10000_u32.to_be_bytes()));
+        f.fields
+            .push(Field::required(field::PROTOCOL_MINOR, [0, 2]));
+        f.fields.push(Field::required(
+            field::MAX_FRAME_BYTES,
+            10000_u32.to_be_bytes(),
+        ));
         f
     }
 
     #[test]
     fn negotiate_common_minor_limit_and_optional_caps() {
         let mut f = hello();
-        f.fields.push(Field::optional(field::CAPABILITIES, 11_u32.to_be_bytes()));
-        f.fields.push(Field::optional(field::CAPABILITIES, 99_u32.to_be_bytes()));
+        f.fields
+            .push(Field::optional(field::CAPABILITIES, 11_u32.to_be_bytes()));
+        f.fields
+            .push(Field::optional(field::CAPABILITIES, 99_u32.to_be_bytes()));
         assert_eq!(
             negotiate_hello(&f, 1, 5000, &[11]),
             Ok(Negotiated {
@@ -98,7 +108,8 @@ mod tests {
     #[test]
     fn reject_unknown_required_capability() {
         let mut f = hello();
-        f.fields.push(Field::required(field::CAPABILITIES, 99_u32.to_be_bytes()));
+        f.fields
+            .push(Field::required(field::CAPABILITIES, 99_u32.to_be_bytes()));
         assert_eq!(
             negotiate_hello(&f, 1, 5000, &[11]),
             Err(NegotiationError::MissingRequiredCapability(99))
@@ -109,7 +120,10 @@ mod tests {
     fn reject_non_hello_and_zero_limits() {
         let mut f = hello();
         f.frame_type = FrameType::Publish;
-        assert_eq!(negotiate_hello(&f, 0, 1000, &[]), Err(NegotiationError::NotHello));
+        assert_eq!(
+            negotiate_hello(&f, 0, 1000, &[]),
+            Err(NegotiationError::NotHello)
+        );
         f.frame_type = FrameType::Hello;
         assert_eq!(
             negotiate_hello(&f, 0, 0, &[]),
