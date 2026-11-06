@@ -1,0 +1,13 @@
+[package]
+name = "rovqet-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+rovqet-protocol = { path = "../protocol" }
+
+[lib]
+name = "rovqet_core"
+path = "src/lib.rs"

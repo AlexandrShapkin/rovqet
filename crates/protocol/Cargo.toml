@@ -1,0 +1,10 @@
+[package]
+name = "rovqet-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+name = "rovqet_protocol"
+path = "src/lib.rs"
