@@ -37,7 +37,7 @@ for source in files:
     in_fence = False
     for line in text.splitlines():
         stripped = line.lstrip()
-        if stripped.startswith(("```, "~~~")):
+        if stripped.startswith(("```", "~~~")):
             in_fence = not in_fence
             continue
         if in_fence:
