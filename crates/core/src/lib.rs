@@ -92,7 +92,10 @@ mod tests {
             log_incarnation: 42,
             sequence: 7,
         };
-        assert_ne!(PublishOutcome::Admitted, PublishOutcome::CommittedLocal(offset));
+        assert_ne!(
+            PublishOutcome::Admitted,
+            PublishOutcome::CommittedLocal(offset)
+        );
         assert_ne!(
             PublishOutcome::CommittedLocal(offset),
             PublishOutcome::CommittedQuorum(offset)
