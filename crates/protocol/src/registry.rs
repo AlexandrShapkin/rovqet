@@ -30,7 +30,7 @@ pub enum FrameType {
 impl TryFrom<u64> for FrameType {
     type Error = ();
 
-    fn try_from(value: u64) -> Result<Self, Self::Error> {
+    fn try_from(value: u64) -> Result<Self, ()> {
         use FrameType::*;
         Ok(match value {
             1 => Hello,
