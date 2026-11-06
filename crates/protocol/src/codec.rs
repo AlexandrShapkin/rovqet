@@ -4,10 +4,7 @@
 use std::collections::HashSet;
 
 use crate::registry::{FrameType, field};
-use crate::{
-    DEFAULT_MAX_PAYLOAD_BYTES, MAX_FRAME_BYTES, MAX_HEADER_BYTES,
-    WIRE_MAJOR_VERSION,
-};
+use crate::{DEFAULT_MAX_PAYLOAD_BYTES, MAX_FRAME_BYTES, MAX_HEADER_BYTES, WIRE_MAJOR_VERSION};
 
 const MAGIC: [u8; 2] = *b"RQ";
 const FLAG_CHECKSUM: u8 = 0x01;
@@ -155,19 +152,46 @@ fn validate_fields(frame: &Frame) -> Result<(), CodecError> {
         }
         let expected = match item.id {
             f::PROTOCOL_MINOR | f::ERROR_CODE | f::CLOSE_REASON => Some(2),
-            f::CAPABILITIES | f::MAX_FRAME_BYTES | f::HEARTBEAT_MS
-            | f::PARTITION_ID | f::TTL_MS | f::RETRY_AFTER_MS | f::MAX_MESSAGES
-            | f::MAX_BYTES | f::WAIT_MS | f::FLOW_CREDIT_MESSAGES
-            | f::FLOW_CREDIT_BYTES | f::DELIVERY_ATTEMPT | f::ACK_DEADLINE_MS
+            f::CAPABILITIES
+            | f::MAX_FRAME_BYTES
+            | f::HEARTBEAT_MS
+            | f::PARTITION_ID
+            | f::TTL_MS
+            | f::RETRY_AFTER_MS
+            | f::MAX_MESSAGES
+            | f::MAX_BYTES
+            | f::WAIT_MS
+            | f::FLOW_CREDIT_MESSAGES
+            | f::FLOW_CREDIT_BYTES
+            | f::DELIVERY_ATTEMPT
+            | f::ACK_DEADLINE_MS
             | f::MAX_INFLIGHT => Some(4),
-            f::AUTH_METHOD | f::QOS | f::PRIORITY | f::PUB_OUTCOME
-            | f::ACK_OUTCOME | f::ERROR_RETRYABLE => Some(1),
-            f::SESSION_ID | f::MESSAGE_ID | f::PRODUCER_ID | f::LEASE_ID
-            | f::DISPOSITION_ID | f::LOG_INCAR | f::SOURCE_LOG_INCAR => Some(16),
-            f::PRINCIPAL_ID | f::TOPIC_ID | f::PRODUCER_EPOCH | f::PRODUCER_SEQUENCE
-            | f::OFFSET | f::SUBSCRIPTION_ID | f::GROUP_ID
-            | f::GROUP_GENERATION | f::OWNERSHIP_EPOCH | f::OWNER_NODE_ID
-            | f::METADATA_REVISION | f::TENANT_ID | f::NONCE => Some(8),
+            f::AUTH_METHOD
+            | f::QOS
+            | f::PRIORITY
+            | f::PUB_OUTCOME
+            | f::ACK_OUTCOME
+            | f::ERROR_RETRYABLE => Some(1),
+            f::SESSION_ID
+            | f::MESSAGE_ID
+            | f::PRODUCER_ID
+            | f::LEASE_ID
+            | f::DISPOSITION_ID
+            | f::LOG_INCAR
+            | f::SOURCE_LOG_INCAR => Some(16),
+            f::PRINCIPAL_ID
+            | f::TOPIC_ID
+            | f::PRODUCER_EPOCH
+            | f::PRODUCER_SEQUENCE
+            | f::OFFSET
+            | f::SUBSCRIPTION_ID
+            | f::GROUP_ID
+            | f::GROUP_GENERATION
+            | f::OWNERSHIP_EPOCH
+            | f::OWNER_NODE_ID
+            | f::METADATA_REVISION
+            | f::TENANT_ID
+            | f::NONCE => Some(8),
             f::PAYLOAD_DIGEST_SHA256 => Some(32),
             _ => None,
         };
@@ -463,7 +487,9 @@ mod tests {
     fn hello() -> Frame {
         let mut frame = Frame::new(FrameType::Hello, 0x0102030405060708);
         frame.fields.push(Field::required(1, 0_u16.to_be_bytes()));
-        frame.fields.push(Field::required(3, 1_048_576_u32.to_be_bytes()));
+        frame
+            .fields
+            .push(Field::required(3, 1_048_576_u32.to_be_bytes()));
         frame
     }
 
@@ -471,13 +497,14 @@ mod tests {
     fn golden_hello_is_stable() {
         let bytes = encode(&hello(), Limits::default()).unwrap();
         let expected: &[u8] = &[
-            0x52, 0x51, 0x01, 0x00, 0x13, 0x00, 0x01,
-            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-            0x03, 0x02, 0x00, 0x00,
-            0x07, 0x04, 0x00, 0x10, 0x00, 0x00,
+            0x52, 0x51, 0x01, 0x00, 0x13, 0x00, 0x01, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+            0x08, 0x03, 0x02, 0x00, 0x00, 0x07, 0x04, 0x00, 0x10, 0x00, 0x00,
         ];
         assert_eq!(bytes, expected);
-        assert_eq!(decode_prefix(&bytes, Limits::default()), Ok(Some((hello(), bytes.len()))));
+        assert_eq!(
+            decode_prefix(&bytes, Limits::default()),
+            Ok(Some((hello(), bytes.len())))
+        );
     }
 
     #[test]
@@ -551,19 +578,34 @@ mod tests {
     #[test]
     fn durable_publish_requires_producer_token() {
         let mut frame = Frame::new(FrameType::Publish, 8);
-        frame.fields.push(Field::required(field::TOPIC_NAME, b"events".to_vec()));
-        frame.fields.push(Field::required(field::PARTITION_KEY, b"k".to_vec()));
+        frame
+            .fields
+            .push(Field::required(field::TOPIC_NAME, b"events".to_vec()));
+        frame
+            .fields
+            .push(Field::required(field::PARTITION_KEY, b"k".to_vec()));
         frame.fields.push(Field::required(field::QOS, [1]));
-        frame.fields.push(Field::required(field::TTL_MS, 1000_u32.to_be_bytes()));
-        frame.fields.push(Field::required(field::MESSAGE_ID, [7_u8; 16]));
+        frame
+            .fields
+            .push(Field::required(field::TTL_MS, 1000_u32.to_be_bytes()));
+        frame
+            .fields
+            .push(Field::required(field::MESSAGE_ID, [7_u8; 16]));
         frame.payload = b"payload".to_vec();
         assert_eq!(
             encode(&frame, Limits::default()),
             Err(CodecError::MissingField(field::PRODUCER_ID))
         );
-        frame.fields.push(Field::required(field::PRODUCER_ID, [9_u8; 16]));
-        frame.fields.push(Field::required(field::PRODUCER_EPOCH, 1_u64.to_be_bytes()));
-        frame.fields.push(Field::required(field::PRODUCER_SEQUENCE, 0_u64.to_be_bytes()));
+        frame
+            .fields
+            .push(Field::required(field::PRODUCER_ID, [9_u8; 16]));
+        frame
+            .fields
+            .push(Field::required(field::PRODUCER_EPOCH, 1_u64.to_be_bytes()));
+        frame.fields.push(Field::required(
+            field::PRODUCER_SEQUENCE,
+            0_u64.to_be_bytes(),
+        ));
         let encoded = encode(&frame, Limits::default()).unwrap();
         assert_eq!(
             decode_prefix(&encoded, Limits::default()),
@@ -574,10 +616,19 @@ mod tests {
     #[test]
     fn durable_ack_requires_incarnation() {
         let mut frame = Frame::new(FrameType::ConsumerAck, 1);
-        frame.fields.push(Field::required(field::GROUP_ID, 1_u64.to_be_bytes()));
-        frame.fields.push(Field::required(field::GROUP_GENERATION, 1_u64.to_be_bytes()));
-        frame.fields.push(Field::required(field::LEASE_ID, [1_u8; 16]));
-        frame.fields.push(Field::required(field::OWNERSHIP_EPOCH, 1_u64.to_be_bytes()));
+        frame
+            .fields
+            .push(Field::required(field::GROUP_ID, 1_u64.to_be_bytes()));
+        frame.fields.push(Field::required(
+            field::GROUP_GENERATION,
+            1_u64.to_be_bytes(),
+        ));
+        frame
+            .fields
+            .push(Field::required(field::LEASE_ID, [1_u8; 16]));
+        frame
+            .fields
+            .push(Field::required(field::OWNERSHIP_EPOCH, 1_u64.to_be_bytes()));
         assert_eq!(
             encode(&frame, Limits::default()),
             Err(CodecError::MissingField(field::LOG_INCAR))
