@@ -1,0 +1,11 @@
+/target/
+/out/
+/tmp/
+/benchmarks/results/
+/.env
+*.log
+*.profraw
+.DS_Store
+*.swp
+/data/
+/target/rovqet-data/

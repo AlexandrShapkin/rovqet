@@ -1,0 +1,571 @@
+{
+  "schema_version": 1,
+  "repository": "AlexandrShapkin/rovqet",
+  "note": "TODO means no implementation or verified test evidence yet; D0 tasks must be audited before marking DONE",
+  "tasks": [
+    {
+      "id": "D0-01",
+      "title": "Import normative sources",
+      "phase": "D0",
+      "depends_on": [],
+      "status": "TODO",
+      "architecture": "00",
+      "proof": "Requirements and changelog present verbatim",
+      "paths": [
+        "docs/requirements/"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "D0-02",
+      "title": "Complete component architecture",
+      "phase": "D0",
+      "depends_on": [
+        "D0-01"
+      ],
+      "status": "TODO",
+      "architecture": "README",
+      "proof": "Chapters 00-16, C4 and state/sequence diagrams present",
+      "paths": [
+        "docs/architecture/"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "D0-03",
+      "title": "Enable autonomous fast workflow",
+      "phase": "D0",
+      "depends_on": [
+        "D0-02"
+      ],
+      "status": "TODO",
+      "architecture": "16",
+      "proof": "AGENTS, task ledger, docs checker and CI exist; docs checker executed",
+      "paths": [
+        "AGENTS.md",
+        "scripts/"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "D0-04",
+      "title": "Architecture consistency audit",
+      "phase": "D0",
+      "depends_on": [
+        "D0-03"
+      ],
+      "status": "TODO",
+      "architecture": "14",
+      "proof": "Source/architecture links and invariant/failure/ID crosswalk checked",
+      "paths": [
+        "docs/architecture/",
+        "docs/roadmap/"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "R0-01",
+      "title": "Bootstrap Rust workspace",
+      "phase": "R0",
+      "depends_on": [
+        "D0-04"
+      ],
+      "status": "TODO",
+      "architecture": "02",
+      "proof": "cargo fmt/check workspace actually pass",
+      "paths": [
+        "Cargo.toml",
+        "crates/"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "R0-02",
+      "title": "Create independent generator and oracle",
+      "phase": "R0",
+      "depends_on": [
+        "R0-01"
+      ],
+      "status": "TODO",
+      "architecture": "14",
+      "proof": "Deterministic generator self-test and append-only oracle",
+      "paths": [
+        "crates/testkit/"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "R0-03",
+      "title": "Create NATS baseline runner",
+      "phase": "R0",
+      "depends_on": [
+        "R0-02"
+      ],
+      "status": "TODO",
+      "architecture": "14",
+      "proof": "Baseline smoke with semantic rubric and raw data",
+      "paths": [
+        "benchmarks/"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "R0-04",
+      "title": "Do bounded transport and WAL spikes",
+      "phase": "R0",
+      "depends_on": [
+        "R0-01"
+      ],
+      "status": "TODO",
+      "architecture": "15",
+      "proof": "Runnable A/B with measured CPU/RAM/fsync or explicit default rationale",
+      "paths": [
+        "benchmarks/"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "R0-05",
+      "title": "Freeze reference codec/storage seams",
+      "phase": "R0",
+      "depends_on": [
+        "R0-03",
+        "R0-04"
+      ],
+      "status": "TODO",
+      "architecture": "04",
+      "proof": "Central wire draft and storage interface documented with fixtures",
+      "paths": [
+        "docs/architecture/"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "A-01",
+      "title": "Types, parser and wire registry",
+      "phase": "A",
+      "depends_on": [
+        "R0-01"
+      ],
+      "status": "TODO",
+      "architecture": "04",
+      "proof": "Protocol golden-vector, malformed frame and bounds tests pass",
+      "paths": [
+        "crates/protocol/"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "A-02",
+      "title": "TCP sessions and state machine",
+      "phase": "A",
+      "depends_on": [
+        "A-01"
+      ],
+      "status": "TODO",
+      "architecture": "03",
+      "proof": "Handshake, lifecycle and session memory smoke pass",
+      "paths": [
+        "crates/transport/"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "A-03",
+      "title": "Topic routing and index",
+      "phase": "A",
+      "depends_on": [
+        "A-01"
+      ],
+      "status": "TODO",
+      "architecture": "05",
+      "proof": "Stable hash and concurrent subscription tests pass",
+      "paths": [
+        "crates/router/"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "A-04",
+      "title": "Budgeted admission and scheduler",
+      "phase": "A",
+      "depends_on": [
+        "A-02",
+        "A-03"
+      ],
+      "status": "TODO",
+      "architecture": "10",
+      "proof": "No unbounded queue at configured resource limit",
+      "paths": [
+        "crates/scheduler/"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "A-05",
+      "title": "Q0 vertical publish and fan-out",
+      "phase": "A",
+      "depends_on": [
+        "A-02",
+        "A-03",
+        "A-04"
+      ],
+      "status": "TODO",
+      "architecture": "05",
+      "proof": "1:N/slow subscriber/TTL and honest ADMITTED tests pass",
+      "paths": [
+        "crates/q0/"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "A-06",
+      "title": "Rust SDK end to end",
+      "phase": "A",
+      "depends_on": [
+        "A-05"
+      ],
+      "status": "TODO",
+      "architecture": "04",
+      "proof": "Two independent SDK processes exchange real messages",
+      "paths": [
+        "crates/sdk/"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "A-07",
+      "title": "Q0 smoke and resource profile",
+      "phase": "A",
+      "depends_on": [
+        "A-06",
+        "R0-02"
+      ],
+      "status": "TODO",
+      "architecture": "14",
+      "proof": "Raw Q0 load evidence with process/kernel memory and p99",
+      "paths": [
+        "benchmarks/"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "B-01",
+      "title": "Segmented local WAL",
+      "phase": "B",
+      "depends_on": [
+        "A-01",
+        "R0-01"
+      ],
+      "status": "TODO",
+      "architecture": "06",
+      "proof": "Torn tail, checksum, rotate, fsync tests pass",
+      "paths": [
+        "crates/wal/"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "B-02",
+      "title": "Q1 partition and local commit outcome",
+      "phase": "B",
+      "depends_on": [
+        "B-01",
+        "A-05"
+      ],
+      "status": "TODO",
+      "architecture": "06",
+      "proof": "Crash before/after fsync no false COMMITTED_LOCAL",
+      "paths": [
+        "crates/durable/"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "B-03",
+      "title": "Producer idempotence and dedup",
+      "phase": "B",
+      "depends_on": [
+        "B-02"
+      ],
+      "status": "TODO",
+      "architecture": "06",
+      "proof": "Same seq same outcome, conflict, gap, fencing tests",
+      "paths": [
+        "crates/durable/"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "B-04",
+      "title": "Bounded replay and incarnation",
+      "phase": "B",
+      "depends_on": [
+        "B-02"
+      ],
+      "status": "TODO",
+      "architecture": "06",
+      "proof": "Replay/crash/reset with no old-incarnation continuity",
+      "paths": [
+        "crates/durable/"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "B-05",
+      "title": "Consumer ACK and cursor",
+      "phase": "B",
+      "depends_on": [
+        "B-03",
+        "B-04"
+      ],
+      "status": "TODO",
+      "architecture": "08",
+      "proof": "Sparse ACK, stale generation and cursor recovery tests",
+      "paths": [
+        "crates/durable/"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "B-06",
+      "title": "DLQ and quarantine",
+      "phase": "B",
+      "depends_on": [
+        "B-05"
+      ],
+      "status": "TODO",
+      "architecture": "08",
+      "proof": "Crash between DLQ and source terminal marker leaves no skip",
+      "paths": [
+        "crates/durable/"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "B-07",
+      "title": "Q1 oracle gate",
+      "phase": "B",
+      "depends_on": [
+        "B-05",
+        "R0-02"
+      ],
+      "status": "TODO",
+      "architecture": "14",
+      "proof": "Acknowledged set equals recovered intact-disk log",
+      "paths": [
+        "crates/testkit/"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "C-01",
+      "title": "Inter-node routing and snapshots",
+      "phase": "C",
+      "depends_on": [
+        "A-01",
+        "A-02"
+      ],
+      "status": "TODO",
+      "architecture": "09",
+      "proof": "Stale map, one proxy hop and bounded request tests",
+      "paths": [
+        "crates/control/"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "C-02",
+      "title": "Metadata group and fenced ownership",
+      "phase": "C",
+      "depends_on": [
+        "C-01",
+        "B-04"
+      ],
+      "status": "TODO",
+      "architecture": "09",
+      "proof": "3-voter ownership, no stale commit, Q1 migration tests",
+      "paths": [
+        "crates/control/"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "C-03",
+      "title": "Q2 Raft storage adapter",
+      "phase": "C",
+      "depends_on": [
+        "B-01",
+        "C-02"
+      ],
+      "status": "TODO",
+      "architecture": "07",
+      "proof": "3-node durable-majority/snapshot storage tests",
+      "paths": [
+        "crates/consensus/"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "C-04",
+      "title": "Q2 publish, offsets and dedup",
+      "phase": "C",
+      "depends_on": [
+        "C-03",
+        "B-03"
+      ],
+      "status": "TODO",
+      "architecture": "07",
+      "proof": "Leader crash before/after majority, consistent retry",
+      "paths": [
+        "crates/durable/",
+        "crates/consensus/"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "C-05",
+      "title": "Q2 durable consumer ACK",
+      "phase": "C",
+      "depends_on": [
+        "C-04",
+        "B-05"
+      ],
+      "status": "TODO",
+      "architecture": "08",
+      "proof": "Fail leader after ACK and cursor remains committed",
+      "paths": [
+        "crates/durable/"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "C-06",
+      "title": "Q1/Q2 class and migration tests",
+      "phase": "C",
+      "depends_on": [
+        "C-04",
+        "B-04"
+      ],
+      "status": "TODO",
+      "architecture": "11",
+      "proof": "Wrong class denied, Q1 incarnation/Q2 prefix separated",
+      "paths": [
+        "crates/testkit/"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "C-07",
+      "title": "Three-node fault gate",
+      "phase": "C",
+      "depends_on": [
+        "C-05",
+        "C-06"
+      ],
+      "status": "TODO",
+      "architecture": "14",
+      "proof": "Independent oracle, one-node failure and no-quorum rejection",
+      "paths": [
+        "crates/testkit/"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "D-01",
+      "title": "Measure selective reliability envelope",
+      "phase": "D",
+      "depends_on": [
+        "A-07",
+        "B-07",
+        "C-07"
+      ],
+      "status": "TODO",
+      "architecture": "10",
+      "proof": "Measured mixed QoS, p99, CPU/RAM/kernel, egress",
+      "paths": [
+        "benchmarks/"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "D-02",
+      "title": "Comparable NATS Core and JetStream runs",
+      "phase": "D",
+      "depends_on": [
+        "D-01",
+        "R0-03"
+      ],
+      "status": "TODO",
+      "architecture": "14",
+      "proof": "Predeclared parity and semantic delta with raw results",
+      "paths": [
+        "benchmarks/"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "D-03",
+      "title": "Issue evidence-backed PoC verdict",
+      "phase": "D",
+      "depends_on": [
+        "D-02"
+      ],
+      "status": "TODO",
+      "architecture": "14",
+      "proof": "Pass/fail/inconclusive with limitations, no invented data",
+      "paths": [
+        "docs/roadmap/"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "P-01",
+      "title": "Production security and operations",
+      "phase": "P",
+      "depends_on": [
+        "D-03"
+      ],
+      "status": "TODO",
+      "architecture": "12",
+      "proof": "SEC TEST-009 and operational gates with TLS/JWT/ACL",
+      "paths": [
+        "crates/",
+        "deploy/"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "P-02",
+      "title": "Scale and full PERF qualification",
+      "phase": "P",
+      "depends_on": [
+        "D-03"
+      ],
+      "status": "TODO",
+      "architecture": "10",
+      "proof": "H1 PERF-* and VAL-01 measured under valid methodology",
+      "paths": [
+        "benchmarks/"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "P-03",
+      "title": "Independent product acceptance",
+      "phase": "P",
+      "depends_on": [
+        "P-01",
+        "P-02"
+      ],
+      "status": "TODO",
+      "architecture": "14",
+      "proof": "Normative M7 evidence, REL/TEST/DoD package",
+      "paths": [
+        "docs/",
+        "deploy/"
+      ],
+      "evidence": null
+    }
+  ]
+}

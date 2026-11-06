@@ -1,0 +1,19 @@
+name: fast
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  docs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 scripts/check_docs.py
+
+# This workflow is intentionally non-blocking: no branch protection, review gate,
+# full soak or release build on everyday commits. When Cargo.toml is introduced,
+# add a separate targeted Rust compile+test job rather than product-wide CI.
