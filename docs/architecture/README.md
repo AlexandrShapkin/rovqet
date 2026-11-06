@@ -31,7 +31,7 @@ The [v1.1.1 specification](../requirements/BROKER_REQUIREMENTS_v1.1.1.en.md) is 
 | [Inter-node RPC](inter-node-rpc.md) | routing/ownership/transfer messages and retry semantics |
 | [Diagrams](diagrams/) | Structurizr DSL and PlantUML sources |
 
-The [roadmap](../roadmap/README.md) identifies the exact implementation order. Refer to work-package IDs in commits and handoffs.
+The [D0 architecture audit](D0-audit.md) records what was checked and what remains unverified. The [roadmap](../roadmap/README.md) identifies the exact implementation order. Refer to work-package IDs in commits and handoffs.
 
 ## Contract maturity
 

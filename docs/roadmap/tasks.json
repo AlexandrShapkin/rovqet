@@ -8,13 +8,17 @@
       "title": "Import normative sources",
       "phase": "D0",
       "depends_on": [],
-      "status": "TODO",
+      "status": "DONE",
       "architecture": "00",
       "proof": "Requirements and changelog present verbatim",
       "paths": [
         "docs/requirements/"
       ],
-      "evidence": null
+      "evidence": {
+        "commit": "734c10e4d19056684b37c68c9324afbbec3e3e4b",
+        "verification": "Requirements and changelog matched supplied UTF-8 content exactly (118296 and 12770 characters); repository paths verified.",
+        "ci_run": "https://github.com/AlexandrShapkin/rovqet/actions/runs/42143846562"
+      }
     },
     {
       "id": "D0-02",
@@ -23,13 +27,17 @@
       "depends_on": [
         "D0-01"
       ],
-      "status": "TODO",
+      "status": "DONE",
       "architecture": "README",
       "proof": "Chapters 00-16, C4 and state/sequence diagrams present",
       "paths": [
         "docs/architecture/"
       ],
-      "evidence": null
+      "evidence": {
+        "commit": "734c10e4d19056684b37c68c9324afbbec3e3e4b",
+        "verification": "Chapters 00–16, concrete protocol/inter-node RPC appendices, state/flow/C4 diagram sources and failure contracts reviewed; fast documentation check PASS. Diagram renderers not executed.",
+        "ci_run": "https://github.com/AlexandrShapkin/rovqet/actions/runs/42143846562"
+      }
     },
     {
       "id": "D0-03",
@@ -38,14 +46,18 @@
       "depends_on": [
         "D0-02"
       ],
-      "status": "TODO",
+      "status": "DONE",
       "architecture": "16",
       "proof": "AGENTS, task ledger, docs checker and CI exist; docs checker executed",
       "paths": [
         "AGENTS.md",
         "scripts/"
       ],
-      "evidence": null
+      "evidence": {
+        "commit": "734c10e4d19056684b37c68c9324afbbec3e3e4b",
+        "verification": "AGENTS.md, task DAG, preflight and GitHub Actions fast workflow present; direct main commits confirmed; latest docs CI PASS.",
+        "ci_run": "https://github.com/AlexandrShapkin/rovqet/actions/runs/42143846562"
+      }
     },
     {
       "id": "D0-04",
@@ -54,14 +66,18 @@
       "depends_on": [
         "D0-03"
       ],
-      "status": "TODO",
+      "status": "DONE",
       "architecture": "14",
       "proof": "Source/architecture links and invariant/failure/ID crosswalk checked",
       "paths": [
         "docs/architecture/",
         "docs/roadmap/"
       ],
-      "evidence": null
+      "evidence": {
+        "commit": "734c10e4d19056684b37c68c9324afbbec3e3e4b",
+        "verification": "docs/architecture/D0-audit.md cross-sectional review: Q0/Q1/Q2 boundaries, incarnation, ACK cursor, fencing, budgets, MVP exception documented; latest docs CI PASS.",
+        "ci_run": "https://github.com/AlexandrShapkin/rovqet/actions/runs/42143846562"
+      }
     },
     {
       "id": "R0-01",

@@ -57,7 +57,7 @@ No mandatory issues, PRs, external approval or fixed review chain. Agents work d
 
 ## Current status
 
-D0 documentation is being established in-repository. Broker implementation and measured M0/MVP benchmarks are **NOT STARTED**. Tasks remain TODO until actual commands succeed. A generated plan is not a test result.
+D0 architecture and agent preparation are **DONE** (source fidelity checked and documentation CI passed). R0 experimental implementation, broker code and measured M0/MVP benchmarks are **NOT STARTED**. Tasks remain TODO until actual commands succeed. A generated plan is not a test result.
 
 ## Work package ownership rule
 
