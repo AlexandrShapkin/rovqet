@@ -86,14 +86,18 @@
       "depends_on": [
         "D0-04"
       ],
-      "status": "TODO",
+      "status": "DONE",
       "architecture": "02",
       "proof": "cargo fmt/check workspace actually pass",
       "paths": [
         "Cargo.toml",
         "crates/"
       ],
-      "evidence": null
+      "evidence": {
+        "commit": "27d41b91065f59b7306f523c069bcef4178d7ec7",
+        "verification": "GitHub Actions 42145757537: cargo fmt --all -- --check PASS; cargo check --workspace --locked PASS; cargo test --workspace --locked PASS; cargo run -p rovqet-server -- --version PASS. Server listener and real SDK still deliberately not implemented.",
+        "ci_run": "https://github.com/AlexandrShapkin/rovqet/actions/runs/42145757537"
+      }
     },
     {
       "id": "R0-02",
