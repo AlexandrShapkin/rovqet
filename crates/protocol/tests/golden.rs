@@ -31,10 +31,9 @@ fn pub_ack(qos: u8, outcome: u8, request_id: u64) -> Frame {
 
 fn no_quorum() -> Frame {
     let mut frame = Frame::new(FrameType::Error, 0x102);
-    frame.fields.push(Field::required(
-        field::ERROR_CODE,
-        15_u16.to_be_bytes(),
-    ));
+    frame
+        .fields
+        .push(Field::required(field::ERROR_CODE, 15_u16.to_be_bytes()));
     frame
         .fields
         .push(Field::required(field::ERROR_RETRYABLE, [0]));
@@ -55,7 +54,11 @@ fn independent_golden_vectors_match_encoder_and_decoder() {
             _ => panic!("unexpected fixture {name}"),
         };
         let expected = hex_bytes(hex);
-        assert_eq!(encode(&frame, Limits::default()).unwrap(), expected, "{name}");
+        assert_eq!(
+            encode(&frame, Limits::default()).unwrap(),
+            expected,
+            "{name}"
+        );
         assert_eq!(
             decode_prefix(&expected, Limits::default()),
             Ok(Some((frame, expected.len()))),
