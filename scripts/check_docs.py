@@ -34,16 +34,24 @@ files = [*ROOT.rglob("*.md")]
 link_re = re.compile(r"(?<!!)\[[^\]]+\]\(([^)]+)\)")
 for source in files:
     text = source.read_text(encoding="utf-8")
-    for href in link_re.findall(text):
-        href = href.split("#", 1)[0].strip().strip("<>")
-        if not href or href.startswith(("https://", "http://", "mailto:", "data:")):
+    in_fence = False
+    for line in text.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith(("```, "~~~")):
+            in_fence = not in_fence
             continue
-        if " " in href:
-            issue(f"{source.relative_to(ROOT)}: whitespace/unsupported local link {href}")
+        if in_fence:
             continue
-        dest = (source.parent / href).resolve()
-        if not dest.is_relative_to(ROOT.resolve()) or not dest.exists():
-            issue(f"{source.relative_to(ROOT)}: broken local link {href}")
+        for href in link_re.findall(line):
+            href = href.split("#", 1)[0].strip().strip("<>")
+            if not href or href.startswith(("https://", "http://", "mailto:", "data:")):
+                continue
+            if " " in href:
+                issue(f"{source.relative_to(ROOT)}: whitespace/unsupported local link {href}")
+                continue
+            dest = (source.parent / href).resolve()
+            if not dest.is_relative_to(ROOT.resolve()) or not dest.exists():
+                issue(f"{source.relative_to(ROOT)}: broken local link {href}")
 
 norm = ROOT / "docs/requirements/BROKER_REQUIREMENTS_v1.1.1.en.md"
 if norm.exists():
