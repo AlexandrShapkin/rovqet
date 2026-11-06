@@ -1,0 +1,113 @@
+@startuml
+title Q0 best-effort publish and local fan-out
+actor Publisher
+participant "Client SDK" as SDK
+participant "Session" as Session
+participant "Admission" as Adm
+participant "Q0 worker" as Q0
+participant "Index" as Index
+participant "Subscriber writer" as Writer
+Publisher -> SDK: publish(Q0, payload)
+SDK -> Session: PUBLISH(request_id)
+Session -> Adm: reserve(bytes, estimated_fanout)
+Adm --> Session: reservation
+Session -> Q0: PublishQ0(payload, reservation)
+Q0 --> Session: ADMITTED
+Session --> SDK: PUB_ACK(ADMITTED)
+Q0 -> Index: matching_subscribers(topic)
+Index --> Q0: bounded recipient batch
+loop each recipient (bounded)
+  Q0 -> Writer: enqueue(shared Bytes)
+  alt recipient ready
+    Writer --> Q0: sent
+  else TTL/overflow
+    Writer --> Q0: drop reason + counter
+  end
+end
+note right of SDK: ADMITTED != delivered
+@enduml
+
+@startuml
+title Q1 local durable publish and retry after lost PUB_ACK
+actor Publisher
+participant "SDK" as SDK
+participant "Q1 actor" as Q1
+database "Local WAL" as WAL
+Publisher -> SDK: publish(token, bytes)
+SDK -> Q1: PUBLISH scoped identity/epoch/seq
+Q1 -> Q1: validate owner/class/seq, assign offset
+Q1 -> WAL: append MESSAGE + recoverable outcome
+WAL --> Q1: page-cache write complete
+Q1 -> WAL: fsync durable barrier
+WAL --> Q1: durable
+Q1 -> Q1: mark committed and dedup
+Q1 --> SDK: PUB_ACK(COMMITTED_LOCAL, incarnation, offset)
+note over SDK,Q1: If reply is lost, outcome is UNKNOWN, not failure
+SDK -> Q1: retry identical token
+Q1 --> SDK: same committed offset, no second record
+@enduml
+
+@startuml
+title Q2 durable quorum publish on RF3
+actor Publisher
+participant "SDK" as SDK
+participant "Q2 leader" as L
+database "Leader WAL" as LW
+participant "Follower 1" as F1
+participant "Follower 2" as F2
+Publisher -> SDK: publish(Q2, producer token)
+SDK -> L: PUBLISH(valid owner/term/epoch)
+L -> LW: append entry + durable log barrier
+L -> F1: AppendEntries
+L -> F2: AppendEntries
+F1 -> F1: persist entry durably
+F1 --> L: durable append acknowledgement
+note over L: Majority durable; commit/apply entry
+L -> L: apply deterministic state machine
+L --> SDK: PUB_ACK(COMMITTED_QUORUM)
+note over L: Without quorum, no new COMMITTED_QUORUM
+@enduml
+
+@startuml
+title Consumer ACK, contiguous cursor and DLQ disposition
+actor Consumer
+participant "SDK" as SDK
+participant "Group actor" as G
+database "Q1 fsync or Q2 quorum" as Store
+participant "DLQ partition" as DLQ
+G -> SDK: MESSAGE(incarnation,offset,generation,lease)
+SDK -> G: CONSUMER_ACK(token)
+G -> G: validate epoch/generation/lease
+G -> Store: durable ACK closure
+Store --> G: barrier complete
+G -> G: advance contiguous closed prefix only
+G --> SDK: ACK_COMMITTED
+opt poison message / max retry
+  G -> G: DEAD_LETTER_PENDING
+  G -> DLQ: idempotent publish(disposition_id)
+  DLQ --> G: DLQ_COMMITTED
+  G -> Store: persist source terminal disposition
+  Store --> G: TERMINAL_COMMITTED
+  G -> G: advance cursor iff all earlier offsets closed
+end
+@enduml
+
+@startuml
+title Q1 migration and explicit history-loss boundary
+participant "Metadata authority" as CP
+participant "Old owner" as O
+participant "New owner" as N
+participant "Client SDK" as SDK
+CP -> O: PREPARE(epoch n)
+CP -> N: CATCH_UP(incarnation x)
+O -> N: snapshot/WAL + dedup/cursors
+N --> CP: verified complete / or failed
+alt transfer verified
+  CP -> O: FENCE_OLD(epoch n)
+  CP -> N: ACTIVATE_NEW(epoch n+1, incarnation x)
+else history irrecoverable
+  CP -> SDK: REPLAY_NOT_AVAILABLE(old x)
+  CP -> N: authorize new incarnation y
+  note over SDK: explicit app reset; no silent continuity
+end
+@enduml

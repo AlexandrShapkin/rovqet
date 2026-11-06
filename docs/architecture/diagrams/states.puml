@@ -1,0 +1,83 @@
+@startuml
+title Broker session lifecycle
+[*] --> NEW
+NEW --> HANDSHAKE : TCP accept
+HANDSHAKE --> ACTIVE : HELLO/WELCOME/AUTH_OK
+HANDSHAKE --> FAILED : invalid/timeout
+ACTIVE --> DRAINING : requested drain
+ACTIVE --> CLOSED : disconnect/idle
+DRAINING --> CLOSED : settled or grace expired
+ACTIVE --> FAILED : fatal parser/transport error
+FAILED --> [*]
+CLOSED --> [*]
+@enduml
+
+@startuml
+title Durable publication outcome
+[*] --> RECEIVED
+RECEIVED --> VALIDATED : policy/epoch/seq accepted
+RECEIVED --> REJECTED : invalid
+VALIDATED --> ADMITTED : resource reservation
+VALIDATED --> REJECTED : no credits
+ADMITTED --> APPENDED : log write
+APPENDED --> FSYNC_LOCAL : Q1 fsync
+FSYNC_LOCAL --> COMMITTED_LOCAL : durability confirmed
+APPENDED --> REPLICATING : Q2 Raft
+REPLICATING --> MAJORITY_DURABLE : quorum persistent
+MAJORITY_DURABLE --> COMMITTED_QUORUM : apply committed
+APPENDED --> UNKNOWN : crash/uncertain barrier
+COMMITTED_LOCAL --> ACK_SENT
+COMMITTED_QUORUM --> ACK_SENT
+REJECTED --> [*]
+ACK_SENT --> [*]
+UNKNOWN --> [*]
+@enduml
+
+@startuml
+title Consumer delivery and terminal closure
+[*] --> READY
+READY --> LEASED : committed message, credits
+LEASED --> DELIVERED : send
+DELIVERED --> ACK_RECEIVED : consumer ACK
+ACK_RECEIVED --> ACK_VALIDATED : current generation/lease
+ACK_RECEIVED --> REJECTED : stale token
+ACK_VALIDATED --> ACK_PERSISTING : write closure
+ACK_PERSISTING --> ACK_COMMITTED : Q1 fsync / Q2 quorum
+ACK_COMMITTED --> CLOSED_FOR_GROUP : contiguous cursor eligibility
+DELIVERED --> RETRY_QUEUED : NACK/timeout
+RETRY_QUEUED --> READY : retry due
+RETRY_QUEUED --> DLQ_PENDING : max retry + DLQ policy
+DLQ_PENDING --> DLQ_COMMITTED : durable idempotent DLQ
+DLQ_COMMITTED --> TERMINAL_COMMITTED : durable source disposition
+TERMINAL_COMMITTED --> CLOSED_FOR_GROUP : contiguous cursor eligibility
+RETRY_QUEUED --> QUARANTINE_PENDING : max retry + quarantine policy
+QUARANTINE_PENDING --> TERMINAL_COMMITTED : durable quarantine
+DLQ_PENDING --> DLQ_PENDING : unavailable/unknown
+ACK_PERSISTING --> RETRY_QUEUED : barrier failed
+CLOSED_FOR_GROUP --> [*]
+@enduml
+
+@startuml
+title Ownership migration and Q1 incarnation
+[*] --> PREPARE
+PREPARE --> CATCH_UP : migration started
+CATCH_UP --> FENCE_OLD : state verified
+FENCE_OLD --> ACTIVATE_NEW : old authority revoked
+ACTIVATE_NEW --> CLEANUP : new epoch committed
+CLEANUP --> [*]
+CATCH_UP --> HISTORY_LOST : Q1 WAL irrecoverable
+HISTORY_LOST --> NEW_INCAR : explicitly authorized reset
+NEW_INCAR --> ACTIVATE_NEW : notify SDK; no offset reuse
+@enduml
+
+@startuml
+title Per-domain overload management
+[*] --> NORMAL
+NORMAL --> PRESSURE : upper watermark
+PRESSURE --> SHED : resource saturation
+SHED --> PRESSURE : lower watermark + dwell
+PRESSURE --> NORMAL : lower watermark + dwell
+SHED --> DRAIN : planned stop
+SHED --> UNAVAILABLE : invariant cannot be preserved
+DRAIN --> UNAVAILABLE : graceful stop complete
+@enduml
