@@ -1,5 +1,7 @@
 # 09 — Cluster metadata, ownership, placement, routing and degradation
 
+Reference inter-node message schemas and migration replies are in [inter-node-rpc.md](inter-node-rpc.md).
+
 ## Two consensus domains
 
 **Metadata group:** cluster ID, membership, node addresses, topics, durable classes, ACL/role revision, desired partition placement, ownership epochs/leases and policy snapshot version. One 3-voter metadata Raft group for full three-node MVP; it is not consulted synchronously per data-plane message.

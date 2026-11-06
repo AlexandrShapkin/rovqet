@@ -1,6 +1,6 @@
 # 04 — Wire protocol and Rust SDK implementation contract
 
-The normative specification defines a versioned binary envelope and explicit error registry (§5). This chapter fixes **reference MVP encodings** to prevent per-component re-design. Freeze exact numeric IDs and golden vectors at the M1 boundary; until then the registry below is a design decision, not yet an implemented standard.
+The normative specification defines a versioned binary envelope and explicit error registry (§5). The [reference binary registry](protocol-registry.md) fixes field IDs, frame IDs, error IDs and wire types for implementation; verify/freeze golden vectors by M1. This chapter fixes **reference MVP encodings** to prevent per-component re-design. Freeze exact numeric IDs and golden vectors at the M1 boundary; until then the registry below is a design decision, not yet an implemented standard.
 
 ## Frame layout and parser
 

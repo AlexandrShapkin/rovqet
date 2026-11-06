@@ -1,6 +1,6 @@
 # Development roadmap — architecture first, fast concept-validation MVP
 
-This is the **execution plan** for autonomous coding agents. The [requirements](../requirements/BROKER_REQUIREMENTS_v1.1.1.en.md) define the eventual product; the [architecture](../architecture/README.md) defines implementation contracts; the [MVP envelope](../architecture/16-mvp-scope.md) records deferred production features. Tasks are in [work-packages.md](work-packages.md) and machine-readable [tasks.json](tasks.json).
+This is the **execution plan** for autonomous coding agents. The [requirements](../requirements/BROKER_REQUIREMENTS_v1.1.1.en.md) define the eventual product; the [architecture](../architecture/README.md) defines implementation contracts; the [MVP envelope](../architecture/16-mvp-scope.md) records deferred production features. Tasks are in [work-packages.md](work-packages.md) and machine-readable [tasks.json](tasks.json); contract coverage is tracked in [architecture-coverage.md](architecture-coverage.md).
 
 ## Delivery order
 

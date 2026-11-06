@@ -9,7 +9,7 @@ ClusterEnvelope {
   cluster_id:u128, source_node:u64, target_node:u64,
   request_id:u128, rpc_kind:u16, api_version:u16,
   metadata_revision:u64, ownership_epoch:u64,
-  deadline_mono_ms:u64, body_len:u32, body:bytes
+  timeout_budget_ms:u32, body_len:u32, body:bytes
 }
 ~~~
 

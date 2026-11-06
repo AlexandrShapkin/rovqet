@@ -27,6 +27,8 @@ The [v1.1.1 specification](../requirements/BROKER_REQUIREMENTS_v1.1.1.en.md) is 
 | [14 Verification](14-verification.md) | reference oracle, fixture contracts and evidence |
 | [15 ADR inventory](15-open-decisions.md) | chosen defaults and evidence-gated alternatives |
 | [16 Research MVP](16-mvp-scope.md) | deliverables and deliberate omissions |
+| [Protocol registry](protocol-registry.md) | fixed reference wire fields, codes and frame structures |
+| [Inter-node RPC](inter-node-rpc.md) | routing/ownership/transfer messages and retry semantics |
 | [Diagrams](diagrams/) | Structurizr DSL and PlantUML sources |
 
 The [roadmap](../roadmap/README.md) identifies the exact implementation order. Refer to work-package IDs in commits and handoffs.
