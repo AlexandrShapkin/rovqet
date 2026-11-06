@@ -57,7 +57,7 @@ No mandatory issues, PRs, external approval or fixed review chain. Agents work d
 
 ## Current status
 
-D0 architecture and agent preparation are **DONE** (source fidelity checked and documentation CI passed). R0 experimental implementation, broker code and measured M0/MVP benchmarks are **NOT STARTED**. Tasks remain TODO until actual commands succeed. A generated plan is not a test result.
+D0 architecture and agent preparation are **DONE** (source fidelity checked and documentation CI passed). R0-01 Rust workspace and A-01 protocol codec are **DONE** with passing Rust CI (22 tests). R0-02/R0-04 and A-02/A-03 are next; data-plane broker/networking and measured M0/MVP experiments have **NOT STARTED**. Tasks remain TODO until actual commands succeed. A generated plan is not a test result.
 
 ## Work package ownership rule
 

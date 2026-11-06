@@ -2,7 +2,7 @@
 
 Rovqet is an experimental, Rust/Tokio message broker focused on dense client connectivity, predictable tail latency, priority isolation and selective durability.
 
-**Status: architecture-first, pre-implementation.** The repository is initialized with the normative v1.1.1 requirements, a deliberately reduced research-MVP delivery profile, detailed component contracts, implementation roadmap and instructions for autonomous AI coding agents. Do not interpret architectural designs or proposed interfaces as implemented features.
+**Status: architecture-first design complete; Rust workspace and wire codec implemented, broker networking not yet started.** The repository is initialized with the normative v1.1.1 requirements, a deliberately reduced research-MVP delivery profile, detailed component contracts, implementation roadmap and instructions for autonomous AI coding agents. Do not interpret architectural designs or proposed interfaces as implemented features.
 
 ## Read in this order
 
@@ -34,4 +34,4 @@ A+B gives a *local research prototype*; A+B+C+D gives a *concept-validation MVP*
 - \`bash scripts/preflight.sh\`: run only available fast, relevant local checks.
 - After implementation starts: \`cargo fmt --check\`, \`cargo check --workspace\`, and focused \`cargo test\` when applicable.
 
-License, crate APIs and build scripts will be added in a dedicated implementation task; no empty pretense of compilable broker code.
+Rust workspace and v1 bounds-first protocol codec now compile; the broker has no network listener or message delivery yet. The CLI deliberately reports that the server is not implemented. Packaging/license and remaining crate APIs are future tasks.

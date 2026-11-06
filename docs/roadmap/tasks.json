@@ -167,13 +167,18 @@
       "depends_on": [
         "R0-01"
       ],
-      "status": "TODO",
+      "status": "DONE",
       "architecture": "04",
       "proof": "Protocol golden-vector, malformed frame and bounds tests pass",
       "paths": [
         "crates/protocol/"
       ],
-      "evidence": null
+      "evidence": {
+        "commit": "ad21959b41e57e68a296401aa98a765022b7b5da",
+        "verification": "GitHub Actions 42147179135: rustfmt PASS, cargo check --workspace --locked PASS, cargo test --workspace --locked PASS (22 tests including 13 protocol unit + 3 protocol integration), binary --version PASS. v1 frame codec, numeric registry, HELLO capability negotiation, malformed frame rejection and independently constructed Q1/Q2/error golden fixtures.",
+        "ci_run": "https://github.com/AlexandrShapkin/rovqet/actions/runs/42147179135",
+        "limitations": "Socket sessions/authentication are A-02; full golden registry for all supported frames is extended when they are implemented."
+      }
     },
     {
       "id": "A-02",

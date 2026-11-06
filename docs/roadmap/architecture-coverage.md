@@ -25,7 +25,7 @@ Normative source: [v1.1.1 requirements](../requirements/BROKER_REQUIREMENTS_v1.1
 
 ## Explicitly material gaps until implemented
 
-1. **No code exists** in initialized repo; architecture docs are design only.
+1. Rust workspace and v1 frame codec now exist and compile; there is still **no live broker listener**, no Q0 dispatch, Q1 WAL or Q2 Raft implementation.
 2. Canonical wire IDs in appendix P have not yet been encoded/decoded by a real fixture; M1 must verify and freeze.
 3. Structurizr/PlantUML diagrams are text sources; CI checks document structure but does not run diagram renderers.
 4. Raft adapter must be compiled against a pinned library version and tested with durable storage; the design does not itself prove a quorum.

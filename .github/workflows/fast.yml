@@ -27,7 +27,7 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Compile workspace
         run: cargo check --workspace --locked
-      - name: Focused bootstrap tests
+      - name: Fast workspace tests
         run: cargo test --workspace --locked
       - name: Verify executable identifies bootstrap
         run: cargo run --locked -p rovqet-server -- --version
