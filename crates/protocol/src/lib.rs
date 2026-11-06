@@ -1,26 +1,18 @@
-//! Shared protocol constants. Frame encoding is implemented in A-01.
+//! Native binary protocol for Rovqet (wire major v1).
 //!
-//! This crate does not yet claim to implement the v1 wire contract.
-//! See docs/architecture/protocol-registry.md for its proposed binary layout.
+//! The parser validates declared sizes before allocating payload memory.
+//! Protocol encoding and decoding do not perform authentication, authorization,
+//! broker durability or message delivery.
 
 #![forbid(unsafe_code)]
 
-/// Major version proposed by the normative protocol specification.
+mod codec;
+pub mod registry;
+
+pub use codec::{CodecError, Field, Frame, Limits, decode_prefix, encode};
+pub use registry::{ErrorCode, FrameType};
+
 pub const WIRE_MAJOR_VERSION: u8 = 1;
-
-/// Initial maximum frame size (1 MiB), subject to negotiated lower limits.
 pub const MAX_FRAME_BYTES: usize = 1_048_576;
-
-/// Initial maximum opaque message payload size (256 KiB).
 pub const DEFAULT_MAX_PAYLOAD_BYTES: usize = 262_144;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn reference_limits_are_bounded() {
-        assert_eq!(WIRE_MAJOR_VERSION, 1);
-        assert!(DEFAULT_MAX_PAYLOAD_BYTES < MAX_FRAME_BYTES);
-    }
-}
+pub const MAX_HEADER_BYTES: usize = 4_096;
