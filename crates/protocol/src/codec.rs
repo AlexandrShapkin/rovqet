@@ -198,6 +198,13 @@ fn validate_fields(frame: &Frame) -> Result<(), CodecError> {
         if expected.is_some_and(|width| item.value.len() != width) {
             return Err(CodecError::InvalidFieldValue(item.id));
         }
+        if (item.id == f::TOPIC_NAME || item.id == f::FILTER)
+            && (item.value.is_empty()
+                || item.value.len() > 255
+                || std::str::from_utf8(&item.value).is_err())
+        {
+            return Err(CodecError::InvalidFieldValue(item.id));
+        }
         if (item.id == f::QOS && item.value[0] > 2)
             || (item.id == f::PRIORITY && item.value[0] > 3)
             || (item.id == f::PUB_OUTCOME && !(1..=3).contains(&item.value[0]))
