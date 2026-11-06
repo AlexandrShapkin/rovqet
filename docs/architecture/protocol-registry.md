@@ -110,7 +110,7 @@ Field IDs 49–127 reserved for compatible additions; every new field must be re
 
 | Frame | Required TLVs | Additional check |
 |---|---|---|
-| HELLO | minor, max_frame_bytes | major in fixed prefix; negotiated bounds |
+| HELLO | minor, max_frame_bytes | major in fixed prefix; CAPABILITIES critical bit distinguishes required from optional; negotiate common minor/limits |
 | WELCOME | minor, session_id, max_frame_bytes | server values replace requested maximum |
 | AUTH | auth_method, auth_data | dev-only method restricted to loopback lab |
 | AUTH_OK | principal_id | only server may issue |
@@ -119,9 +119,9 @@ Field IDs 49–127 reserved for compatible additions; every new field must be re
 | SUBSCRIBE | filter or topic_name | validated topic syntax and subscription quota |
 | SUB_ACK | subscription_id | bound to authenticated session |
 | MESSAGE | topic_name or ID, qos, message_id | durable additionally group_id, generation, lease_id, incarnation, offset |
-| CONSUMER_ACK | group_id, generation, lease_id, ownership_epoch, incarnation, offset | previously delivered committed record |
+| CONSUMER_ACK, CONSUMER_NACK, EXTEND_LEASE | topic_name or topic_id, partition_id, group_id, generation, lease_id, ownership_epoch, incarnation, offset | full partition scope and previously delivered committed record |
 | CONSUMER_ACK_RESULT | ack_outcome | correlation by identical request_id |
-| FETCH | group_id, incarnation, offset, max_bytes, max_messages | no unbounded fetch |
+| FETCH | topic_name or topic_id, partition_id, group_id, incarnation, offset, max_bytes, max_messages | no unbounded or ambiguous group fetch |
 | FLOW_CREDIT | subscription_id or group_id, flow_credit_messages/bytes | cannot exceed negotiated credit |
 | REDIRECT | owner_node_id, ownership_epoch, metadata_revision | bounded hop/retry |
 | ERROR | error_code, error_retryable | diagnostic fields optional; never success |

@@ -258,7 +258,15 @@ fn validate_fields(frame: &Frame) -> Result<(), CodecError> {
         FrameType::PubAck => {
             require(f::QOS)?;
             require(f::PUB_OUTCOME)?;
-            if frame.field(f::QOS).is_some_and(|qos| qos[0] != 0) {
+            let qos = frame.field(f::QOS).unwrap()[0];
+            let outcome = frame.field(f::PUB_OUTCOME).unwrap()[0];
+            if (qos, outcome) != (0, 1)
+                && (qos, outcome) != (1, 2)
+                && (qos, outcome) != (2, 3)
+            {
+                return Err(CodecError::InvalidFieldValue(f::PUB_OUTCOME));
+            }
+            if qos != 0 {
                 durable_ref()?;
             }
         }
@@ -279,7 +287,9 @@ fn validate_fields(frame: &Frame) -> Result<(), CodecError> {
                 require(f::LEASE_ID)?;
             }
         }
-        FrameType::ConsumerAck => {
+        FrameType::ConsumerAck | FrameType::ConsumerNack | FrameType::ExtendLease => {
+            topic()?;
+            require(f::PARTITION_ID)?;
             require(f::GROUP_ID)?;
             require(f::GROUP_GENERATION)?;
             require(f::LEASE_ID)?;
@@ -289,6 +299,8 @@ fn validate_fields(frame: &Frame) -> Result<(), CodecError> {
         }
         FrameType::ConsumerAckResult => require(f::ACK_OUTCOME)?,
         FrameType::Fetch => {
+            topic()?;
+            require(f::PARTITION_ID)?;
             require(f::GROUP_ID)?;
             require(f::LOG_INCAR)?;
             require(f::OFFSET)?;
@@ -616,6 +628,12 @@ mod tests {
     #[test]
     fn durable_ack_requires_incarnation() {
         let mut frame = Frame::new(FrameType::ConsumerAck, 1);
+        frame
+            .fields
+            .push(Field::required(field::TOPIC_NAME, b"events".to_vec()));
+        frame
+            .fields
+            .push(Field::required(field::PARTITION_ID, 0_u32.to_be_bytes()));
         frame
             .fields
             .push(Field::required(field::GROUP_ID, 1_u64.to_be_bytes()));

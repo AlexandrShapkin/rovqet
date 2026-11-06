@@ -7,9 +7,11 @@
 #![forbid(unsafe_code)]
 
 mod codec;
+mod handshake;
 pub mod registry;
 
 pub use codec::{CodecError, Field, Frame, Limits, decode_prefix, encode};
+pub use handshake::{Negotiated, NegotiationError, negotiate_hello};
 pub use registry::{ErrorCode, FrameType};
 
 pub const WIRE_MAJOR_VERSION: u8 = 1;
