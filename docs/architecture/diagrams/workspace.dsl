@@ -1,5 +1,5 @@
 workspace "Rovqet" "Reference C4 model for the architecture-first research broker" {
-  !identifiers hierarchical
+  !identifiers flat
 
   model {
     publisher = person "Publisher" "Sensor, controller or application publishing messages"
@@ -70,7 +70,7 @@ workspace "Rovqet" "Reference C4 model for the architecture-first research broke
       include *
       autoLayout lr
     }
-    component rovqet.broker "BrokerComponents" {
+    component broker "BrokerComponents" {
       include *
       autoLayout lr
     }
