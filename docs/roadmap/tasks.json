@@ -230,18 +230,18 @@
         "A-02",
         "A-03"
       ],
-      "status": "IN_PROGRESS",
+      "status": "DONE",
       "architecture": "10",
       "proof": "No unbounded queue at configured resource limit",
       "paths": [
         "crates/scheduler/"
       ],
       "evidence": {
-        "commit": "67e06f475e9ede7ec7fdd3af84de50b7e2ed63a7",
-        "verification": "Implemented hierarchical RAII ingress message/byte budgets (global/topic/session), bounded outbound reservation and protected control capacity, weighted 8:4:2:1 service with CONTROL reserve. Two scheduler tests plus transport reservation/control isolation tests PASS; socket ingress exhaustion rejects explicitly.",
-        "test_command": "cargo fmt --all -- --check; CARGO_HOME=/tmp/rovqet-cargo cargo check --workspace --locked; CARGO_HOME=/tmp/rovqet-cargo cargo test --workspace --locked; CARGO_HOME=/tmp/rovqet-cargo cargo build -p rovqet-server -p rovqet-sdk --examples --bins --locked; python3 scripts/q0_smoke.py",
-        "observed_result": "PASS: formatting, workspace check, 40 tests, independent-process smoke. After reconnect cleanup adjustment: targeted SDK+Q0 tests PASS (10 tests), workspace check PASS.",
-        "limitations": "Remaining: configurable physical egress rate/delivery quotas and overload states with hysteresis; measured capacity model is not available. Current hard queue/byte bounds do not establish production resource isolation."
+        "commit": "8e6f1ee5a572b10a8634fefcf772ecba32b9c906",
+        "verification": "Hierarchical atomic RAII reservations charge global/tenant/topic/partition/session ingress and independent global/tenant/topic plus per-session outbound budgets. Enforced encoded-byte/physical-delivery token buckets at admission and socket write; weighted scheduler and protected control reserve; overload occupancy thresholds, hysteresis, minimum dwell, drain/unavailable/recovery. Failure/cancellation/disconnect tests return all counters to zero.",
+        "test_command": "cargo fmt --all -- --check; CARGO_HOME=/tmp/rovqet-cargo cargo check --workspace --locked; CARGO_HOME=/tmp/rovqet-cargo cargo test -p rovqet-q0 --test flow_overflow --locked; CARGO_HOME=/tmp/rovqet-cargo cargo test -p rovqet-q0 --locked; CARGO_HOME=/tmp/rovqet-cargo cargo test --workspace --locked; CARGO_HOME=/tmp/rovqet-cargo cargo build -p rovqet-server -p rovqet-sdk --examples --bins --locked; python3 scripts/q0_smoke.py; python3 scripts/check_docs.py",
+        "observed_result": "PASS: formatting, workspace compilation, 63 nonzero unit/integration tests (17 Q0 socket, 10 SDK, 10 transport, 4 scheduler, 4 router, 16 protocol, 2 core); independent-process publisher/two-subscriber smoke and documentation checks. No ignored tests.",
+        "limitations": "Prototype limits and queue-occupancy overload signals await independent capacity calibration in R0-02/A-07; no production CPU/kernel-memory isolation or SLO claim. Control traffic retains separately bounded reserve."
       }
     },
     {
@@ -253,18 +253,18 @@
         "A-03",
         "A-04"
       ],
-      "status": "IN_PROGRESS",
+      "status": "DONE",
       "architecture": "05",
       "proof": "1:N/slow subscriber/TTL and honest ADMITTED tests pass",
       "paths": [
         "crates/q0/"
       ],
       "evidence": {
-        "commit": "67e06f475e9ede7ec7fdd3af84de50b7e2ed63a7",
-        "verification": "Real Q0 publish/ADMITTED, shared encoded payload fanout, exact subscriptions, monotonic TTL at dispatch/write, DROP_NEWEST shedding, REJECT_PUBLISH outbound reservation, enqueue/drop/write counters. Five socket integration tests PASS including 1:1000, slow reader, TTL and exhaustion.",
-        "test_command": "cargo fmt --all -- --check; CARGO_HOME=/tmp/rovqet-cargo cargo check --workspace --locked; CARGO_HOME=/tmp/rovqet-cargo cargo test --workspace --locked; CARGO_HOME=/tmp/rovqet-cargo cargo build -p rovqet-server -p rovqet-sdk --examples --bins --locked; python3 scripts/q0_smoke.py",
-        "observed_result": "PASS: formatting, workspace check, 40 tests, independent-process smoke. After reconnect cleanup adjustment: targeted SDK+Q0 tests PASS (10 tests), workspace check PASS.",
-        "limitations": "Remaining: wire FLOW_CREDIT, DROP_OLDEST and COALESCE_LATEST (unsupported configurations fail construction); complete delivery/drop conservation including shutdown/in-progress write outcomes. No durability or universal delivery promised."
+        "commit": "8e6f1ee5a572b10a8634fefcf772ecba32b9c906",
+        "verification": "All four Q0 overflow policies, shared immutable wire payloads with per-subscription header patching, admission recipient snapshots, send credits, monotonic queued TTL, slow-consumer isolation, per-reason transport/broker counters and reservation rollback. Twelve flow/overflow socket tests plus five existing socket tests PASS including 1:1000, egress exhaustion/refill, unsubscribe, queued disconnect and clean shutdown.",
+        "test_command": "cargo fmt --all -- --check; CARGO_HOME=/tmp/rovqet-cargo cargo check --workspace --locked; CARGO_HOME=/tmp/rovqet-cargo cargo test -p rovqet-q0 --test flow_overflow --locked; CARGO_HOME=/tmp/rovqet-cargo cargo test -p rovqet-q0 --locked; CARGO_HOME=/tmp/rovqet-cargo cargo test --workspace --locked; CARGO_HOME=/tmp/rovqet-cargo cargo build -p rovqet-server -p rovqet-sdk --examples --bins --locked; python3 scripts/q0_smoke.py; python3 scripts/check_docs.py",
+        "observed_result": "PASS: formatting, workspace compilation, 63 nonzero unit/integration tests (17 Q0 socket, 10 SDK, 10 transport, 4 scheduler, 4 router, 16 protocol, 2 core); independent-process publisher/two-subscriber smoke and documentation checks. No ignored tests.",
+        "limitations": "Q0 ADMITTED is volatile admission only; successful socket write is distinct from independent SDK receipt. An in-progress write may finish during unsubscribe. Wildcards and durable lanes are not implemented."
       }
     },
     {
@@ -274,18 +274,18 @@
       "depends_on": [
         "A-05"
       ],
-      "status": "IN_PROGRESS",
+      "status": "DONE",
       "architecture": "04",
       "proof": "Two independent SDK processes exchange real messages",
       "paths": [
         "crates/sdk/"
       ],
       "evidence": {
-        "commit": "67e06f475e9ede7ec7fdd3af84de50b7e2ed63a7",
-        "verification": "SDK connects/authenticates, publishes Q0, subscribes/unsubscribes/receives/closes, bounds pending messages, reports typed remote errors and OutcomeUnknown, reconnects with exponential backoff/jitter and subscription recreation. Five SDK tests PASS. scripts/q0_smoke.py PASS: independent publisher and two subscriber processes exchanged one Q0 payload through a real broker and exited cleanly.",
-        "test_command": "cargo fmt --all -- --check; CARGO_HOME=/tmp/rovqet-cargo cargo check --workspace --locked; CARGO_HOME=/tmp/rovqet-cargo cargo test --workspace --locked; CARGO_HOME=/tmp/rovqet-cargo cargo build -p rovqet-server -p rovqet-sdk --examples --bins --locked; python3 scripts/q0_smoke.py",
-        "observed_result": "PASS: formatting, workspace check, 40 tests, independent-process smoke. After reconnect cleanup adjustment: targeted SDK+Q0 tests PASS (10 tests), workspace check PASS.",
-        "limitations": "Basic SDK functionality validated; DONE held until A-05 dependency is complete and wire flow-credit is integrated. No automatic retry of uncertain Q0 publish; heartbeat runs during active receive only."
+        "commit": "8e6f1ee5a572b10a8634fefcf772ecba32b9c906",
+        "verification": "SDK negotiates finite initial message/encoded-byte windows, explicit and automatic replenishment, ownership/invalid/quota typed errors, bounded pending deliveries, timeout cancellation, heartbeats and reconnect with original windows recreated once. Ten SDK tests PASS; independent publisher and two subscriber processes exchange Q0 through real TCP and shut down cleanly.",
+        "test_command": "cargo fmt --all -- --check; CARGO_HOME=/tmp/rovqet-cargo cargo check --workspace --locked; CARGO_HOME=/tmp/rovqet-cargo cargo test -p rovqet-q0 --test flow_overflow --locked; CARGO_HOME=/tmp/rovqet-cargo cargo test -p rovqet-q0 --locked; CARGO_HOME=/tmp/rovqet-cargo cargo test --workspace --locked; CARGO_HOME=/tmp/rovqet-cargo cargo build -p rovqet-server -p rovqet-sdk --examples --bins --locked; python3 scripts/q0_smoke.py; python3 scripts/check_docs.py",
+        "observed_result": "PASS: formatting, workspace compilation, 63 nonzero unit/integration tests (17 Q0 socket, 10 SDK, 10 transport, 4 scheduler, 4 router, 16 protocol, 2 core); independent-process publisher/two-subscriber smoke and documentation checks. No ignored tests.",
+        "limitations": "Serial client API; unused clients have no background heartbeat. Uncertain Q0 publishes return OutcomeUnknown and are not replayed automatically. No Q1/Q2 claim."
       }
     },
     {
