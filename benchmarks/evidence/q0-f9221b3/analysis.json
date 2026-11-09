@@ -1,0 +1,143 @@
+{
+  "source_commit": "f9221b304c7546fff5f3d57fd71f588de2068c78",
+  "slow_subscribers": [
+    {
+      "run": "E-slow-r1",
+      "subscribers": [
+        {
+          "subscriber": 0,
+          "count": 132,
+          "p50_ns": 1736052756,
+          "p95_ns": 2724424480,
+          "p99_ns": 2725489638,
+          "p999_ns": 2725512266
+        },
+        {
+          "subscriber": 1,
+          "count": 500,
+          "p50_ns": 418702,
+          "p95_ns": 562297,
+          "p99_ns": 721816,
+          "p999_ns": 786209
+        }
+      ]
+    },
+    {
+      "run": "E-slow-r2",
+      "subscribers": [
+        {
+          "subscriber": 0,
+          "count": 132,
+          "p50_ns": 1740673284,
+          "p95_ns": 2728469234,
+          "p99_ns": 2729232186,
+          "p999_ns": 2729638595
+        },
+        {
+          "subscriber": 1,
+          "count": 500,
+          "p50_ns": 389158,
+          "p95_ns": 506074,
+          "p99_ns": 582900,
+          "p999_ns": 631440
+        }
+      ]
+    },
+    {
+      "run": "E-slow-r3",
+      "subscribers": [
+        {
+          "subscriber": 0,
+          "count": 132,
+          "p50_ns": 1742207922,
+          "p95_ns": 2729379138,
+          "p99_ns": 2729963573,
+          "p999_ns": 2730424809
+        },
+        {
+          "subscriber": 1,
+          "count": 500,
+          "p50_ns": 397191,
+          "p95_ns": 521858,
+          "p99_ns": 625294,
+          "p999_ns": 983093
+        }
+      ]
+    },
+    {
+      "run": "E-credit-starved-r1",
+      "subscribers": [
+        {
+          "subscriber": 0,
+          "count": 0,
+          "p50_ns": null,
+          "p95_ns": null,
+          "p99_ns": null,
+          "p999_ns": null
+        },
+        {
+          "subscriber": 1,
+          "count": 500,
+          "p50_ns": 418841,
+          "p95_ns": 522137,
+          "p99_ns": 588557,
+          "p999_ns": 836565
+        }
+      ]
+    },
+    {
+      "run": "E-credit-starved-r2",
+      "subscribers": [
+        {
+          "subscriber": 0,
+          "count": 0,
+          "p50_ns": null,
+          "p95_ns": null,
+          "p99_ns": null,
+          "p999_ns": null
+        },
+        {
+          "subscriber": 1,
+          "count": 500,
+          "p50_ns": 416048,
+          "p95_ns": 516341,
+          "p99_ns": 576056,
+          "p999_ns": 710850
+        }
+      ]
+    },
+    {
+      "run": "E-credit-starved-r3",
+      "subscribers": [
+        {
+          "subscriber": 0,
+          "count": 0,
+          "p50_ns": null,
+          "p95_ns": null,
+          "p99_ns": null,
+          "p999_ns": null
+        },
+        {
+          "subscriber": 1,
+          "count": 500,
+          "p50_ns": 418911,
+          "p95_ns": 527515,
+          "p99_ns": 572982,
+          "p999_ns": 719859
+        }
+      ]
+    }
+  ],
+  "all_complete_runs_replayed": 36,
+  "correctness": {
+    "duplicates": 0,
+    "corrupt": 0,
+    "ordering_violations": 0,
+    "unknown_outcomes": 0
+  },
+  "notes": [
+    "Percentiles are per run, never averaged. All timestamps derive from one independent generator origin.",
+    "Broker counters include warmup; oracle measured counts exclude it.",
+    "COMPLETE means evidence collection and oracle integrity, not a production performance acceptance."
+  ]
+}

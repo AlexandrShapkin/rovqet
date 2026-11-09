@@ -107,5 +107,17 @@ failure, newest/oldest drops, coalescing, closed subscriptions and cancellation.
 Broker counters distinguish admission, enqueue, rejection, egress rejection,
 overload transitions and ingress TTL/unsubscribe/shutdown drops. Outstanding
 usage and active session/subscription counts are exposed for resource tests.
-Successful socket writes do not prove SDK receipt. The independent load/oracle
-and quantitative resource profile remain the next tasks (R0-02/A-07).
+Successful socket writes do not prove SDK receipt. The independent load/oracle (R0-02) is implemented. Build and run its reusable
+profiles using [benchmark instructions](benchmarks/README.md). The
+[exploratory Q0 evidence](benchmarks/evidence/q0-f9221b3/REPORT.md) records three
+repetitions, real sessions through4,096, all raw histogram distributions and
+explicit limits. A-07 remains IN_PROGRESS:10k sessions exceeded the safety
+budget, and overload runs exposed generator pressure rather than establishing
+maximum sustainable broker throughput.
+
+Controlled density experiments may set `--max-connections` explicitly. The default
+remains1,024; limits above it require `--connection-budget-bytes` covering the
+conservative per-session envelope. This validates a configured bound rather than
+reserving RAM or certifying capacity. The runner also checks available memory
+headroom; loopback enforcement remains mandatory. Optional
+`--metrics-interval-ms 250` emits bounded-frequency `BROKER_METRICS` JSON to stderr.

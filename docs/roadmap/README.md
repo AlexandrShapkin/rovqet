@@ -58,8 +58,9 @@ No mandatory issues, PRs, external approval or fixed review chain. Agents work d
 ## Current status
 
 D0 architecture and agent preparation are **DONE** (source fidelity checked and documentation CI passed). R0-01 Rust workspace and A-01 protocol codec are **DONE** with passing Rust CI (22 tests). A-02/A-03 and the Q0 resource, overflow and SDK-credit slices are implemented with
-real socket tests; exact completion evidence is in tasks.json. R0-02 independent
-load/oracle and A-07 quantitative resource validation are next. No measured
+real socket tests; exact completion evidence is in tasks.json. R0-02 independent load/oracle is DONE. A-07 has
+[measured exploratory evidence](../../benchmarks/evidence/q0-f9221b3/REPORT.md)
+but remains IN_PROGRESS for the safe10k-session and non-generator-limited capacity cases. No measured
 production throughput or density/SLO claim is made. A generated plan is not a test result.
 
 ## Work package ownership rule

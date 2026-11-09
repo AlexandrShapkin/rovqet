@@ -45,12 +45,15 @@ cargo test -p rovqet-protocol
 cargo test -p rovqet-wal
 cargo test -p rovqet-durable
 cargo test -p rovqet-consensus
-cargo run -p rovqet-testkit -- q0-smoke --clients 1000 --seed 42
+cargo run -p rovqet-testkit -- q0-load --publishers 1 --subscribers 1000 --messages 20 --rate 20 --seed 42 --output /tmp/q0-new-run
 cargo run -p rovqet-testkit -- q1-restart --seed 42
 cargo run -p rovqet-testkit -- q2-failover --seed 42
 ~~~
 
-These are **planned interfaces**, not commands that already work. Agents implementing testkit must expose stable CLI names or update this document in the same commit.
+The Q0 load command is implemented; see [benchmark instructions](../../benchmarks/README.md)
+for profiles, resource sampling and JSONL replay. Q1/Q2 commands remain planned
+interfaces and are not implemented. Current exploratory evidence is in the
+[Q0 report](../../benchmarks/evidence/q0-f9221b3/REPORT.md); it is not H1 qualification.
 
 ## Honest output schema
 
