@@ -133,8 +133,12 @@ routes the same demo topic across four partitions; NATS Core has no partition
 ownership or matching priority/resource hierarchy.
 
 NATS Core publishes are **unconfirmed client enqueue operations**, never Rovqet
-`ADMITTED`. End-of-stream flush only bounds publication progress; it is not a
-per-publication admission or delivery acknowledgement. Compare actual received
+`ADMITTED`. In pinned async-nats0.39, `flush()` only flushes the local socket
+writer. The generator separately uses a bounded unique temporary-subject
+self-echo barrier to establish server processing after authentication, SUB
+registration, publisher settlement and closure. This is not a per-publication
+admission or recipient-delivery acknowledgement. These control publications are
+outside workload ID accounting but remain in resource and network samples. Compare actual received
 IDs and same-process monotonic send-to-receipt distributions. Never compare Core
 publish-enqueue latency with Rovqet PUB_ACK latency. Missing unconfirmed copies
 remain separate from missing admitted copies. Server rejection/expiry reasons
@@ -166,3 +170,16 @@ Official references: [server release](https://github.com/nats-io/nats-server/rel
 [configuration](https://docs.nats.io/reference/config/),
 [Core publish](https://docs.nats.io/using-nats/developer/sending), and
 [slow consumers](https://docs.nats.io/running-a-nats-service/nats_admin/slow_consumers).
+
+The repeated Core/Q0 results and invalid-run details are in
+[evidence/nats-438fa0c/REPORT.md](evidence/nats-438fa0c/REPORT.md). Pair matching
+workloads without equating publication acknowledgment semantics:
+
+```sh
+python3 benchmarks/compare_q0.py --rovqet benchmarks/results/new-rovqet \
+  --nats benchmarks/results/new-nats --output /tmp/new-comparison.json
+```
+
+A result with event-evidence overflow is INVALID even if some subscriber copies
+were received. Its partial recorded offer/delivery counts cannot represent the
+complete workload. The runner preserves this failure, and replay rejects it.

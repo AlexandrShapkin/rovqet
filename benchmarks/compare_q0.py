@@ -26,7 +26,11 @@ def read_runs(root):
 def project(run):
     result = run.get('generator_result', {})
     oracle = result.get('oracle', {})
-    return {'status': run['status'], 'reason': run.get('reason'),
+    return {'status': run['status'],
+            'reason': run.get('reason') or run.get('error') or run.get('summary_error') or run.get('artifact_error'),
+            'evidence_valid': result.get('valid'),
+            'event_queue_overflow': result.get('event_queue_overflow'),
+            'error_events_or_invalid_records': result.get('error_events_or_invalid_records'),
             'git_sha': run.get('git_sha'), 'working_tree_dirty': run.get('working_tree_dirty'),
             'counts': {k: v for k, v in oracle.items() if isinstance(v, (int, bool))},
             'latency': {k: {metric: value for metric, value in v.items() if metric != 'buckets_ns'}

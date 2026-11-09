@@ -1,0 +1,534 @@
+{
+  "rovqet": {
+    "backend": "rovqet",
+    "command": [
+      "target/release/rovqet-testkit",
+      "replay",
+      "--run",
+      "<directory>/generator"
+    ],
+    "executed": 39,
+    "passed": 39,
+    "failed": 0,
+    "runs": [
+      {
+        "directory": "A-basic-r1",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "A-basic-r2",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "A-basic-r3",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "B-fanout-r1",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "B-fanout-r2",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "B-fanout-r3",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "C-many-to-many-r1",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "C-many-to-many-r2",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "C-many-to-many-r3",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "D-idle-1024-r1",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "D-idle-1024-r2",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "D-idle-1024-r3",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "D-idle-128-r1",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "D-idle-128-r2",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "D-idle-128-r3",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "D-idle-2000-r1",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "D-idle-2000-r2",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "D-idle-2000-r3",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "D-idle-512-r1",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "D-idle-512-r2",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "D-idle-512-r3",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "E-credit-starved-r1",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "E-credit-starved-r2",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "E-credit-starved-r3",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "E-slow-r1",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "E-slow-r2",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "E-slow-r3",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "F-burst-r1",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "F-burst-r2",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "F-burst-r3",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "F-controlled-10000-r1",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "F-controlled-10000-r2",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "F-controlled-10000-r3",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "F-controlled-5000-r1",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "F-controlled-5000-r2",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "F-controlled-5000-r3",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "F-overload-r1",
+        "runner_status": "INVALID",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "F-overload-r2",
+        "runner_status": "INVALID",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "F-overload-r3",
+        "runner_status": "INVALID",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      }
+    ]
+  },
+  "nats": {
+    "backend": "nats",
+    "command": [
+      "target/release/rovqet-testkit",
+      "replay",
+      "--run",
+      "<directory>/generator"
+    ],
+    "executed": 33,
+    "passed": 30,
+    "failed": 3,
+    "runs": [
+      {
+        "directory": "A-basic-r1",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "A-basic-r2",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "A-basic-r3",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "B-fanout-r1",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "B-fanout-r2",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "B-fanout-r3",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "C-many-to-many-r1",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "C-many-to-many-r2",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "C-many-to-many-r3",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "D-idle-1024-r1",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "D-idle-1024-r2",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "D-idle-1024-r3",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "D-idle-128-r1",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "D-idle-128-r2",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "D-idle-128-r3",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "D-idle-512-r1",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "D-idle-512-r2",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "D-idle-512-r3",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "E-slow-r1",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "E-slow-r2",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "E-slow-r3",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "F-burst-r1",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "F-burst-r2",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "F-burst-r3",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "F-controlled-10000-r1",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "F-controlled-10000-r2",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "F-controlled-10000-r3",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "F-controlled-5000-r1",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "F-controlled-5000-r2",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "F-controlled-5000-r3",
+        "runner_status": "COMPLETE",
+        "exit_code": 0,
+        "stdout": "PASS: independent JSONL replay matches every oracle aggregate",
+        "stderr": ""
+      },
+      {
+        "directory": "F-overload-r1",
+        "runner_status": "INVALID",
+        "exit_code": 2,
+        "stdout": "",
+        "stderr": "replay: invalid event at line 34162: send without offer"
+      },
+      {
+        "directory": "F-overload-r2",
+        "runner_status": "INVALID",
+        "exit_code": 2,
+        "stdout": "",
+        "stderr": "replay: invalid event at line 34671: send without offer"
+      },
+      {
+        "directory": "F-overload-r3",
+        "runner_status": "INVALID",
+        "exit_code": 2,
+        "stdout": "",
+        "stderr": "replay: invalid event at line 34050: delivery without send"
+      }
+    ]
+  }
+}

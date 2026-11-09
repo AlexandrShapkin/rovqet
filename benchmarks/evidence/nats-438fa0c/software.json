@@ -1,0 +1,20 @@
+{
+  "measurement_commit": "438fa0c622bb40180b2f526e7ba5ea1781a32bf5",
+  "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13) (Arch Linux rust 1:1.99.1-1)",
+  "nats_version": "nats-server: v2.11.10",
+  "archive_sha256": "e99ddaf76e0de2cce90e22d6cbe78d52f003e5e97d45b934d287af2f867c864e",
+  "binaries": {
+    "rovqet": {
+      "bytes": 1677736,
+      "sha256": "36ff8da101a07da822a954b65dc6bef0b6bc8dabe7230c9cd7c7bcf8c7e7823d"
+    },
+    "testkit": {
+      "bytes": 5821208,
+      "sha256": "e83751ae049d3e5faea6f5800d20d37daf5148ef92fbc7ad0897772293644ef4"
+    },
+    "nats": {
+      "bytes": 16680585,
+      "sha256": "60138396dbd173a2f1661132ea6aa3c06aaa937f332eb55a32e6e35107ee26d3"
+    }
+  }
+}

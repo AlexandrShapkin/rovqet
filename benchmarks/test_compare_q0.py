@@ -34,6 +34,15 @@ class ComparisonTests(unittest.TestCase):
             self.fixture(a); self.fixture(b,status='INVALID')
             self.assertEqual(c.compare(a,b)['runs'][0]['comparison'],'INVALID_OR_NOT_RUN')
 
+    def test_incomplete_evidence_flags_are_preserved(self):
+        row=c.project({'status':'INVALID','summary_error':'evidence invalid',
+                       'generator_result':{'valid':False,'event_queue_overflow':True,
+                                           'oracle':{'offered':12}}})
+        self.assertFalse(row['evidence_valid'])
+        self.assertTrue(row['event_queue_overflow'])
+        self.assertEqual(row['reason'],'evidence invalid')
+        self.assertEqual(row['counts']['offered'],12)
+
     def test_missing_artifact_fails(self):
         with tempfile.TemporaryDirectory() as d:
             a=Path(d)/'a'; self.fixture(a)

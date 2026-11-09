@@ -1,0 +1,338 @@
+{
+  "before": {
+    "source_run_sha256": "b53a8f78e5afd1b990c637793dd878e2e7340fe7606b327f01ffe61679dc2081",
+    "source": "/tmp/rovqet-instrument-before-hex/F-overload-r1/run.json",
+    "run": {
+      "status": "INVALID",
+      "reason": null,
+      "git_sha": "f329a595530ccd61058a3b4564f41faebf8a3c44",
+      "working_tree_dirty": true,
+      "counts": {
+        "admitted": 1030,
+        "authenticated": 110,
+        "client_dropped": 0,
+        "connected": 110,
+        "connection_failures": 0,
+        "corrupt": 0,
+        "delivered": 2612,
+        "delivery_attempts": 3612,
+        "disconnected": 110,
+        "duplicates": 0,
+        "errors": 0,
+        "expected_fanout_deliveries": 10300,
+        "incomplete": false,
+        "incomplete_outcomes": 0,
+        "missing_admitted": 7688,
+        "offered": 10000,
+        "ordering_violations": 0,
+        "rejected": 8970,
+        "sent": 10000,
+        "unexpected": 0,
+        "unique_delivered": 2612,
+        "unknown": 0,
+        "unknown_expected_fanout": 0,
+        "unknown_undelivered": 0,
+        "warmup_delivered": 1000,
+        "warmup_offered": 100
+      },
+      "latency": {
+        "ack_latency": {
+          "count": 10000,
+          "max_ns": 23151881,
+          "p50_ns": 6588742,
+          "p95_ns": 12621962,
+          "p999_ns": 21305611,
+          "p99_ns": 16358222
+        },
+        "connection_latency": {
+          "count": 110,
+          "max_ns": 11229385,
+          "p50_ns": 614469,
+          "p95_ns": 957322,
+          "p999_ns": 11229385,
+          "p99_ns": 1506000
+        },
+        "disconnect_latency": {
+          "count": 110,
+          "max_ns": 4632401,
+          "p50_ns": 83950,
+          "p95_ns": 315336,
+          "p999_ns": 4632401,
+          "p99_ns": 1679836
+        },
+        "e2e_latency": {
+          "count": 2612,
+          "max_ns": 1006173796,
+          "p50_ns": 814466599,
+          "p95_ns": 975862705,
+          "p999_ns": 998778380,
+          "p99_ns": 989424249
+        },
+        "offered_to_delivery_latency": {
+          "count": 2612,
+          "max_ns": 1022821862,
+          "p50_ns": 833789400,
+          "p95_ns": 992910896,
+          "p999_ns": 1016977495,
+          "p99_ns": 1007295946
+        }
+      },
+      "measurement": {
+        "authenticated_publishers": 100,
+        "authenticated_subscribers": 10,
+        "connection_attempts": 110,
+        "connection_establishment_secs": 0.087011443,
+        "connection_failures": 0,
+        "connections_per_sec": 1264.2015372621738,
+        "delivery_digest_ns": 89708025,
+        "delivery_observation_secs": 3.735824538,
+        "disconnect_secs": 0.001080034,
+        "established_connections": 110,
+        "late_offers_over_1ms": 10100,
+        "max_offer_lateness_ns": 438157162,
+        "mode": "load",
+        "not_attempted": 0,
+        "offer_secs": 0.535472013,
+        "payload_generation_and_digest_ns": 238826113,
+        "publish_settlement_secs": 0.734518124,
+        "publishers_finished": true,
+        "timing": "single monotonic origin within independent generator process; E2E from Sent to subscriber receipt; no cross-host clock subtraction"
+      },
+      "throughput": {
+        "active_admitted_per_sec": 918.7630283384927,
+        "active_measured_secs": 1.121072538,
+        "active_physical_deliveries_per_sec": 2329.911679631207,
+        "active_window": "first measured offer through last measured offer/ACK/delivery, excludes empty final drain; counters still include every rejected/client-dropped/unknown outcome",
+        "admitted_per_sec": 1402.2798979974523,
+        "delivery_rate_window": "measurement start through settlement and configured final drain; includes waiting for missing work",
+        "offered_per_sec": 18675.11234429352,
+        "physical_deliveries_per_sec": 699.1763059081871,
+        "published_unconfirmed_per_sec": 0.0,
+        "rejected_per_sec": 12212.088043725384,
+        "sent_per_sec": 13614.367941722836,
+        "unique_deliveries_per_sec": 699.1763059081871
+      },
+      "resources": {
+        "broker": {
+          "samples": 38,
+          "sampled_seconds": 3.807269416,
+          "rss_min_bytes": 2699264,
+          "rss_max_bytes": 6438912,
+          "fd_max": 120,
+          "cpu_seconds_delta": 2.09,
+          "cpu_percent_mean": 54.89498566129316,
+          "cpu_percent_peak_interval": 241.2418984475527
+        },
+        "generator": {
+          "samples": 37,
+          "sampled_seconds": 3.705559263,
+          "rss_min_bytes": 7974912,
+          "rss_max_bytes": 17412096,
+          "fd_max": 120,
+          "cpu_seconds_delta": 3.1100000000000003,
+          "cpu_percent_mean": 83.92795201127514,
+          "cpu_percent_peak_interval": 261.0237921788229
+        },
+        "network": {
+          "scope": "loopback network-namespace counters; sockstat memory may include host activity",
+          "interface": "lo",
+          "rx_bytes_delta": 17550932,
+          "tx_bytes_delta": 17550932,
+          "tcp_socket_memory_max_bytes": 1646592,
+          "tcp_socket_memory_status": "AVAILABLE_NAMESPACE_AGGREGATE"
+        }
+      },
+      "generator_saturation_reasons": [
+        "generator offered 18673.245/s below 90% of requested 100000/s",
+        "generator max offer lateness exceeds max(5ms, 10% of offer duration)"
+      ],
+      "instrumentation": {
+        "logging_enqueue_ns": 323982001,
+        "observed_events": 34132,
+        "oracle_observe_ns": 280273957
+      },
+      "semantics": "Rovqet ADMITTED is volatile bounded broker admission; no durability or recipient receipt guarantee.",
+      "server_version": null
+    },
+    "offers": {
+      "offers": 10000,
+      "elapsed_ns": 535451340,
+      "gaps_over_1ms": 77,
+      "gaps_under_10us": 0,
+      "max_gap_ns": 7707329
+    },
+    "retained_raw_directory": "benchmarks/results/instrument-before-hex-438fa0c"
+  },
+  "after": {
+    "source_run_sha256": "aeb0c0d3d8635478fb76540b95b80e7f9ce188c2ef06e453b3a3e34d40fb90fd",
+    "source": "/tmp/rovqet-instrument-after-hex/F-overload-r1/run.json",
+    "run": {
+      "status": "INVALID",
+      "reason": null,
+      "git_sha": "f329a595530ccd61058a3b4564f41faebf8a3c44",
+      "working_tree_dirty": true,
+      "counts": {
+        "admitted": 1072,
+        "authenticated": 110,
+        "client_dropped": 0,
+        "connected": 110,
+        "connection_failures": 0,
+        "corrupt": 0,
+        "delivered": 3388,
+        "delivery_attempts": 4388,
+        "disconnected": 110,
+        "duplicates": 0,
+        "errors": 0,
+        "expected_fanout_deliveries": 10720,
+        "incomplete": false,
+        "incomplete_outcomes": 0,
+        "missing_admitted": 7332,
+        "offered": 10000,
+        "ordering_violations": 0,
+        "rejected": 8928,
+        "sent": 10000,
+        "unexpected": 0,
+        "unique_delivered": 3388,
+        "unknown": 0,
+        "unknown_expected_fanout": 0,
+        "unknown_undelivered": 0,
+        "warmup_delivered": 1000,
+        "warmup_offered": 100
+      },
+      "latency": {
+        "ack_latency": {
+          "count": 10000,
+          "max_ns": 21674935,
+          "p50_ns": 6306022,
+          "p95_ns": 12555054,
+          "p999_ns": 19551532,
+          "p99_ns": 15735512
+        },
+        "connection_latency": {
+          "count": 110,
+          "max_ns": 7536776,
+          "p50_ns": 649390,
+          "p95_ns": 1080314,
+          "p999_ns": 7536776,
+          "p99_ns": 1317008
+        },
+        "disconnect_latency": {
+          "count": 110,
+          "max_ns": 5561647,
+          "p50_ns": 85696,
+          "p95_ns": 138637,
+          "p999_ns": 5561647,
+          "p99_ns": 763721
+        },
+        "e2e_latency": {
+          "count": 3388,
+          "max_ns": 842425475,
+          "p50_ns": 719053589,
+          "p95_ns": 821105478,
+          "p999_ns": 839985759,
+          "p99_ns": 834669885
+        },
+        "offered_to_delivery_latency": {
+          "count": 3388,
+          "max_ns": 888205283,
+          "p50_ns": 801408743,
+          "p95_ns": 856045129,
+          "p999_ns": 881383967,
+          "p99_ns": 866816421
+        }
+      },
+      "measurement": {
+        "authenticated_publishers": 100,
+        "authenticated_subscribers": 10,
+        "connection_attempts": 110,
+        "connection_establishment_secs": 0.086483787,
+        "connection_failures": 0,
+        "connections_per_sec": 1271.914700035048,
+        "delivery_digest_ns": 40835000,
+        "delivery_observation_secs": 3.716189288,
+        "disconnect_secs": 0.000901799,
+        "established_connections": 110,
+        "late_offers_over_1ms": 10100,
+        "max_offer_lateness_ns": 325994191,
+        "mode": "load",
+        "not_attempted": 0,
+        "offer_secs": 0.423273981,
+        "payload_generation_and_digest_ns": 147286308,
+        "publish_settlement_secs": 0.71547531,
+        "publishers_finished": true,
+        "timing": "single monotonic origin within independent generator process; E2E from Sent to subscriber receipt; no cross-host clock subtraction"
+      },
+      "throughput": {
+        "active_admitted_per_sec": 910.6943280950555,
+        "active_measured_secs": 1.177123835,
+        "active_physical_deliveries_per_sec": 2878.20185036012,
+        "active_window": "first measured offer through last measured offer/ACK/delivery, excludes empty final drain; counters still include every rejected/client-dropped/unknown outcome",
+        "admitted_per_sec": 1498.3046724561327,
+        "delivery_rate_window": "measurement start through settlement and configured final drain; includes waiting for missing work",
+        "offered_per_sec": 23625.359575314884,
+        "physical_deliveries_per_sec": 911.6866062071272,
+        "published_unconfirmed_per_sec": 0.0,
+        "rejected_per_sec": 12478.418018366001,
+        "sent_per_sec": 13976.722690822135,
+        "unique_deliveries_per_sec": 911.6866062071272
+      },
+      "resources": {
+        "broker": {
+          "samples": 38,
+          "sampled_seconds": 3.833586691,
+          "rss_min_bytes": 3215360,
+          "rss_max_bytes": 6758400,
+          "fd_max": 120,
+          "cpu_seconds_delta": 2.23,
+          "cpu_percent_mean": 58.17006839144413,
+          "cpu_percent_peak_interval": 238.49672943013869
+        },
+        "generator": {
+          "samples": 37,
+          "sampled_seconds": 3.730624135,
+          "rss_min_bytes": 8065024,
+          "rss_max_bytes": 18157568,
+          "fd_max": 120,
+          "cpu_seconds_delta": 3.18,
+          "cpu_percent_mean": 85.24042854293066,
+          "cpu_percent_peak_interval": 311.88033848556597
+        },
+        "network": {
+          "scope": "loopback network-namespace counters; sockstat memory may include host activity",
+          "interface": "lo",
+          "rx_bytes_delta": 18771350,
+          "tx_bytes_delta": 18771350,
+          "tcp_socket_memory_max_bytes": 1654784,
+          "tcp_socket_memory_status": "AVAILABLE_NAMESPACE_AGGREGATE"
+        }
+      },
+      "generator_saturation_reasons": [
+        "generator offered 23622.997/s below 90% of requested 100000/s",
+        "generator max offer lateness exceeds max(5ms, 10% of offer duration)"
+      ],
+      "instrumentation": {
+        "logging_enqueue_ns": 339997353,
+        "observed_events": 34908,
+        "oracle_observe_ns": 300971493
+      },
+      "semantics": "Rovqet ADMITTED is volatile bounded broker admission; no durability or recipient receipt guarantee.",
+      "server_version": null
+    },
+    "offers": {
+      "offers": 10000,
+      "elapsed_ns": 423252120,
+      "gaps_over_1ms": 82,
+      "gaps_under_10us": 5,
+      "max_gap_ns": 3984688
+    },
+    "retained_raw_directory": "benchmarks/results/instrument-after-hex-438fa0c"
+  },
+  "limits": [
+    "One dirty-tree diagnostic run each, not a statistically established speedup or capacity measurement.",
+    "Stage elapsed timings include preemption and overlap across tasks; not exclusive CPU fractions.",
+    "perf record cycles:u unavailable: perf_event_paranoid=2 denied event recording. No system settings changed.",
+    "Fixed hex encoding preserves SHA256 values; removed one unnecessary Rovqet receive payload clone.",
+    "Per-event timers and delivery atomic counter themselves add overhead; all final compared runs use identical instrumentation.",
+    "Both diagnostic overload runs INVALID; JSONL/source remains locally in /tmp paths above."
+  ]
+}

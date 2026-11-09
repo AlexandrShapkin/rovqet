@@ -35,7 +35,7 @@
       ],
       "evidence": {
         "commit": "734c10e4d19056684b37c68c9324afbbec3e3e4b",
-        "verification": "Chapters 00–16, concrete protocol/inter-node RPC appendices, state/flow/C4 diagram sources and failure contracts reviewed; fast documentation check PASS. Diagram renderers not executed.",
+        "verification": "Chapters 00\u201316, concrete protocol/inter-node RPC appendices, state/flow/C4 diagram sources and failure contracts reviewed; fast documentation check PASS. Diagram renderers not executed.",
         "ci_run": "https://github.com/AlexandrShapkin/rovqet/actions/runs/42143846562"
       }
     },
@@ -128,13 +128,29 @@
       "depends_on": [
         "R0-02"
       ],
-      "status": "TODO",
+      "status": "DONE",
       "architecture": "14",
       "proof": "Baseline smoke with semantic rubric and raw data",
       "paths": [
-        "benchmarks/"
+        "benchmarks/",
+        "crates/testkit/"
       ],
-      "evidence": null
+      "evidence": {
+        "commit": "438fa0c622bb40180b2f526e7ba5ea1781a32bf5",
+        "verification": "Checksum-pinned NATS Core2.11.10, official async-nats0.39.0 isolated to testkit, same deterministic open-loop scheduler/payloads/JSONL oracle, bounded queues and shared Linux sampler. NATS local enqueue is PublishedUnconfirmed; no admission ACK or equivalent ACK-latency claim. Actual self-echo barriers establish readiness/settlement. Future-only JetStream configs are not durability evidence.",
+        "test_command": "cargo fmt --all -- --check; CARGO_HOME=/tmp/rovqet-cargo cargo check --workspace --locked; CARGO_HOME=/tmp/rovqet-cargo cargo test --workspace --locked; CARGO_HOME=/tmp/rovqet-cargo cargo test -p rovqet-testkit --locked; python3 -m unittest discover -s benchmarks -p 'test_*.py'; python3 scripts/q0_smoke.py; python3 benchmarks/install_nats.py; CARGO_HOME=/tmp/rovqet-cargo cargo build --release --locked -p rovqet-server -p rovqet-testkit; python3 benchmarks/run_q0.py --output benchmarks/results/comparison-438fa0c-rovqet --repetitions 3; python3 benchmarks/run_q0.py --backend nats --output benchmarks/results/comparison-438fa0c-nats --repetitions 3; target/release/rovqet-testkit replay --run <each executed generator directory>; python3 benchmarks/compare_q0.py --rovqet benchmarks/results/comparison-438fa0c-rovqet --nats benchmarks/results/comparison-438fa0c-nats --output /tmp/rovqet-comparison-final.json",
+        "observed_result": "84 Rust workspace tests and16 focused testkit tests PASS;22 Python tests PASS. Existing independent SDK smoke, actual pinned NATS1000-message smoke, both oracle replays and legacy trace replay PASS. Three repetitions per profile: Rovqet36 COMPLETE/3 INVALID/6 NOT_RUN; NATS30 COMPLETE/3 INVALID/12 NOT_RUN. All66 complete traces and3 generator-limited Rovqet traces replay PASS. Three NATS overload traces intentionally INVALID after bounded evidence overflow and fail replay; partial event counts are not performance/correctness evidence. CI42707917261 docs+rust SUCCESS including both real socket smokes.",
+        "artifacts": [
+          "benchmarks/evidence/nats-438fa0c/REPORT.md",
+          "benchmarks/evidence/nats-438fa0c/comparison.json",
+          "benchmarks/evidence/nats-438fa0c/replay-validation.json",
+          "benchmarks/evidence/nats-438fa0c/software.json",
+          "benchmarks/evidence/nats-438fa0c/rovqet/results.json",
+          "benchmarks/evidence/nats-438fa0c/nats/results.json"
+        ],
+        "ci_run": "https://github.com/AlexandrShapkin/rovqet/actions/runs/42707917261",
+        "limitations": "Short sequential same-host exploratory runs; no equivalent admission ACK, credits/TTL/drop/egress policy or durability comparison. NATS credit-starved profile NOT_RUN. Changing host memory headroom prevented4096/10k and NATS2000; these are safety skips, not measured capacity limits. Both100k/s overload scenarios generator-limited; NATS evidence additionally overflows and cannot support total-accounting claims. No maximum sustainable service-rate/H1/VAL-01 claim; A-07 stays IN_PROGRESS. Full raw traces retained locally ignored; compact distributions/resources/representative traces and SHA256 index committed."
+      }
     },
     {
       "id": "R0-04",
@@ -323,7 +339,12 @@
           "benchmarks/evidence/q0-f9221b3/resources.jsonl.gz"
         ],
         "limitations": "A-07 remains incomplete: safe10k-session environment is unavailable; generator peak~392%CPU/four-worker runtime and offer lateness~96ms limit overload capacity interpretation. No maximum sustainable broker rate or production PERF/H1/VAL-01 PASS. Kernel socket/network counters are namespace aggregates; exclusive broker kernel-memory/ingress and cgroup quotas UNAVAILABLE. Short exploratory repetitions, not soak. Full rawevents retained locally ignored with SHA256 index, representative full trace committed.",
-        "correctness_finding": "Initial E-slow run on942f4ef INVALID with52 inversions. Narrow f9221b3 gate-scan FIFO fix plus deterministic transport regression; complete matrix rerun after fix. Original failure evidence retained before-fix/."
+        "correctness_finding": "Initial E-slow run on942f4ef INVALID with52 inversions. Narrow f9221b3 gate-scan FIFO fix plus deterministic transport regression; complete matrix rerun after fix. Original failure evidence retained before-fix/.",
+        "comparative_followup": {
+          "source_commit": "438fa0c",
+          "artifact": "benchmarks/evidence/nats-438fa0c/REPORT.md",
+          "result": "Repeated matched-config Core/Q0 subset,69 successful replays across66 COMPLETE+3 generator-limited Rovqet runs;3 NATS overload evidence failures retained INVALID. Controlled5k/s and10k/s offer schedules maintained, but Rovqet quota/drop results and differing Core buffering prevent a general service-capacity claim. Current safe idle maxima2000 Rovqet/1024 NATS, not actual capacity limits. Prior4096 evidence preserved.10k remains NOT_RUN; A-07 remains IN_PROGRESS."
+        }
       }
     },
     {
