@@ -1,0 +1,9 @@
+[package]
+name = "rovqet-router"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+rovqet-core = { path = "../core" }

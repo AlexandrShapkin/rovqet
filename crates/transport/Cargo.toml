@@ -1,0 +1,10 @@
+[package]
+name = "rovqet-transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+rovqet-protocol = { path = "../protocol" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }

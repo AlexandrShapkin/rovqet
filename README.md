@@ -2,7 +2,7 @@
 
 Rovqet is an experimental, Rust/Tokio message broker focused on dense client connectivity, predictable tail latency, priority isolation and selective durability.
 
-**Status: architecture-first design complete; Rust workspace and wire codec implemented, broker networking not yet started.** The repository is initialized with the normative v1.1.1 requirements, a deliberately reduced research-MVP delivery profile, detailed component contracts, implementation roadmap and instructions for autonomous AI coding agents. Do not interpret architectural designs or proposed interfaces as implemented features.
+**Status: operational development-only Q0 TCP pub/sub and Rust SDK; durability and quantitative validation remain unfinished.** The repository is initialized with the normative v1.1.1 requirements, a deliberately reduced research-MVP delivery profile, detailed component contracts, implementation roadmap and instructions for autonomous AI coding agents. Do not interpret architectural designs or proposed interfaces as implemented features.
 
 ## Read in this order
 
@@ -34,4 +34,50 @@ A+B gives a *local research prototype*; A+B+C+D gives a *concept-validation MVP*
 - \`bash scripts/preflight.sh\`: run only available fast, relevant local checks.
 - After implementation starts: \`cargo fmt --check\`, \`cargo check --workspace\`, and focused \`cargo test\` when applicable.
 
-Rust workspace and v1 bounds-first protocol codec now compile; the broker has no network listener or message delivery yet. The CLI deliberately reports that the server is not implemented. Packaging/license and remaining crate APIs are future tasks.
+Run the broker and SDK examples in separate terminals:
+
+```sh
+cargo run -p rovqet-server -- --listen 127.0.0.1:7443
+cargo run -p rovqet-sdk --example q0 -- sub demo
+cargo run -p rovqet-sdk --example q0 -- pub demo hello
+```
+
+The fixed development topics are `demo` and `telemetry` (four partitions each).
+The listener refuses non-loopback addresses; AUTH method 0 uses the static `dev`
+identity. Q1/Q2 and durable consumer operations are rejected. `Admitted` means
+bounded volatile admission, with no promise of durability or subscriber receipt.
+
+Reproduce the independent-process smoke (one publisher, two subscribers):
+
+```sh
+cargo build -p rovqet-server -p rovqet-sdk --examples --bins --locked
+python3 scripts/q0_smoke.py
+cargo fmt --all -- --check
+cargo check --workspace --locked
+cargo test --workspace --locked
+```
+
+Current bounds: 1,024 connections including incomplete handshakes; one inbound
+frame per session (1 MiB frame, 256 KiB payload); 64 outbound data slots and
+256 KiB per session including the active writer; eight protected control slots
+and 4 KiB per session. Q0 ingress has 1,024 slots (one reserved for CONTROL),
+16 MiB global estimated cost, 8 MiB per topic and 128 slots/1 MiB per publishing
+session. Admission cost includes estimated physical recipients and metadata.
+These are configurable library prototype bounds, **not measured capacity or
+production SLOs**. Kernel socket and allocator memory are additional.
+
+Library topic policies support `DROP_NEWEST` subscriber shedding and
+`REJECT_PUBLISH` pre-admission outbound reservation. `DROP_OLDEST` and
+`COALESCE_LATEST` configurations are rejected at broker construction. Explicit
+wire flow-credit, egress rate quotas, full overload hysteresis and the independent
+load/oracle/resource profile remain unfinished (A-04/A-05/R0-02/A-07). No WAL is
+called by Q0. Exact names only; wildcard and production authorization are deferred.
+
+The SDK serializes operations per client, bounds pending deliveries, sends
+heartbeats while receiving, and explicitly reconnects with bounded exponential
+backoff/jitter and subscription recreation. An unused client has no background
+keepalive and may need reconnect after idle expiry. A lost publication response
+is `OutcomeUnknown`; uncertain Q0 publications are never automatically replayed.
+Transport counters distinguish successful MESSAGE writes, writer expiry and
+write failure; broker counters distinguish admission, enqueue, rejection and
+queue/TTL/unsubscribe drops. Successful socket writes do not prove SDK receipt.

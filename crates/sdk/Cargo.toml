@@ -7,6 +7,9 @@ publish = false
 
 [dependencies]
 rovqet-core = { path = "../core" }
+rovqet-protocol = { path = "../protocol" }
+rovqet-transport = { path = "../transport" }
+tokio = { version = "1", features = ["net", "io-util", "time", "macros", "rt-multi-thread"] }
 
 [lib]
 name = "rovqet_sdk"

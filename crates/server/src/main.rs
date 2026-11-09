@@ -1,91 +1,56 @@
-//! Initial executable scaffold. Network listener is implemented in task A-02.
-
+//! Isolated development broker: plaintext and static identity on loopback only.
 #![forbid(unsafe_code)]
-
-use std::ffi::OsString;
-use std::fs;
-use std::path::Path;
-
-/// Exit status reserved for not-yet-implemented server execution.
-const EXIT_UNAVAILABLE: i32 = 78;
-const EXIT_USAGE: i32 = 2;
-
-fn main() {
-    std::process::exit(run(std::env::args_os().skip(1)));
-}
-
-fn run(args: impl IntoIterator<Item = OsString>) -> i32 {
-    let args: Vec<OsString> = args.into_iter().collect();
-
-    match args.as_slice() {
-        [flag] if flag == "--version" => {
-            println!(
-                "rovqet {} (wire v{}, bootstrap only; no broker listener)",
-                env!("CARGO_PKG_VERSION"),
-                rovqet_protocol::WIRE_MAJOR_VERSION
-            );
-            0
-        }
-        [flag] if flag == "--help" || flag == "-h" => {
-            println!(
-                "rovqet {}\n\nUsage:\n  rovqet --version\n  rovqet --help\n  rovqet --config <FILE>\n\nStatus: Rust workspace bootstrap. Broker networking is not implemented.",
-                env!("CARGO_PKG_VERSION")
-            );
-            0
-        }
-        [flag, path] if flag == "--config" => {
-            let path = Path::new(path);
-            match fs::read(path) {
-                Ok(_) => {
-                    eprintln!(
-                        "rovqet: config file '{}' is readable but not parsed; server not implemented (task A-02). No listener started.",
-                        path.display()
-                    );
-                    EXIT_UNAVAILABLE
-                }
-                Err(err) => {
-                    eprintln!("rovqet: cannot read config '{}': {err}", path.display());
-                    EXIT_USAGE
-                }
-            }
-        }
+use rovqet_transport::{Config, serve};
+#[tokio::main]
+async fn main() -> std::io::Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args == ["--version"] {
+        println!(
+            "rovqet {} (wire v1; development profile)",
+            env!("CARGO_PKG_VERSION")
+        );
+        return Ok(());
+    }
+    if args == ["--help"] || args == ["-h"] {
+        println!(
+            "Usage: rovqet [--listen 127.0.0.1:7443]\nDevelopment only: plaintext, static dev identity, loopback required.\nQ0 topics: demo, telemetry."
+        );
+        return Ok(());
+    }
+    let addr = match args.as_slice() {
+        [] => "127.0.0.1:7443",
+        [flag, addr] if flag == "--listen" => addr,
         _ => {
-            eprintln!("rovqet: expected --help, --version or --config <FILE>");
-            EXIT_USAGE
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "expected --listen <LOOPBACK:PORT>, --help or --version",
+            ));
         }
+    };
+    let addr: std::net::SocketAddr = addr
+        .parse()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    if !addr.ip().is_loopback() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "development listener must be loopback",
+        ));
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn args(values: &[&str]) -> Vec<OsString> {
-        values.iter().map(OsString::from).collect()
-    }
-
-    #[test]
-    fn version_and_help_are_available() {
-        assert_eq!(run(args(&["--version"])), 0);
-        assert_eq!(run(args(&["--help"])), 0);
-    }
-
-    #[test]
-    fn missing_argument_or_config_is_not_silent_success() {
-        assert_eq!(run(args(&[])), EXIT_USAGE);
-        assert_eq!(run(args(&["--config"])), EXIT_USAGE);
-        assert_eq!(
-            run(args(&["--config", "__missing_rovqet_file__.yaml"])),
-            EXIT_USAGE
-        );
-    }
-
-    #[test]
-    fn readable_config_does_not_claim_that_broker_started() {
-        let existing = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
-        assert_eq!(
-            run(vec![OsString::from("--config"), existing.into_os_string()]),
-            EXIT_UNAVAILABLE
-        );
-    }
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    eprintln!(
+        "rovqet development profile listening on {}",
+        listener.local_addr()?
+    );
+    let broker = rovqet_q0::Broker::development();
+    let (stop, mut rx) = tokio::sync::watch::channel(false);
+    let dispatcher = tokio::spawn(broker.clone().run(async move {
+        let _ = rx.changed().await;
+    }));
+    let result = serve(listener, Config::default(), broker, async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .await;
+    let _ = stop.send(true);
+    let _ = dispatcher.await;
+    result
 }

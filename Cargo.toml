@@ -5,6 +5,10 @@ members = [
     "crates/core",
     "crates/sdk",
     "crates/server",
+    "crates/transport",
+    "crates/router",
+    "crates/scheduler",
+    "crates/q0",
 ]
 
 [workspace.package]

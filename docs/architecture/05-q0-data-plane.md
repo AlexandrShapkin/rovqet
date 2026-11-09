@@ -48,3 +48,20 @@ Matching exact-topic subscribers is O(1) lookup plus O(recipients) physical fan-
 - Mixed Q0 + Q1/Q2 load: fsync/quorum slowdown cannot block the Q0 worker except for measured shared hardware resource contention.
 
 **Out of MVP:** guaranteed delivery to all subscribers, wildcard regex language, per-client persistent Q0 cursors, bridging to MQTT/Kafka, global ordering.
+
+## Implemented development subset
+
+The exact-name parser accepts ASCII paths of at most 255 bytes, nonempty segments
+using `[A-Za-z0-9_.-]`. Partition scheme v1 is pinned FNV-1a64 over tenant ID
+(u64 BE), topic ID (u64 BE), then key bytes, modulo the configured partition count.
+The router fixture pins these bytes; changing the scheme requires migration.
+
+The initial broker supports DROP_NEWEST at subscriber queues and REJECT_PUBLISH
+by reserving every current recipient's outbound slot/bytes before admission.
+Reservations are released on rejection, cancellation or expiry. Removal before
+dispatch suppresses reserved deliveries; a socket write already in progress may
+finish. Other overflow configurations fail construction explicitly. Flow-credit,
+DROP_OLDEST and COALESCE_LATEST remain unfinished rather than silently aliased.
+Shared encoded immutable frames avoid payload copies per recipient. TTL is
+checked at dispatch and before socket write. Transport write completion is counted
+separately from broker enqueue and from independently observed SDK reception.

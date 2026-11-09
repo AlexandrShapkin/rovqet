@@ -1,0 +1,17 @@
+[package]
+name = "rovqet-q0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+rovqet-core = { path = "../core" }
+rovqet-protocol = { path = "../protocol" }
+rovqet-router = { path = "../router" }
+rovqet-scheduler = { path = "../scheduler" }
+rovqet-transport = { path = "../transport" }
+tokio = { version = "1", features = ["sync", "rt", "time"] }
+
+[dev-dependencies]
+rovqet-sdk = { path = "../sdk" }
