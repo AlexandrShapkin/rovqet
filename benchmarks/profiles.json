@@ -111,6 +111,28 @@
       "idle_connections": 4096,
       "duration_secs": 3,
       "broker_max_connections": 4096
+    },
+    "F-controlled-5000": {
+      "publishers": 10,
+      "subscribers": 1,
+      "messages": 5000,
+      "rate": 5000,
+      "payload_bytes": 1024,
+      "warmup_messages": 100,
+      "drain_ms": 2000,
+      "check_order": false,
+      "broker_max_connections": 1024
+    },
+    "F-controlled-10000": {
+      "publishers": 10,
+      "subscribers": 1,
+      "messages": 10000,
+      "rate": 10000,
+      "payload_bytes": 1024,
+      "warmup_messages": 100,
+      "drain_ms": 2000,
+      "check_order": false,
+      "broker_max_connections": 1024
     }
   }
 }

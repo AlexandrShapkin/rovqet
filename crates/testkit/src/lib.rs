@@ -59,7 +59,13 @@ pub fn payload_identity(bytes: &[u8]) -> Result<(u64, usize), String> {
 
 pub fn digest(bytes: &[u8]) -> String {
     let value = Sha256::digest(bytes);
-    value.iter().map(|byte| format!("{byte:02x}")).collect()
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(64);
+    for byte in value {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 15) as usize] as char);
+    }
+    encoded
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +75,8 @@ pub enum Outcome {
     Rejected,
     Unknown,
     ClientDropped,
+    /// Local NATS Core enqueue; never a server admission or delivery acknowledgment.
+    PublishedUnconfirmed,
 }
 
 /// Monotonic offsets use one generator-process origin, never wall-clock subtraction.
@@ -103,6 +111,11 @@ pub enum Event {
         authenticated: bool,
         at_ns: u64,
         elapsed_ns: u64,
+    },
+    /// Callback notifications are a lower bound: async-nats bounds its callback channel.
+    NatsSlowConsumer {
+        client: String,
+        at_ns: u64,
     },
     Error {
         message: String,
@@ -151,11 +164,23 @@ impl LatencyDistribution {
     }
 }
 
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Summary {
     pub offered: u64,
     pub sent: u64,
     pub admitted: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub published_unconfirmed: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub nats_slow_consumer_notifications: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unconfirmed_expected_fanout: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unconfirmed_unreceived: u64,
     pub rejected: u64,
     pub unknown: u64,
     pub client_dropped: u64,
@@ -251,6 +276,10 @@ impl Oracle {
                 offered: 0,
                 sent: 0,
                 admitted: 0,
+                published_unconfirmed: 0,
+                nats_slow_consumer_notifications: 0,
+                unconfirmed_expected_fanout: 0,
+                unconfirmed_unreceived: 0,
                 rejected: 0,
                 unknown: 0,
                 client_dropped: 0,
@@ -344,6 +373,7 @@ impl Oracle {
                 if m.measured {
                     match outcome {
                         Outcome::Admitted => self.totals.admitted += 1,
+                        Outcome::PublishedUnconfirmed => self.totals.published_unconfirmed += 1,
                         Outcome::Rejected => self.totals.rejected += 1,
                         Outcome::Unknown => self.totals.unknown += 1,
                         Outcome::ClientDropped => self.totals.client_dropped += 1,
@@ -431,6 +461,9 @@ impl Oracle {
                     self.totals.connection_failures += 1;
                 }
             }
+            Event::NatsSlowConsumer { .. } => {
+                self.totals.nats_slow_consumer_notifications += 1;
+            }
             Event::Error { .. } => {
                 self.totals.errors += 1;
             }
@@ -445,6 +478,10 @@ impl Oracle {
                 Some(Outcome::Admitted) => {
                     result.expected_fanout_deliveries += self.subscribers as u64;
                     result.missing_admitted += self.subscribers as u64 - valid;
+                }
+                Some(Outcome::PublishedUnconfirmed) => {
+                    result.unconfirmed_expected_fanout += self.subscribers as u64;
+                    result.unconfirmed_unreceived += self.subscribers as u64 - valid;
                 }
                 Some(Outcome::Unknown) => {
                     result.unknown_expected_fanout += self.subscribers as u64;
@@ -674,6 +711,28 @@ mod tests {
             &a[20..28],
             &[0xae, 0xe9, 0x59, 0xb5, 0x5d, 0x88, 0x39, 0x27]
         );
+    }
+    #[test]
+    fn nats_local_enqueue_is_not_admission_ack_or_definite_loss() {
+        let mut oracle = Oracle::new(2, 10, false).unwrap();
+        send(&mut oracle, 1, Outcome::PublishedUnconfirmed);
+        oracle.observe(&delivery(1, 0, 50)).unwrap();
+        oracle
+            .observe(&Event::NatsSlowConsumer {
+                client: "sub-1".into(),
+                at_ns: 60,
+            })
+            .unwrap();
+        let summary = oracle.summary();
+        assert_eq!(summary.published_unconfirmed, 1);
+        assert_eq!(summary.unconfirmed_expected_fanout, 2);
+        assert_eq!(summary.unconfirmed_unreceived, 1);
+        assert_eq!(summary.admitted, 0);
+        assert_eq!(summary.missing_admitted, 0);
+        assert_eq!(summary.unknown, 0);
+        assert_eq!(summary.ack_latency.count, 0);
+        assert_eq!(summary.nats_slow_consumer_notifications, 1);
+        assert!(!summary.incomplete);
     }
     #[test]
     fn artificial_transport_fixture_accounts_missing_duplicates_corruption_and_unknown() {

@@ -43,6 +43,12 @@ jobs:
         run: python3 benchmarks/run_q0.py --profiles A-basic --repetitions 1 --broker target/debug/rovqet --testkit target/debug/rovqet-testkit --output /tmp/rovqet-testkit-ci
       - name: Replay independent oracle evidence
         run: target/debug/rovqet-testkit replay --run /tmp/rovqet-testkit-ci/A-basic-r1/generator
+      - name: Install checksum-pinned NATS Core baseline
+        run: python3 benchmarks/install_nats.py
+      - name: Independent NATS Core socket smoke
+        run: python3 benchmarks/run_q0.py --backend nats --profiles A-basic --repetitions 1 --testkit target/debug/rovqet-testkit --output /tmp/rovqet-nats-ci
+      - name: Replay NATS independent oracle evidence
+        run: target/debug/rovqet-testkit replay --run /tmp/rovqet-nats-ci/A-basic-r1/generator
 
 # Fast checks only. No PR requirement, mandatory human review, release build,
 # long-running soak or full benchmark suite on ordinary main commits.

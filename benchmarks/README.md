@@ -105,3 +105,64 @@ visible. Missing admitted copies are Q0 observations and are never reclassified
 as expiry without broker telemetry; unknown outcomes are never called definite
 loss. Broker drop/expiry telemetry includes warmup, while oracle measured counts
 exclude it. These totals must not be compared without that distinction.
+
+## Pinned NATS Core baseline (R0-03)
+
+Use the same release testkit and profiles for both backends. The official Linux
+amd64 NATS Server 2.11.10 release archive is SHA-256 pinned in `install_nats.py`:
+
+```sh
+python3 benchmarks/install_nats.py --output /tmp/rovqet-nats-server-2.11.10
+python3 benchmarks/run_q0.py --backend nats \
+  --nats-server /tmp/rovqet-nats-server-2.11.10 \
+  --profiles A-basic,B-fanout,C-many-to-many,D-idle-128,D-idle-512,D-idle-1024,D-idle-4096,E-slow,F-overload,F-burst \
+  --repetitions 3 --seed 42 --output benchmarks/results/nats-new
+```
+
+`nats/core.conf` is an isolated plaintext loopback development configuration with
+static test credentials, 256KiB maximum payload and 256KiB per-connection pending
+output ceiling (NATS requires max_payload <= max_pending; Rovqet allows1MiB frames,
+while both compared workloads use at most1KiB). The runner copies it into every run directory, substitutes only
+the profile's maximum connection count, verifies the server version, starts a
+fresh server, discovers its actual ephemeral TCP listener and stops it on exit.
+Resource sampling, deterministic seed, offered schedule, payload identities,
+JSONL event oracle and histograms reuse the Rovqet path. The generator uses the
+official `async-nats` Rust client, isolated in the testkit crate. No queue groups
+are used: exact subject `demo` subscriptions all receive physical copies. Rovqet
+routes the same demo topic across four partitions; NATS Core has no partition
+ownership or matching priority/resource hierarchy.
+
+NATS Core publishes are **unconfirmed client enqueue operations**, never Rovqet
+`ADMITTED`. End-of-stream flush only bounds publication progress; it is not a
+per-publication admission or delivery acknowledgement. Compare actual received
+IDs and same-process monotonic send-to-receipt distributions. Never compare Core
+publish-enqueue latency with Rovqet PUB_ACK latency. Missing unconfirmed copies
+remain separate from missing admitted copies. Server rejection/expiry reasons
+that Core cannot expose per publication are UNAVAILABLE, rather than invented.
+
+The slow consumer configurations are deliberately semantically different:
+Rovqet enforces delivery credits, DROP_NEWEST and broker queue TTL; NATS Core has
+no equivalent credit replenishment or per-message TTL in this profile and may
+disconnect slow consumers at its pending-output boundary. SDK/client channel
+capacities do not imply identical effective kernel/runtime buffering.
+`E-credit-starved` is explicitly NOT_RUN for NATS. A slow/overload observation is
+useful but does not establish an equivalent drop policy or durability advantage.
+The high-density resource-envelope safety check is retained for both baselines;
+10,000 sessions remain NOT_RUN when the host cannot safely cover the envelope.
+
+Sustained-rate runs are INVALID for capacity claims if actual offered rate is
+below90% of requested, maximum scheduling lateness exceeds the larger of5ms and
+10% of the offer window, or the bounded generator queue sheds offers. Reasons
+remain in `run.json`; original traces and distributions are retained. A burst has
+no sustained target and its client-side shedding is counted explicitly.
+
+Future-only `nats/jetstream-single.conf` and `nats/jetstream-cluster.conf` prepare
+isolated bounded storage templates. They do not create streams or consumers and
+are not executed Q1/Q2 comparisons. Separate store directories, replica counts,
+fsync/commit and consumer-ACK semantics need validation when corresponding Rovqet
+functionality exists. No durable equivalence is claimed here.
+
+Official references: [server release](https://github.com/nats-io/nats-server/releases/tag/v2.11.10),
+[configuration](https://docs.nats.io/reference/config/),
+[Core publish](https://docs.nats.io/using-nats/developer/sending), and
+[slow consumers](https://docs.nats.io/running-a-nats-service/nats_admin/slow_consumers).
