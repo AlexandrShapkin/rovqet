@@ -6,7 +6,7 @@ use rovqet_protocol::{
 };
 use rovqet_scheduler::{Budget, RateQuota, RateReservation, Reservation};
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     future::Future,
     io,
     sync::{
@@ -519,6 +519,7 @@ impl DataQueue {
                 let now = Instant::now();
                 let mut pos = 0;
                 let mut rate_blocked = false;
+                let mut visited_gates = HashSet::new();
                 while pos < state.items.len() {
                     let item = &state.items[pos];
                     let expired = item.deadline.is_some_and(|d| now >= d);
@@ -535,6 +536,13 @@ impl DataQueue {
                     }
                     let item_bytes = item.bytes.len();
                     if let Some(gate) = item.gate.clone() {
+                        // Credit may change concurrently during this scan. Once a
+                        // subscription's head is blocked, only a new scan may retry it;
+                        // a later copy must not steal newly replenished credit.
+                        if !visited_gates.insert(Arc::as_ptr(&gate)) {
+                            pos += 1;
+                            continue;
+                        }
                         if gate.ready(item_bytes) {
                             let rate =
                                 RateQuota::reserve(&gate.quotas.lock().unwrap(), item_bytes, 1);
@@ -1501,5 +1509,39 @@ mod tests {
         assert_eq!(stats.dropped_oldest.load(Ordering::Relaxed), 1);
         assert_eq!(stats.dropped_closed.load(Ordering::Relaxed), 1);
         assert_eq!(stats.dropped_shutdown.load(Ordering::Relaxed), 0);
+    }
+    #[tokio::test]
+    async fn credit_blocked_head_cannot_be_overtaken_within_subscription() {
+        let queue = DataQueue::new(2, 4096, Arc::new(TransportStats::default()));
+        let gate = DeliveryGate::new(2, 8192);
+        let large = message_bytes(1, &[1; 1024]);
+        let small = message_bytes(2, b"small");
+        for bytes in [large.clone(), small.clone()] {
+            queue
+                .enqueue(
+                    bytes,
+                    None,
+                    OverflowPolicy::DropNewest,
+                    b"same-key".to_vec(),
+                    Some(gate.clone()),
+                )
+                .unwrap();
+        }
+        gate.add(1, small.len() as u32).unwrap();
+        assert!(
+            timeout(Duration::from_millis(5), queue.next())
+                .await
+                .is_err(),
+            "a newer copy cannot bypass a credit-blocked head"
+        );
+        gate.add(0, (large.len() - small.len()) as u32).unwrap();
+        let mut first = queue.next().await.unwrap();
+        assert!(Arc::ptr_eq(&first.bytes, &large));
+        first.finish();
+        drop(first);
+        gate.add(1, small.len() as u32).unwrap();
+        let mut second = queue.next().await.unwrap();
+        assert!(Arc::ptr_eq(&second.bytes, &small));
+        second.finish();
     }
 }
