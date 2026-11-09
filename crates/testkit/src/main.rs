@@ -359,7 +359,7 @@ async fn execute(c: &Config, events: Events) -> serde_json::Value {
                     Ok(_) => Outcome::Admitted,
                     Err(ClientError::Remote { .. }) => Outcome::Rejected,
                     Err(ClientError::OutcomeUnknown) => Outcome::Unknown,
-                    Err(ClientError::Closed) => Outcome::ClientDropped,
+                    Err(ClientError::Closed) => Outcome::Unknown,
                     Err(_) => Outcome::Unknown,
                 };
                 events.emit(Event::Ack {
