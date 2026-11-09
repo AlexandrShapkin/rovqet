@@ -35,6 +35,14 @@ jobs:
         run: cargo build -p rovqet-server -p rovqet-sdk --examples --bins --locked
       - name: Independent TCP publisher and subscribers
         run: python3 scripts/q0_smoke.py
+      - name: Independent testkit fixtures and sampler tests
+        run: python3 -m unittest discover -s benchmarks -p 'test_*.py'
+      - name: Build load generator
+        run: cargo build -p rovqet-testkit --locked
+      - name: Independent testkit socket smoke
+        run: python3 benchmarks/run_q0.py --profiles A-basic --repetitions 1 --broker target/debug/rovqet --testkit target/debug/rovqet-testkit --output /tmp/rovqet-testkit-ci
+      - name: Replay independent oracle evidence
+        run: target/debug/rovqet-testkit replay --run /tmp/rovqet-testkit-ci/A-basic-r1/generator
 
 # Fast checks only. No PR requirement, mandatory human review, release build,
 # long-running soak or full benchmark suite on ordinary main commits.

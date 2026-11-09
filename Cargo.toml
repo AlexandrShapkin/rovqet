@@ -9,6 +9,7 @@ members = [
     "crates/router",
     "crates/scheduler",
     "crates/q0",
+    "crates/testkit",
 ]
 
 [workspace.package]

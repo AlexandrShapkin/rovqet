@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 rovqet-q0 = { path = "../q0" }
+rovqet-router = { path = "../router" }
 rovqet-core = { path = "../core" }
 rovqet-protocol = { path = "../protocol" }
 rovqet-transport = { path = "../transport" }

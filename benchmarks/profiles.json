@@ -1,0 +1,116 @@
+{
+  "schema_version": 1,
+  "notes": "Exploratory localhost Q0 profiles, not normative performance certification. Rate is total offered messages/second; zero means burst.",
+  "profiles": {
+    "A-basic": {
+      "publishers": 1,
+      "subscribers": 1,
+      "messages": 1000,
+      "rate": 1000,
+      "payload_bytes": 256,
+      "warmup_messages": 100,
+      "drain_ms": 2000,
+      "check_order": true,
+      "broker_max_connections": 1024
+    },
+    "B-fanout": {
+      "publishers": 1,
+      "subscribers": 1000,
+      "messages": 20,
+      "rate": 20,
+      "payload_bytes": 256,
+      "warmup_messages": 2,
+      "drain_ms": 3000,
+      "check_order": true,
+      "broker_max_connections": 1024
+    },
+    "C-many-to-many": {
+      "publishers": 100,
+      "subscribers": 10,
+      "messages": 1000,
+      "rate": 1000,
+      "payload_bytes": 1024,
+      "warmup_messages": 100,
+      "drain_ms": 3000,
+      "check_order": false,
+      "broker_max_connections": 1024
+    },
+    "D-idle-128": {
+      "idle_connections": 128,
+      "duration_secs": 2,
+      "broker_max_connections": 1024
+    },
+    "D-idle-512": {
+      "idle_connections": 512,
+      "duration_secs": 2,
+      "broker_max_connections": 1024
+    },
+    "D-idle-1024": {
+      "idle_connections": 1024,
+      "duration_secs": 2,
+      "broker_max_connections": 1024
+    },
+    "D-idle-2000": {
+      "idle_connections": 2000,
+      "duration_secs": 2,
+      "broker_max_connections": 2000
+    },
+    "D-idle-10000": {
+      "idle_connections": 10000,
+      "duration_secs": 3,
+      "broker_max_connections": 10000
+    },
+    "E-slow": {
+      "publishers": 1,
+      "subscribers": 2,
+      "messages": 500,
+      "rate": 1000,
+      "payload_bytes": 256,
+      "warmup_messages": 20,
+      "slow_subscribers": 1,
+      "slow_ms": 20,
+      "drain_ms": 3000,
+      "check_order": true,
+      "broker_max_connections": 1024
+    },
+    "E-credit-starved": {
+      "publishers": 1,
+      "subscribers": 2,
+      "messages": 500,
+      "rate": 1000,
+      "payload_bytes": 256,
+      "warmup_messages": 20,
+      "credit_starved": 1,
+      "drain_ms": 2500,
+      "check_order": true,
+      "broker_max_connections": 1024
+    },
+    "F-overload": {
+      "publishers": 100,
+      "subscribers": 10,
+      "messages": 10000,
+      "rate": 100000,
+      "payload_bytes": 1024,
+      "warmup_messages": 100,
+      "drain_ms": 3000,
+      "check_order": false,
+      "broker_max_connections": 1024
+    },
+    "F-burst": {
+      "publishers": 10,
+      "subscribers": 10,
+      "messages": 5000,
+      "rate": 0,
+      "payload_bytes": 256,
+      "warmup_messages": 0,
+      "drain_ms": 3000,
+      "check_order": false,
+      "broker_max_connections": 1024
+    },
+    "D-idle-4096": {
+      "idle_connections": 4096,
+      "duration_secs": 3,
+      "broker_max_connections": 4096
+    }
+  }
+}
