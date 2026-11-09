@@ -56,12 +56,32 @@ using `[A-Za-z0-9_.-]`. Partition scheme v1 is pinned FNV-1a64 over tenant ID
 (u64 BE), topic ID (u64 BE), then key bytes, modulo the configured partition count.
 The router fixture pins these bytes; changing the scheme requires migration.
 
-The initial broker supports DROP_NEWEST at subscriber queues and REJECT_PUBLISH
-by reserving every current recipient's outbound slot/bytes before admission.
-Reservations are released on rejection, cancellation or expiry. Removal before
-dispatch suppresses reserved deliveries; a socket write already in progress may
-finish. Other overflow configurations fail construction explicitly. Flow-credit,
-DROP_OLDEST and COALESCE_LATEST remain unfinished rather than silently aliased.
-Shared encoded immutable frames avoid payload copies per recipient. TTL is
-checked at dispatch and before socket write. Transport write completion is counted
-separately from broker enqueue and from independently observed SDK reception.
+The broker implements all four policies on bounded per-session delivery queues.
+DROP_OLDEST evicts the oldest unconsumed copy for the affected subscription;
+COALESCE_LATEST replaces only the same subscription/topic/partition key. If no
+eligible victim exists and a shared byte/message budget is full, the new copy
+is explicitly rejected/counted rather than evicting unrelated subscriptions.
+REJECT_PUBLISH reserves every current recipient's outbound slot and hierarchical
+bytes before admission. Recipients are snapshotted at admission so subsequent
+registrations cannot expand already-admitted fan-out cost. Reservations release
+on rejection, cancellation, eviction, expiry, unsubscribe and disconnect.
+
+SUBSCRIBE may carry initial FLOW_CREDIT_MESSAGES/BYTES; absent fields use finite
+64-message/256-KiB defaults. SUB_ACK echoes the accepted window. Both zero values
+are valid at subscription creation. FLOW_CREDIT requires subscription_id and
+both credit fields (one may be zero); both zero is BAD_FRAME. The additive delta
+is echoed in a FLOW_CREDIT response with the same request_id. The maximum balance
+is 128 messages/1 MiB; overflow is QUOTA_EXCEEDED and foreign/stale IDs are
+PERMISSION_DENIED. MESSAGE includes subscription_id; encoded frame bytes and one
+message are consumed immediately before socket delivery. Credits never gate
+control responses. A zero-credit copy remains queued, subject to TTL and policy.
+The SDK replenishes consumed credits before the next receive and restores each
+subscription's original window once on explicit reconnect.
+
+One encoded immutable payload/frame is shared across recipients. Writers patch
+only the subscription ID in the header using separate writes, preserving payload
+sharing. These internal shared frames have no checksum; checksum-capable generic
+frames remain supported by the codec. TTL is checked at dispatch and before
+socket write. A write already in progress may finish during unsubscribe. Counters
+separate queue acceptance, eviction/coalescing/expiry/closure/cancellation and
+successful writes; only the independent oracle measures SDK receipt.

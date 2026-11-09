@@ -23,6 +23,11 @@ pub struct ClientConfig {
     pub request_timeout: Duration,
     pub max_pending_messages: usize,
     pub max_pending_bytes: usize,
+    /// Initial per-subscription credits; zero permits explicit manual flow control.
+    pub delivery_credit_messages: u32,
+    pub delivery_credit_bytes: u32,
+    /// Return consumed credit before the next receive operation.
+    pub auto_replenish: bool,
 }
 impl Default for ClientConfig {
     fn default() -> Self {
@@ -31,6 +36,9 @@ impl Default for ClientConfig {
             request_timeout: Duration::from_secs(5),
             max_pending_messages: 128,
             max_pending_bytes: 1024 * 1024,
+            delivery_credit_messages: 64,
+            delivery_credit_bytes: 256 * 1024,
+            auto_replenish: true,
         }
     }
 }
@@ -48,6 +56,7 @@ pub enum ClientError {
     },
     ResourceExhausted,
     UnsupportedGuarantee,
+    InvalidFlowControl,
     /// Socket loss or timeout after a publish might have reached the broker.
     OutcomeUnknown,
 }
@@ -85,6 +94,15 @@ pub struct Delivery {
     pub subscription_id: Option<u64>,
     pub message_id: u128,
     pub payload: Vec<u8>,
+    /// Encoded MESSAGE bytes charged against delivery credit.
+    pub wire_bytes: u32,
+}
+
+#[derive(Clone)]
+struct SubscriptionState {
+    topic: String,
+    initial_messages: u32,
+    initial_bytes: u32,
 }
 
 /// Operations are serialized through `&mut self`; use separate clients for
@@ -98,7 +116,8 @@ pub struct Client {
     heartbeat: Duration,
     pending: VecDeque<Delivery>,
     pending_bytes: usize,
-    subscriptions: BTreeMap<u64, String>,
+    subscriptions: BTreeMap<u64, SubscriptionState>,
+    owed_credit: BTreeMap<u64, (u32, u32)>,
 }
 impl Client {
     pub async fn connect(config: ClientConfig) -> Result<Self, ClientError> {
@@ -110,6 +129,8 @@ impl Client {
         if config.max_pending_messages == 0
             || config.max_pending_bytes == 0
             || config.request_timeout.is_zero()
+            || config.delivery_credit_messages > 128
+            || config.delivery_credit_bytes > 1024 * 1024
         {
             return Err(ClientError::Protocol("invalid client limits"));
         }
@@ -127,6 +148,7 @@ impl Client {
             pending: VecDeque::new(),
             pending_bytes: 0,
             subscriptions: BTreeMap::new(),
+            owed_credit: BTreeMap::new(),
         };
         let mut hello = client.request(FrameType::Hello)?;
         hello
@@ -325,20 +347,119 @@ impl Client {
         Ok(PublishOutcome::Admitted)
     }
     pub async fn subscribe(&mut self, topic: &str) -> Result<u64, ClientError> {
+        self.subscribe_with_credit(
+            topic,
+            self.config.delivery_credit_messages,
+            self.config.delivery_credit_bytes,
+        )
+        .await
+    }
+    /// Register an exact-topic subscription with an explicit bounded credit window.
+    /// Both initial values may be zero; add_credit then enables delivery.
+    pub async fn subscribe_with_credit(
+        &mut self,
+        topic: &str,
+        messages: u32,
+        bytes: u32,
+    ) -> Result<u64, ClientError> {
         if topic.is_empty() || topic.len() > 255 {
             return Err(ClientError::Protocol("invalid topic length"));
+        }
+        if messages > 128 || bytes > 1024 * 1024 {
+            return Err(ClientError::InvalidFlowControl);
         }
         if self.subscriptions.len() >= self.config.max_pending_messages {
             return Err(ClientError::ResourceExhausted);
         }
         let mut frame = self.request(FrameType::Subscribe)?;
-        frame
-            .fields
-            .push(Field::required(f::TOPIC_NAME, topic.as_bytes().to_vec()));
+        frame.fields = vec![
+            Field::required(f::TOPIC_NAME, topic.as_bytes().to_vec()),
+            Field::optional(f::FLOW_CREDIT_MESSAGES, messages.to_be_bytes()),
+            Field::optional(f::FLOW_CREDIT_BYTES, bytes.to_be_bytes()),
+        ];
         let result = self.exchange(frame, FrameType::SubAck).await?;
-        let id = u64_field(&result, f::SUBSCRIPTION_ID)?;
-        self.subscriptions.insert(id, topic.to_string());
+        let id = match credit_ack(&result, messages, bytes) {
+            Ok(id) => id,
+            Err(error) => {
+                self.stream = None;
+                return Err(error);
+            }
+        };
+        if self.subscriptions.contains_key(&id) {
+            self.stream = None;
+            return Err(ClientError::Protocol("duplicate subscription id"));
+        }
+        self.subscriptions.insert(
+            id,
+            SubscriptionState {
+                topic: topic.into(),
+                initial_messages: messages,
+                initial_bytes: bytes,
+            },
+        );
         Ok(id)
+    }
+    /// Add a delta to an existing subscription's remaining delivery credits.
+    /// The server rejects increments that would exceed its bounded window.
+    pub async fn add_credit(
+        &mut self,
+        id: u64,
+        messages: u32,
+        bytes: u32,
+    ) -> Result<(), ClientError> {
+        if !self.subscriptions.contains_key(&id)
+            || (messages == 0 && bytes == 0)
+            || messages > 128
+            || bytes > 1024 * 1024
+        {
+            return Err(ClientError::InvalidFlowControl);
+        }
+        let mut frame = self.request(FrameType::FlowCredit)?;
+        frame.fields = vec![
+            Field::required(f::SUBSCRIPTION_ID, id.to_be_bytes()),
+            Field::required(f::FLOW_CREDIT_MESSAGES, messages.to_be_bytes()),
+            Field::required(f::FLOW_CREDIT_BYTES, bytes.to_be_bytes()),
+        ];
+        let result = self.exchange(frame, FrameType::FlowCredit).await?;
+        match credit_ack(&result, messages, bytes) {
+            Ok(ack_id) if ack_id == id => {}
+            _ => {
+                self.stream = None;
+                return Err(ClientError::Protocol("credit acknowledgment mismatch"));
+            }
+        }
+        Ok(())
+    }
+    async fn replenish(&mut self) -> Result<(), ClientError> {
+        while let Some((&id, &(messages, bytes))) = self.owed_credit.first_key_value() {
+            // A failed/uncertain increment closes the session rather than being replayed.
+            if let Err(error) = self.add_credit(id, messages, bytes).await {
+                self.stream = None;
+                return Err(error);
+            }
+            self.owed_credit.remove(&id);
+        }
+        Ok(())
+    }
+    fn consumed(&mut self, delivery: &Delivery) -> Result<(), ClientError> {
+        if !self.config.auto_replenish {
+            return Ok(());
+        }
+        let id = delivery
+            .subscription_id
+            .ok_or(ClientError::Protocol("missing subscription identity"))?;
+        if self.subscriptions.contains_key(&id) {
+            let owed = self.owed_credit.entry(id).or_default();
+            owed.0 = owed
+                .0
+                .checked_add(1)
+                .ok_or(ClientError::InvalidFlowControl)?;
+            owed.1 = owed
+                .1
+                .checked_add(delivery.wire_bytes)
+                .ok_or(ClientError::InvalidFlowControl)?;
+        }
+        Ok(())
     }
     pub async fn unsubscribe(&mut self, id: u64) -> Result<(), ClientError> {
         let mut frame = self.request(FrameType::Unsubscribe)?;
@@ -350,11 +471,14 @@ impl Client {
             return Err(ClientError::Protocol("unsubscribe id mismatch"));
         }
         self.subscriptions.remove(&id);
+        self.owed_credit.remove(&id);
         Ok(())
     }
     pub async fn receive(&mut self) -> Result<Delivery, ClientError> {
+        self.replenish().await?;
         if let Some(delivery) = self.pending.pop_front() {
             self.pending_bytes -= delivery.payload.len() + delivery.topic.len();
+            self.consumed(&delivery)?;
             return Ok(delivery);
         }
         let frame = self.incoming(None).await?;
@@ -364,7 +488,9 @@ impl Client {
         if frame.frame_type != FrameType::Message {
             return Err(ClientError::Protocol("expected delivery"));
         }
-        delivery(frame)
+        let delivery = delivery(frame)?;
+        self.consumed(&delivery)?;
+        Ok(delivery)
     }
     /// Reconnects and recreates ephemeral subscriptions. Returns old/new IDs.
     /// No in-flight publication is replayed. Connection attempts alone are retried.
@@ -373,6 +499,7 @@ impl Client {
         self.stream = None;
         self.pending.clear();
         self.pending_bytes = 0;
+        self.owed_credit.clear();
         let mut replacement = None;
         let mut error = ClientError::Closed;
         for attempt in 0..3 {
@@ -399,8 +526,17 @@ impl Client {
         }
         let mut client = replacement.ok_or(error)?;
         let mut mappings = Vec::new();
-        for (&old, topic) in &self.subscriptions {
-            mappings.push((old, client.subscribe(topic).await?));
+        for (&old, subscription) in &self.subscriptions {
+            mappings.push((
+                old,
+                client
+                    .subscribe_with_credit(
+                        &subscription.topic,
+                        subscription.initial_messages,
+                        subscription.initial_bytes,
+                    )
+                    .await?,
+            ));
         }
         *self = client;
         Ok(mappings)
@@ -412,6 +548,7 @@ impl Client {
         self.pending.clear();
         self.pending_bytes = 0;
         self.subscriptions.clear();
+        self.owed_credit.clear();
         result
     }
 }
@@ -426,6 +563,22 @@ fn u64_field(frame: &Frame, id: u64) -> Result<u64, ClientError> {
             .try_into()
             .map_err(|_| ClientError::Protocol("invalid integer field"))?,
     ))
+}
+fn u32_field(frame: &Frame, id: u64) -> Result<u32, ClientError> {
+    Ok(u32::from_be_bytes(
+        required(frame, id)?
+            .try_into()
+            .map_err(|_| ClientError::Protocol("invalid credit field"))?,
+    ))
+}
+fn credit_ack(frame: &Frame, messages: u32, bytes: u32) -> Result<u64, ClientError> {
+    let id = u64_field(frame, f::SUBSCRIPTION_ID)?;
+    if u32_field(frame, f::FLOW_CREDIT_MESSAGES)? != messages
+        || u32_field(frame, f::FLOW_CREDIT_BYTES)? != bytes
+    {
+        return Err(ClientError::Protocol("credit acknowledgment mismatch"));
+    }
+    Ok(id)
 }
 fn remote(frame: &Frame) -> Result<ClientError, ClientError> {
     let code = u16::from_be_bytes(
@@ -448,6 +601,12 @@ fn remote(frame: &Frame) -> Result<ClientError, ClientError> {
     })
 }
 fn delivery(frame: Frame) -> Result<Delivery, ClientError> {
+    let wire_bytes = u32::try_from(
+        rovqet_protocol::encode(&frame, Limits::default())
+            .map_err(|_| ClientError::Protocol("invalid delivery"))?
+            .len(),
+    )
+    .map_err(|_| ClientError::Protocol("oversize delivery"))?;
     if frame.field(f::QOS) != Some(&[0][..]) {
         return Err(ClientError::UnsupportedGuarantee);
     }
@@ -468,6 +627,7 @@ fn delivery(frame: Frame) -> Result<Delivery, ClientError> {
         subscription_id,
         message_id,
         payload: frame.payload,
+        wire_bytes,
     })
 }
 
@@ -477,6 +637,9 @@ mod tests {
     use tokio::net::TcpListener;
 
     async fn handshake(stream: &mut TcpStream) {
+        handshake_settings(stream, None).await;
+    }
+    async fn handshake_settings(stream: &mut TcpStream, heartbeat_ms: Option<u32>) {
         let hello = read_frame(stream, Limits::default())
             .await
             .unwrap()
@@ -488,6 +651,11 @@ mod tests {
             Field::required(f::MAX_FRAME_BYTES, 1_048_576u32.to_be_bytes()),
             Field::required(f::SESSION_ID, 1u128.to_be_bytes()),
         ];
+        if let Some(ms) = heartbeat_ms {
+            welcome
+                .fields
+                .push(Field::optional(f::HEARTBEAT_MS, ms.to_be_bytes()));
+        }
         write_frame(stream, &welcome, Limits::default())
             .await
             .unwrap();
@@ -641,5 +809,238 @@ mod tests {
         ];
         assert!(matches!(remote(&frame).unwrap(),ClientError::Remote {
             retry_after:Some(delay), .. } if delay==Duration::from_millis(250)));
+    }
+    async fn accept_subscription(stream: &mut TcpStream, id: u64) -> Frame {
+        let request = read_frame(stream, Limits::default())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.frame_type, FrameType::Subscribe);
+        let mut ack = Frame::new(FrameType::SubAck, request.request_id);
+        ack.fields = vec![
+            Field::required(f::SUBSCRIPTION_ID, id.to_be_bytes()),
+            Field::optional(
+                f::FLOW_CREDIT_MESSAGES,
+                required(&request, f::FLOW_CREDIT_MESSAGES).unwrap(),
+            ),
+            Field::optional(
+                f::FLOW_CREDIT_BYTES,
+                required(&request, f::FLOW_CREDIT_BYTES).unwrap(),
+            ),
+        ];
+        write_frame(stream, &ack, Limits::default()).await.unwrap();
+        request
+    }
+    fn message(id: u128) -> Frame {
+        let mut frame = Frame::new(FrameType::Message, 0);
+        frame.fields = vec![
+            Field::required(f::TOPIC_NAME, b"demo".to_vec()),
+            Field::required(f::QOS, [0]),
+            Field::required(f::MESSAGE_ID, id.to_be_bytes()),
+            Field::optional(f::SUBSCRIPTION_ID, 7u64.to_be_bytes()),
+        ];
+        frame.payload = vec![id as u8];
+        frame
+    }
+    #[tokio::test]
+    async fn consumed_delivery_credit_is_replenished_before_next_receive() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = ClientConfig {
+            endpoint: listener.local_addr().unwrap(),
+            delivery_credit_messages: 1,
+            delivery_credit_bytes: 1024,
+            ..Default::default()
+        };
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            handshake(&mut stream).await;
+            let sub = accept_subscription(&mut stream, 7).await;
+            assert_eq!(u32_field(&sub, f::FLOW_CREDIT_MESSAGES).unwrap(), 1);
+            let first = message(1);
+            let expected = encode_len(&first);
+            write_frame(&mut stream, &first, Limits::default())
+                .await
+                .unwrap();
+            let credit = read_frame(&mut stream, Limits::default())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(credit.frame_type, FrameType::FlowCredit);
+            assert_eq!(u64_field(&credit, f::SUBSCRIPTION_ID).unwrap(), 7);
+            assert_eq!(u32_field(&credit, f::FLOW_CREDIT_MESSAGES).unwrap(), 1);
+            assert_eq!(u32_field(&credit, f::FLOW_CREDIT_BYTES).unwrap(), expected);
+            write_frame(&mut stream, &credit, Limits::default())
+                .await
+                .unwrap();
+            write_frame(&mut stream, &message(2), Limits::default())
+                .await
+                .unwrap();
+        });
+        let mut client = Client::connect(config).await.unwrap();
+        assert_eq!(client.subscribe("demo").await.unwrap(), 7);
+        let first = client.receive().await.unwrap();
+        assert_eq!(first.payload, [1]);
+        assert_eq!(client.owed_credit.get(&7), Some(&(1, first.wire_bytes)));
+        assert_eq!(client.receive().await.unwrap().payload, [2]);
+        server.await.unwrap();
+    }
+    fn encode_len(frame: &Frame) -> u32 {
+        rovqet_protocol::encode(frame, Limits::default())
+            .unwrap()
+            .len() as u32
+    }
+    #[tokio::test]
+    async fn manual_credit_rejects_invalid_local_operations_and_surfaces_quota_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = ClientConfig {
+            endpoint: listener.local_addr().unwrap(),
+            auto_replenish: false,
+            ..Default::default()
+        };
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            handshake(&mut stream).await;
+            let sub = accept_subscription(&mut stream, 7).await;
+            assert_eq!(u32_field(&sub, f::FLOW_CREDIT_MESSAGES).unwrap(), 0);
+            let credit = read_frame(&mut stream, Limits::default())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(credit.frame_type, FrameType::FlowCredit);
+            let mut error = Frame::new(FrameType::Error, credit.request_id);
+            error.fields = vec![
+                Field::required(
+                    f::ERROR_CODE,
+                    (ErrorCode::QuotaExceeded as u16).to_be_bytes(),
+                ),
+                Field::required(f::ERROR_RETRYABLE, [0]),
+            ];
+            write_frame(&mut stream, &error, Limits::default())
+                .await
+                .unwrap();
+        });
+        let mut client = Client::connect(config).await.unwrap();
+        client.subscribe_with_credit("demo", 0, 0).await.unwrap();
+        assert!(matches!(
+            client.add_credit(7, 0, 0).await,
+            Err(ClientError::InvalidFlowControl)
+        ));
+        assert!(matches!(
+            client.add_credit(99, 1, 100).await,
+            Err(ClientError::InvalidFlowControl)
+        ));
+        assert!(matches!(
+            client.add_credit(7, 1, 100).await,
+            Err(ClientError::Remote {
+                code: Some(ErrorCode::QuotaExceeded),
+                ..
+            })
+        ));
+        server.await.unwrap();
+    }
+    #[tokio::test]
+    async fn reconnect_closes_old_socket_and_recreates_each_window_once() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = ClientConfig {
+            endpoint: listener.local_addr().unwrap(),
+            ..Default::default()
+        };
+        let server = tokio::spawn(async move {
+            let (mut old, _) = listener.accept().await.unwrap();
+            handshake(&mut old).await;
+            accept_subscription(&mut old, 7).await;
+            assert!(
+                read_frame(&mut old, Limits::default())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let (mut stream, _) = listener.accept().await.unwrap();
+            handshake(&mut stream).await;
+            let request = accept_subscription(&mut stream, 8).await;
+            assert_eq!(u32_field(&request, f::FLOW_CREDIT_MESSAGES).unwrap(), 0);
+            assert_eq!(u32_field(&request, f::FLOW_CREDIT_BYTES).unwrap(), 0);
+            let close = read_frame(&mut stream, Limits::default())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(close.frame_type, FrameType::Close);
+        });
+        let mut client = Client::connect(config).await.unwrap();
+        client.subscribe_with_credit("demo", 0, 0).await.unwrap();
+        assert_eq!(client.reconnect().await.unwrap(), [(7, 8)]);
+        assert_eq!(client.subscriptions.len(), 1);
+        client.close().await.unwrap();
+        server.await.unwrap();
+    }
+    #[tokio::test]
+    async fn malformed_credit_ack_closes_the_session_without_tracking_an_orphan() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = ClientConfig {
+            endpoint: listener.local_addr().unwrap(),
+            ..Default::default()
+        };
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            handshake(&mut stream).await;
+            let sub = read_frame(&mut stream, Limits::default())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut ack = Frame::new(FrameType::SubAck, sub.request_id);
+            ack.fields
+                .push(Field::required(f::SUBSCRIPTION_ID, 7u64.to_be_bytes()));
+            write_frame(&mut stream, &ack, Limits::default())
+                .await
+                .unwrap();
+            assert!(
+                read_frame(&mut stream, Limits::default())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        });
+        let mut client = Client::connect(config).await.unwrap();
+        assert!(matches!(
+            client.subscribe("demo").await,
+            Err(ClientError::Protocol(_))
+        ));
+        assert!(client.stream.is_none());
+        assert!(client.subscriptions.is_empty());
+        server.await.unwrap();
+    }
+    #[tokio::test]
+    async fn receive_sends_negotiated_heartbeat_while_waiting_for_credit_limited_delivery() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = ClientConfig {
+            endpoint: listener.local_addr().unwrap(),
+            ..Default::default()
+        };
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            handshake_settings(&mut stream, Some(40)).await;
+            accept_subscription(&mut stream, 7).await;
+            let ping = timeout(
+                Duration::from_secs(1),
+                read_frame(&mut stream, Limits::default()),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+            assert_eq!(ping.frame_type, FrameType::Ping);
+            let mut pong = ping;
+            pong.frame_type = FrameType::Pong;
+            write_frame(&mut stream, &pong, Limits::default())
+                .await
+                .unwrap();
+            write_frame(&mut stream, &message(1), Limits::default())
+                .await
+                .unwrap();
+        });
+        let mut client = Client::connect(config).await.unwrap();
+        client.subscribe("demo").await.unwrap();
+        assert_eq!(client.receive().await.unwrap().payload, [1]);
+        server.await.unwrap();
     }
 }

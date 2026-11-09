@@ -66,18 +66,46 @@ session. Admission cost includes estimated physical recipients and metadata.
 These are configurable library prototype bounds, **not measured capacity or
 production SLOs**. Kernel socket and allocator memory are additional.
 
-Library topic policies support `DROP_NEWEST` subscriber shedding and
-`REJECT_PUBLISH` pre-admission outbound reservation. `DROP_OLDEST` and
-`COALESCE_LATEST` configurations are rejected at broker construction. Explicit
-wire flow-credit, egress rate quotas, full overload hysteresis and the independent
-load/oracle/resource profile remain unfinished (A-04/A-05/R0-02/A-07). No WAL is
-called by Q0. Exact names only; wildcard and production authorization are deferred.
+Library topic policies implement all four Q0 choices: `DROP_NEWEST`,
+`DROP_OLDEST`, `COALESCE_LATEST` (same topic/key/subscription), and `REJECT_PUBLISH`
+(pre-admission reservation for every current recipient). Zero-credit queued data
+remains bounded and evictable; TTL expiry and unsubscribe release reservations.
+Shared encoded payloads are reused across recipients with per-subscription header
+IDs written separately.
+
+`ResourceConfig` enforces outstanding outbound message/byte budgets globally,
+per tenant and per topic (default 16,384 messages; 64/32/16 MiB respectively).
+Ingress also charges tenant and partition budgets. Q0 data egress byte/delivery
+quotas apply to global/node, tenant and topic domains at admission and again at
+socket delivery. Defaults are 256 MiB/s and 1,000,000 deliveries/s per domain,
+with a one-second token-bucket burst; per-topic overrides are supported.
+Protected control traffic has its separate bounded reserve. These prototype
+settings await calibration in R0-02/A-07 and are not measured throughput claims.
+
+The overload state is observable through `Broker::overload_state()`: occupancy
+enters PRESSURE at 70% and SHED at 90%; recovery uses 65%/50% thresholds and a
+100 ms minimum dwell. DRAIN rejects with `ServerDraining`; UNAVAILABLE rejects
+with `ResourceExhausted`; explicit recovery passes through SHED and PRESSURE.
+The state uses ingress bytes/messages in this volatile MVP; durable-resource and
+production CPU/p99 signals are future work. No WAL is called by Q0.
+Exact names only; wildcards and production authorization remain deferred.
 
 The SDK serializes operations per client, bounds pending deliveries, sends
 heartbeats while receiving, and explicitly reconnects with bounded exponential
 backoff/jitter and subscription recreation. An unused client has no background
-keepalive and may need reconnect after idle expiry. A lost publication response
+keepalive and may need reconnect after idle expiry. SUBSCRIBE negotiates finite
+message/encoded-byte delivery credits (default 64 messages/256 KiB, maximum
+128 messages/1 MiB). `subscribe_with_credit` permits an initial zero window;
+`add_credit` replenishes it explicitly. The SDK normally returns each consumed
+message's credit before the next receive; `auto_replenish=false` enables manual
+control. Invalid, foreign, stale or excessive credit operations return typed
+errors. Reconnect recreates each subscription once with its original window.
+A lost publication response
 is `OutcomeUnknown`; uncertain Q0 publications are never automatically replayed.
-Transport counters distinguish successful MESSAGE writes, writer expiry and
-write failure; broker counters distinguish admission, enqueue, rejection and
-queue/TTL/unsubscribe drops. Successful socket writes do not prove SDK receipt.
+Transport counters distinguish successful MESSAGE writes/bytes, expiry, write
+failure, newest/oldest drops, coalescing, closed subscriptions and cancellation.
+Broker counters distinguish admission, enqueue, rejection, egress rejection,
+overload transitions and ingress TTL/unsubscribe/shutdown drops. Outstanding
+usage and active session/subscription counts are exposed for resource tests.
+Successful socket writes do not prove SDK receipt. The independent load/oracle
+and quantitative resource profile remain the next tasks (R0-02/A-07).

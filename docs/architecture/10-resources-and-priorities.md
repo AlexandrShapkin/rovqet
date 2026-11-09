@@ -65,3 +65,30 @@ Separate protected credits for ACK/PUB_ACK, control heartbeat, Raft election/rep
 Sweep 30/50/70/80/90/100/110% sustainable capacity, and add 10k client handshake burst; measure process+kernel RAM, CPU, network, queue growth, successful delivered rate and p99. Include 1→N and N→N, slow consumers, stalled fsync, exporter outage, Raft follower lag and reconnect storms. If model underestimates or admissions cause OOM, fix bound/model rather than introducing a procedural acceptance waiver.
 
 Only formal product tests prove PERF-D1/D2/etc; a demo cannot.
+
+## Implemented Q0 prototype profile
+
+Reservations lock all affected domains in stable order before mutation; RAII
+releases each charge once on failure or cancellation. Ingress accounts global,
+tenant, topic, partition and publishing session scopes. Delivery queues retain
+independent global/tenant/topic outstanding-byte/message reservations through
+queued and in-progress writes, in addition to per-session queue limits. The
+single-node global domain also represents the node. Protected control queues
+have separate capacity and are not blocked by delivery credits.
+
+Q0 physical egress uses global/tenant/topic two-dimensional token buckets
+(bytes and actual recipient copies, one second of burst). Separate admission
+and writer buckets prevent a delayed zero-credit queue from bypassing the rate
+at delivery. Failed/partial socket write attempts consume their reserved rate
+cost conservatively; canceled unsent reservations roll back. An impossible or
+exhausted admission estimate returns EGRESS_QUOTA, not ADMITTED. The defaults
+in ResourceConfig are experimental bounds awaiting R0-02/A-07 calibration.
+
+The volatile overload signal is the maximum of ingress byte and message
+occupancy: NORMAL enters PRESSURE at 70%, any active state enters SHED at 90%.
+SHED recovers to PRESSURE at <=65%, PRESSURE to NORMAL at <=50%; each recovery
+requires the configured minimum dwell (default 100 ms). DRAIN/UNAVAILABLE are
+explicit terminal processing states until recovery is requested; recovery
+starts at SHED. State and transition counts are exposed. Storage, CPU and p99
+signals are not claimed for this Q0-only implementation. Saturation does not
+alter the Q0 acknowledgment boundary or introduce a durable dependency.

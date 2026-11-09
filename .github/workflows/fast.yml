@@ -29,8 +29,12 @@ jobs:
         run: cargo check --workspace --locked
       - name: Fast workspace tests
         run: cargo test --workspace --locked
-      - name: Verify executable identifies bootstrap
+      - name: Verify executable identifies development profile
         run: cargo run --locked -p rovqet-server -- --version
+      - name: Build independent-process smoke binaries
+        run: cargo build -p rovqet-server -p rovqet-sdk --examples --bins --locked
+      - name: Independent TCP publisher and subscribers
+        run: python3 scripts/q0_smoke.py
 
 # Fast checks only. No PR requirement, mandatory human review, release build,
 # long-running soak or full benchmark suite on ordinary main commits.

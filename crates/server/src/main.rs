@@ -46,8 +46,10 @@ async fn main() -> std::io::Result<()> {
     let dispatcher = tokio::spawn(broker.clone().run(async move {
         let _ = rx.changed().await;
     }));
-    let result = serve(listener, Config::default(), broker, async {
+    let drain = broker.clone();
+    let result = serve(listener, Config::default(), broker, async move {
         let _ = tokio::signal::ctrl_c().await;
+        drain.drain();
     })
     .await;
     let _ = stop.send(true);

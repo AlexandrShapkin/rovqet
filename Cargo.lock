@@ -123,6 +123,7 @@ name = "rovqet-transport"
 version = "0.1.0"
 dependencies = [
  "rovqet-protocol",
+ "rovqet-scheduler",
  "tokio",
 ]
 

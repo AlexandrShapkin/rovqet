@@ -4,11 +4,13 @@ use rovqet_protocol::{
     CodecError, ErrorCode, Field, Frame, FrameType, Limits, decode_prefix, encode, negotiate_hello,
     registry::field,
 };
+use rovqet_scheduler::{Budget, RateQuota, RateReservation, Reservation};
 use std::{
+    collections::VecDeque,
     future::Future,
     io,
     sync::{
-        Arc,
+        Arc, Mutex, Weak,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -16,7 +18,7 @@ use std::{
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
+    sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc},
     task::JoinSet,
     time::{Instant, timeout},
 };
@@ -121,6 +123,13 @@ pub struct TransportStats {
     pub delivered: AtomicU64,
     pub writer_expired: AtomicU64,
     pub write_failed: AtomicU64,
+    pub enqueued: AtomicU64,
+    pub delivered_bytes: AtomicU64,
+    pub dropped_newest: AtomicU64,
+    pub dropped_oldest: AtomicU64,
+    pub coalesced: AtomicU64,
+    pub dropped_closed: AtomicU64,
+    pub dropped_shutdown: AtomicU64,
 }
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -162,27 +171,509 @@ fn is_message(bytes: &[u8]) -> bool {
     }
     bytes.get(cursor) == Some(&(FrameType::Message as u8))
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverflowPolicy {
+    DropNewest,
+    DropOldest,
+    CoalesceLatest,
+    RejectPublish,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnqueueResult {
+    pub evicted: usize,
+}
+struct CreditState {
+    messages: u32,
+    bytes: u32,
+    closed: bool,
+    subscription_id: u64,
+    watcher: Option<Weak<Notify>>,
+}
+/// Per-subscription byte/message credits. Only successful replenishment wakes delivery.
+pub struct DeliveryGate {
+    max_messages: u32,
+    max_bytes: u32,
+    state: Mutex<CreditState>,
+    quotas: Mutex<Vec<Arc<RateQuota>>>,
+    budgets: Mutex<Vec<Arc<Budget>>>,
+}
+impl DeliveryGate {
+    pub fn new(max_messages: u32, max_bytes: u32) -> Arc<Self> {
+        Arc::new(Self {
+            max_messages,
+            max_bytes,
+            quotas: Mutex::new(Vec::new()),
+            budgets: Mutex::new(Vec::new()),
+            state: Mutex::new(CreditState {
+                messages: 0,
+                bytes: 0,
+                closed: false,
+                subscription_id: 0,
+                watcher: None,
+            }),
+        })
+    }
+    pub fn set_budgets(&self, budgets: Vec<Arc<Budget>>) {
+        *self.budgets.lock().unwrap() = budgets;
+    }
+    pub fn set_quotas(&self, quotas: Vec<Arc<RateQuota>>) {
+        *self.quotas.lock().unwrap() = quotas;
+    }
+    fn can_fit(&self, bytes: usize) -> bool {
+        bytes <= self.max_bytes as usize
+            && self
+                .quotas
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|q| q.can_fit(bytes, 1))
+    }
+    fn ready(&self, bytes: usize) -> bool {
+        let s = self.state.lock().unwrap();
+        !s.closed && s.messages > 0 && bytes <= s.bytes as usize
+    }
+    pub fn add(&self, messages: u32, bytes: u32) -> Result<(), ErrorCode> {
+        let mut state = self.state.lock().unwrap();
+        if state.closed {
+            return Err(ErrorCode::BadFrame);
+        }
+        let m = state
+            .messages
+            .checked_add(messages)
+            .ok_or(ErrorCode::QuotaExceeded)?;
+        let b = state
+            .bytes
+            .checked_add(bytes)
+            .ok_or(ErrorCode::QuotaExceeded)?;
+        if (messages == 0 && bytes == 0) || m > self.max_messages || b > self.max_bytes {
+            return Err(ErrorCode::QuotaExceeded);
+        }
+        state.messages = m;
+        state.bytes = b;
+        if let Some(n) = state.watcher.as_ref().and_then(Weak::upgrade) {
+            n.notify_one();
+        }
+        Ok(())
+    }
+    pub fn set_subscription_id(&self, id: u64) {
+        self.state.lock().unwrap().subscription_id = id;
+    }
+    fn subscription_id(&self) -> u64 {
+        self.state.lock().unwrap().subscription_id
+    }
+    pub fn available(&self) -> (u32, u32) {
+        let s = self.state.lock().unwrap();
+        (s.messages, s.bytes)
+    }
+    pub fn close(&self) {
+        let mut s = self.state.lock().unwrap();
+        s.closed = true;
+        if let Some(n) = s.watcher.as_ref().and_then(Weak::upgrade) {
+            n.notify_one();
+        }
+    }
+    pub fn is_closed(&self) -> bool {
+        self.closed()
+    }
+    fn closed(&self) -> bool {
+        self.state.lock().unwrap().closed
+    }
+    fn refund(&self, messages: u32, bytes: u32) {
+        let mut state = self.state.lock().unwrap();
+        if state.closed {
+            return;
+        }
+        state.messages = state
+            .messages
+            .saturating_add(messages)
+            .min(self.max_messages);
+        state.bytes = state.bytes.saturating_add(bytes).min(self.max_bytes);
+        if let Some(notify) = state.watcher.as_ref().and_then(Weak::upgrade) {
+            notify.notify_one();
+        }
+    }
+    fn take(&self, bytes: usize) -> bool {
+        let mut s = self.state.lock().unwrap();
+        if s.closed || s.messages == 0 || bytes > s.bytes as usize {
+            return false;
+        }
+        s.messages -= 1;
+        s.bytes -= bytes as u32;
+        true
+    }
+    fn watch(&self, notify: &Arc<Notify>) {
+        self.state.lock().unwrap().watcher = Some(Arc::downgrade(notify));
+    }
+}
 struct Queued {
     bytes: Arc<[u8]>,
     _bytes: OwnedSemaphorePermit,
+    _slot: Option<OwnedSemaphorePermit>,
     deadline: Option<Instant>,
+    key: Vec<u8>,
+    gate: Option<Arc<DeliveryGate>>,
+    stats: Option<Arc<TransportStats>>,
+    armed: bool,
+    rate: Option<RateReservation>,
+    _accounting: Option<Reservation>,
 }
-/// A message-count and byte reservation; dropping it rolls back both budgets.
+impl Queued {
+    fn finish(&mut self) {
+        self.armed = false;
+    }
+}
+impl Drop for Queued {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Some(stats) = &self.stats {
+                stats.dropped_shutdown.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+struct DataState {
+    items: VecDeque<Queued>,
+    closed: bool,
+}
+struct DataQueue {
+    state: Mutex<DataState>,
+    notify: Arc<Notify>,
+    slots: Arc<Semaphore>,
+    bytes: Arc<Semaphore>,
+    max_bytes: usize,
+    stats: Arc<TransportStats>,
+}
+impl DataQueue {
+    fn new(messages: usize, bytes: usize, stats: Arc<TransportStats>) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(DataState {
+                items: VecDeque::new(),
+                closed: false,
+            }),
+            notify: Arc::new(Notify::new()),
+            slots: Arc::new(Semaphore::new(messages)),
+            bytes: Arc::new(Semaphore::new(bytes)),
+            max_bytes: bytes,
+            stats,
+        })
+    }
+    fn close(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.closed = true;
+        for mut item in state.items.drain(..) {
+            item.finish();
+            self.stats.dropped_closed.fetch_add(1, Ordering::Relaxed);
+        }
+        self.notify.notify_waiters();
+    }
+    fn reserve(
+        self: &Arc<Self>,
+        bytes: Arc<[u8]>,
+        deadline: Option<Instant>,
+        key: Vec<u8>,
+        gate: Option<Arc<DeliveryGate>>,
+    ) -> Result<PendingSend, ErrorCode> {
+        let state = self.state.lock().unwrap();
+        if bytes.len() > self.max_bytes
+            || gate
+                .as_ref()
+                .is_some_and(|g| !g.can_fit(bytes.len()) || g.closed())
+            || state.closed
+        {
+            return Err(ErrorCode::ResourceExhausted);
+        }
+        let slot = self
+            .slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| ErrorCode::ResourceExhausted)?;
+        let permit = self
+            .bytes
+            .clone()
+            .try_acquire_many_owned(bytes.len() as u32)
+            .map_err(|_| ErrorCode::ResourceExhausted)?;
+        let accounting =
+            account(&gate, bytes.len(), key.len()).ok_or(ErrorCode::ResourceExhausted)?;
+        if let Some(g) = &gate {
+            g.watch(&self.notify);
+        }
+        Ok(PendingSend {
+            slot: PendingSlot::Data(self.clone()),
+            item: Queued {
+                bytes,
+                _bytes: permit,
+                _slot: Some(slot),
+                deadline,
+                key,
+                gate,
+                stats: Some(self.stats.clone()),
+                armed: false,
+                rate: None,
+                _accounting: accounting,
+            },
+        })
+    }
+    fn enqueue(
+        self: &Arc<Self>,
+        bytes: Arc<[u8]>,
+        deadline: Option<Instant>,
+        policy: OverflowPolicy,
+        key: Vec<u8>,
+        gate: Option<Arc<DeliveryGate>>,
+    ) -> Result<EnqueueResult, ErrorCode> {
+        if bytes.len() > self.max_bytes || gate.as_ref().is_some_and(|g| !g.can_fit(bytes.len())) {
+            self.stats.dropped_newest.fetch_add(1, Ordering::Relaxed);
+            return Err(ErrorCode::ResourceExhausted);
+        }
+        let mut state = self.state.lock().unwrap();
+        if state.closed || gate.as_ref().is_some_and(|g| g.closed()) {
+            return Err(ErrorCode::ResourceExhausted);
+        }
+        let mut evicted = 0;
+        if policy == OverflowPolicy::CoalesceLatest {
+            if let Some(pos) = state
+                .items
+                .iter()
+                .position(|item| item.key == key && same_gate(&item.gate, &gate))
+            {
+                let mut old = state.items.remove(pos).unwrap();
+                old.finish();
+                drop(old);
+                self.stats.coalesced.fetch_add(1, Ordering::Relaxed);
+                evicted += 1;
+            }
+        }
+        loop {
+            let slot = self.slots.clone().try_acquire_owned();
+            let permit = self
+                .bytes
+                .clone()
+                .try_acquire_many_owned(bytes.len() as u32);
+            match (slot, permit) {
+                (Ok(slot), Ok(permit)) => {
+                    let accounting = account(&gate, bytes.len(), key.len());
+                    if accounting.is_none() {
+                        drop(slot);
+                        drop(permit);
+                        let evict = state
+                            .items
+                            .iter()
+                            .position(|item| same_gate(&item.gate, &gate));
+                        if policy == OverflowPolicy::DropOldest && evict.is_some() {
+                            let mut old = state.items.remove(evict.unwrap()).unwrap();
+                            old.finish();
+                            drop(old);
+                            self.stats.dropped_oldest.fetch_add(1, Ordering::Relaxed);
+                            evicted += 1;
+                            continue;
+                        }
+                        self.stats.dropped_newest.fetch_add(1, Ordering::Relaxed);
+                        return Err(ErrorCode::ResourceExhausted);
+                    }
+                    if let Some(g) = &gate {
+                        g.watch(&self.notify);
+                    }
+                    state.items.push_back(Queued {
+                        bytes,
+                        _bytes: permit,
+                        _slot: Some(slot),
+                        deadline,
+                        key,
+                        gate,
+                        stats: Some(self.stats.clone()),
+                        armed: true,
+                        rate: None,
+                        _accounting: accounting.unwrap(),
+                    });
+                    self.stats.enqueued.fetch_add(1, Ordering::Relaxed);
+                    self.notify.notify_one();
+                    return Ok(EnqueueResult { evicted });
+                }
+                (slot, permit) => {
+                    drop(slot);
+                    drop(permit);
+                }
+            }
+            let evict = state
+                .items
+                .iter()
+                .position(|item| same_gate(&item.gate, &gate));
+            if policy != OverflowPolicy::DropOldest || evict.is_none() {
+                self.stats.dropped_newest.fetch_add(1, Ordering::Relaxed);
+                return Err(ErrorCode::ResourceExhausted);
+            }
+            let mut old = state.items.remove(evict.unwrap()).unwrap();
+            old.finish();
+            drop(old);
+            self.stats.dropped_oldest.fetch_add(1, Ordering::Relaxed);
+            evicted += 1;
+        }
+    }
+    async fn next(&self) -> Option<Queued> {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let wake = {
+                let mut state = self.state.lock().unwrap();
+                let now = Instant::now();
+                let mut pos = 0;
+                let mut rate_blocked = false;
+                while pos < state.items.len() {
+                    let item = &state.items[pos];
+                    let expired = item.deadline.is_some_and(|d| now >= d);
+                    let closed = item.gate.as_ref().is_some_and(|g| g.closed());
+                    if expired || closed {
+                        let mut old = state.items.remove(pos).unwrap();
+                        old.finish();
+                        if closed {
+                            self.stats.dropped_closed.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            self.stats.writer_expired.fetch_add(1, Ordering::Relaxed);
+                        }
+                        continue;
+                    }
+                    let item_bytes = item.bytes.len();
+                    if let Some(gate) = item.gate.clone() {
+                        if gate.ready(item_bytes) {
+                            let rate =
+                                RateQuota::reserve(&gate.quotas.lock().unwrap(), item_bytes, 1);
+                            if let Some(rate) = rate {
+                                if gate.take(item_bytes) {
+                                    let mut item = state.items.remove(pos).unwrap();
+                                    item.rate = Some(rate);
+                                    return Some(item);
+                                }
+                            } else {
+                                rate_blocked = true;
+                            }
+                        }
+                    } else {
+                        return state.items.remove(pos);
+                    }
+                    pos += 1;
+                }
+                if state.closed {
+                    return None;
+                }
+                let expiry = state.items.iter().filter_map(|i| i.deadline).min();
+                if rate_blocked {
+                    Some(
+                        expiry
+                            .unwrap_or(now + Duration::from_millis(5))
+                            .min(now + Duration::from_millis(5)),
+                    )
+                } else {
+                    expiry
+                }
+            };
+            if let Some(deadline) = wake {
+                tokio::select! {_=notified.as_mut()=>{},_=tokio::time::sleep_until(deadline)=>{}}
+            } else {
+                notified.await;
+            }
+        }
+    }
+}
+fn account(
+    gate: &Option<Arc<DeliveryGate>>,
+    bytes: usize,
+    key: usize,
+) -> Option<Option<Reservation>> {
+    match gate {
+        Some(gate) => {
+            let cost = bytes.checked_add(key)?.checked_add(128)?;
+            Budget::reserve(&gate.budgets.lock().unwrap(), cost).map(Some)
+        }
+        None => Some(None),
+    }
+}
+fn same_gate(a: &Option<Arc<DeliveryGate>>, b: &Option<Arc<DeliveryGate>>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
+    }
+}
+fn varint(bytes: &[u8], cursor: &mut usize) -> Option<usize> {
+    let mut value = 0usize;
+    for shift in (0..70).step_by(7) {
+        let byte = *bytes.get(*cursor)?;
+        *cursor += 1;
+        value |= ((byte & 127) as usize).checked_shl(shift)?;
+        if byte & 128 == 0 {
+            return Some(value);
+        }
+    }
+    None
+}
+fn subscription_slot(bytes: &[u8]) -> Option<usize> {
+    if bytes.get(3).copied()? & 1 != 0 {
+        return None;
+    }
+    let mut cursor = 4;
+    let header = varint(bytes, &mut cursor)?;
+    let _payload = varint(bytes, &mut cursor)?;
+    let end = cursor.checked_add(header)?;
+    varint(bytes, &mut cursor)?;
+    cursor = cursor.checked_add(8)?;
+    while cursor < end {
+        let tag = varint(bytes, &mut cursor)?;
+        let len = varint(bytes, &mut cursor)?;
+        if tag >> 1 == field::SUBSCRIPTION_ID as usize && len == 8 {
+            return Some(cursor);
+        }
+        cursor = cursor.checked_add(len)?;
+    }
+    None
+}
+async fn write_queued<W: AsyncWrite + Unpin>(writer: &mut W, item: &Queued) -> io::Result<()> {
+    if let Some(gate) = &item.gate {
+        let id = gate.subscription_id();
+        if id != 0 {
+            let slot = subscription_slot(&item.bytes)
+                .ok_or_else(|| invalid("missing subscription slot"))?;
+            writer.write_all(&item.bytes[..slot]).await?;
+            writer.write_all(&id.to_be_bytes()).await?;
+            return writer.write_all(&item.bytes[slot + 8..]).await;
+        }
+    }
+    writer.write_all(&item.bytes).await
+}
+enum PendingSlot {
+    Control(mpsc::OwnedPermit<Queued>),
+    Data(Arc<DataQueue>),
+}
+/// Owns queue count/bytes until commit or drop. Dropping rolls back both charges.
 pub struct PendingSend {
-    slot: mpsc::OwnedPermit<Queued>,
+    slot: PendingSlot,
     item: Queued,
 }
 impl PendingSend {
-    pub fn send(self) {
-        self.slot.send(self.item);
+    pub fn send(mut self) {
+        match self.slot {
+            PendingSlot::Control(slot) => {
+                slot.send(self.item);
+            }
+            PendingSlot::Data(queue) => {
+                let mut state = queue.state.lock().unwrap();
+                queue.stats.enqueued.fetch_add(1, Ordering::Relaxed);
+                if state.closed || self.item.gate.as_ref().is_some_and(|g| g.closed()) {
+                    queue.stats.dropped_closed.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                self.item.armed = true;
+                state.items.push_back(self.item);
+                queue.notify.notify_one();
+            }
+        }
     }
 }
 #[derive(Clone)]
 pub struct Outbound {
-    tx: mpsc::Sender<Queued>,
+    data: Arc<DataQueue>,
     control_tx: mpsc::Sender<Queued>,
     control_bytes: Arc<Semaphore>,
-    bytes: Arc<Semaphore>,
     limits: Limits,
 }
 impl Outbound {
@@ -197,10 +688,11 @@ impl Outbound {
         frame: Arc<Frame>,
         deadline: Option<Instant>,
     ) -> Result<(), ErrorCode> {
-        let bytes = Arc::from(encode(&frame, self.limits).map_err(|_| ErrorCode::BadFrame)?);
-        self.try_send_encoded(bytes, deadline)
+        self.try_send_encoded(
+            Arc::from(encode(&frame, self.limits).map_err(|_| ErrorCode::BadFrame)?),
+            deadline,
+        )
     }
-    /// Trusted internally encoded frame, shared by every fan-out destination.
     pub fn try_send_encoded(
         &self,
         bytes: Arc<[u8]>,
@@ -209,34 +701,67 @@ impl Outbound {
         self.reserve_encoded(bytes, deadline)?.send();
         Ok(())
     }
+    pub fn enqueue(
+        &self,
+        bytes: Arc<[u8]>,
+        deadline: Option<Instant>,
+        policy: OverflowPolicy,
+        key: Vec<u8>,
+        gate: Option<Arc<DeliveryGate>>,
+    ) -> Result<EnqueueResult, ErrorCode> {
+        if bytes.len() > self.limits.max_frame_bytes || !is_message(&bytes) {
+            return Err(ErrorCode::BadFrame);
+        }
+        self.data.enqueue(bytes, deadline, policy, key, gate)
+    }
+    pub fn reserve_delivery(
+        &self,
+        bytes: Arc<[u8]>,
+        deadline: Option<Instant>,
+        key: Vec<u8>,
+        gate: Option<Arc<DeliveryGate>>,
+    ) -> Result<PendingSend, ErrorCode> {
+        if bytes.len() > self.limits.max_frame_bytes || !is_message(&bytes) {
+            return Err(ErrorCode::BadFrame);
+        }
+        self.data.reserve(bytes, deadline, key, gate)
+    }
     pub fn reserve_encoded(
         &self,
         bytes: Arc<[u8]>,
         deadline: Option<Instant>,
     ) -> Result<PendingSend, ErrorCode> {
-        let size = bytes.len();
-        if size > self.limits.max_frame_bytes {
+        if bytes.len() > self.limits.max_frame_bytes {
             return Err(ErrorCode::ResourceExhausted);
         }
-        let (sender, budget) = if is_message(&bytes) {
-            (&self.tx, &self.bytes)
-        } else {
-            (&self.control_tx, &self.control_bytes)
-        };
-        let permit = budget
+        if is_message(&bytes) {
+            return self.data.reserve(bytes, deadline, Vec::new(), None);
+        }
+        let permit = self
+            .control_bytes
             .clone()
-            .try_acquire_many_owned(u32::try_from(size).map_err(|_| ErrorCode::ResourceExhausted)?)
+            .try_acquire_many_owned(
+                u32::try_from(bytes.len()).map_err(|_| ErrorCode::ResourceExhausted)?,
+            )
             .map_err(|_| ErrorCode::ResourceExhausted)?;
-        let slot = sender
+        let slot = self
+            .control_tx
             .clone()
             .try_reserve_owned()
             .map_err(|_| ErrorCode::ResourceExhausted)?;
         Ok(PendingSend {
-            slot,
+            slot: PendingSlot::Control(slot),
             item: Queued {
                 bytes,
                 _bytes: permit,
+                _slot: None,
                 deadline,
+                key: Vec::new(),
+                gate: None,
+                stats: None,
+                armed: false,
+                rate: None,
+                _accounting: None,
             },
         })
     }
@@ -370,13 +895,16 @@ async fn session(
     stream.set_nodelay(true)?;
     let (mut reader, mut writer) = stream.into_split();
     let mut limits = config.limits;
-    let (tx, mut rx) = mpsc::channel::<Queued>(config.outbound_messages);
+    let data = DataQueue::new(
+        config.outbound_messages,
+        config.outbound_bytes,
+        config.stats.clone(),
+    );
     let (control_tx, mut control_rx) = mpsc::channel::<Queued>(8);
     let mut outbound = Outbound {
-        tx,
+        data: data.clone(),
         control_tx,
         control_bytes: Arc::new(Semaphore::new(4096)),
-        bytes: Arc::new(Semaphore::new(config.outbound_bytes)),
         limits,
     };
     let write_timeout = config.write_timeout;
@@ -384,31 +912,49 @@ async fn session(
     let mut writer_task = tokio::spawn(async move {
         loop {
             let item = tokio::select! {biased; item=control_rx.recv(), if !control_rx.is_closed() || !control_rx.is_empty()=>item,
-            item=rx.recv(), if !rx.is_closed() || !rx.is_empty()=>item, else=>break};
-            let Some(item) = item else {
-                if control_rx.is_closed() && control_rx.is_empty() {
-                    break;
-                }
-                continue;
+            item=data.next()=>item};
+            let Some(mut item) = item else {
+                break;
             };
-            if item.deadline.is_some_and(|d| Instant::now() >= d) {
-                stats.writer_expired.fetch_add(1, Ordering::Relaxed);
+            if item.gate.as_ref().is_some_and(|gate| gate.closed()) {
+                item.finish();
+                stats.dropped_closed.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
-            match timeout(write_timeout, writer.write_all(&item.bytes)).await {
+            if item.deadline.is_some_and(|d| Instant::now() >= d) {
+                item.finish();
+                stats.writer_expired.fetch_add(1, Ordering::Relaxed);
+                if let Some(gate) = &item.gate {
+                    gate.refund(1, item.bytes.len() as u32);
+                }
+                continue;
+            }
+            // Charge attempts conservatively: partial failed writes cannot refund
+            // their complete estimated physical egress cost.
+            if let Some(rate) = item.rate.take() {
+                rate.commit();
+            }
+            match timeout(write_timeout, write_queued(&mut writer, &item)).await {
                 Ok(Ok(())) => {
                     if is_message(&item.bytes) {
                         stats.delivered.fetch_add(1, Ordering::Relaxed);
+                        stats
+                            .delivered_bytes
+                            .fetch_add(item.bytes.len() as u64, Ordering::Relaxed);
                     }
                 }
                 _ => {
-                    stats.write_failed.fetch_add(1, Ordering::Relaxed);
+                    item.finish();
+                    if is_message(&item.bytes) {
+                        stats.write_failed.fetch_add(1, Ordering::Relaxed);
+                    }
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "socket write failed or timed out",
                     ));
                 }
             }
+            item.finish();
         }
         writer.shutdown().await
     });
@@ -517,6 +1063,7 @@ async fn session(
         }
     }
     cleanup.clean();
+    outbound.data.close();
     drop(outbound);
     if timeout(config.drain_timeout, &mut writer_task)
         .await
@@ -677,8 +1224,7 @@ mod tests {
         let out = Outbound {
             control_tx: tx.clone(),
             control_bytes: Arc::new(Semaphore::new(128)),
-            tx,
-            bytes: Arc::new(Semaphore::new(128)),
+            data: DataQueue::new(1, 128, Arc::new(TransportStats::default())),
             limits: Limits::default(),
         };
         out.try_send(Frame::new(FrameType::Ping, 1)).unwrap();
@@ -695,12 +1241,10 @@ mod tests {
     }
     #[tokio::test]
     async fn reserved_data_rolls_back_and_cannot_consume_control_capacity() {
-        let (tx, mut rx) = mpsc::channel(1);
         let (control_tx, mut control_rx) = mpsc::channel(1);
         let out = Outbound {
-            tx,
+            data: DataQueue::new(1, 512, Arc::new(TransportStats::default())),
             control_tx,
-            bytes: Arc::new(Semaphore::new(512)),
             control_bytes: Arc::new(Semaphore::new(128)),
             limits: Limits::default(),
         };
@@ -716,9 +1260,246 @@ mod tests {
         out.try_send(Frame::new(FrameType::Ping, 1)).unwrap();
         assert!(control_rx.recv().await.is_some());
         drop(reservation);
-        assert_eq!(out.bytes.available_permits(), 512);
+        assert_eq!(out.data.bytes.available_permits(), 512);
         out.reserve_encoded(encoded, None).unwrap().send();
-        assert!(rx.recv().await.is_some());
-        assert_eq!(out.bytes.available_permits(), 512);
+        let mut item = out.data.next().await.unwrap();
+        item.finish();
+        drop(item);
+        assert_eq!(out.data.bytes.available_permits(), 512);
+    }
+    fn message_bytes(id: u128, body: &[u8]) -> Arc<[u8]> {
+        let mut message = Frame::new(FrameType::Message, 0);
+        message.fields = vec![
+            Field::required(field::TOPIC_NAME, b"demo".to_vec()),
+            Field::required(field::QOS, [0]),
+            Field::required(field::MESSAGE_ID, id.to_be_bytes()),
+            Field::optional(field::SUBSCRIPTION_ID, 0u64.to_be_bytes()),
+        ];
+        message.payload = body.to_vec();
+        encode(&message, Limits::default()).unwrap().into()
+    }
+    #[tokio::test]
+    async fn zero_credit_overflow_policies_preserve_exact_survivors() {
+        for policy in [
+            OverflowPolicy::DropNewest,
+            OverflowPolicy::DropOldest,
+            OverflowPolicy::CoalesceLatest,
+        ] {
+            let stats = Arc::new(TransportStats::default());
+            let queue = DataQueue::new(2, 2048, stats.clone());
+            let gate = DeliveryGate::new(8, 4096);
+            queue
+                .enqueue(
+                    message_bytes(1, b"first"),
+                    None,
+                    policy,
+                    b"a".to_vec(),
+                    Some(gate.clone()),
+                )
+                .unwrap();
+            queue
+                .enqueue(
+                    message_bytes(2, b"second"),
+                    None,
+                    policy,
+                    b"b".to_vec(),
+                    Some(gate.clone()),
+                )
+                .unwrap();
+            let result = queue.enqueue(
+                message_bytes(3, b"third"),
+                None,
+                policy,
+                b"a".to_vec(),
+                Some(gate.clone()),
+            );
+            assert_eq!(result.is_err(), policy == OverflowPolicy::DropNewest);
+            assert!(
+                timeout(Duration::from_millis(5), queue.next())
+                    .await
+                    .is_err()
+            );
+            gate.add(2, 2048).unwrap();
+            let mut ids = Vec::new();
+            for _ in 0..2 {
+                let mut item = queue.next().await.unwrap();
+                let frame = decode_prefix(&item.bytes, Limits::default())
+                    .unwrap()
+                    .unwrap()
+                    .0;
+                ids.push(u128::from_be_bytes(
+                    frame.field(field::MESSAGE_ID).unwrap().try_into().unwrap(),
+                ));
+                item.finish();
+            }
+            assert_eq!(
+                ids,
+                if policy == OverflowPolicy::DropNewest {
+                    vec![1, 2]
+                } else {
+                    vec![2, 3]
+                }
+            );
+            assert_eq!(queue.bytes.available_permits(), 2048);
+            assert_eq!(queue.slots.available_permits(), 2);
+            assert_eq!(stats.dropped_shutdown.load(Ordering::Relaxed), 0);
+        }
+    }
+    #[tokio::test]
+    async fn credit_ttl_close_and_rejected_credit_leave_bounds_intact() {
+        let stats = Arc::new(TransportStats::default());
+        let queue = DataQueue::new(2, 2048, stats.clone());
+        let gate = DeliveryGate::new(2, 2048);
+        assert_eq!(gate.add(3, 0), Err(ErrorCode::QuotaExceeded));
+        assert_eq!(gate.available(), (0, 0));
+        queue
+            .enqueue(
+                message_bytes(1, b"expire"),
+                Some(Instant::now() + Duration::from_millis(5)),
+                OverflowPolicy::DropNewest,
+                Vec::new(),
+                Some(gate.clone()),
+            )
+            .unwrap();
+        assert!(
+            timeout(Duration::from_millis(15), queue.next())
+                .await
+                .is_err()
+        );
+        assert_eq!(stats.writer_expired.load(Ordering::Relaxed), 1);
+        queue
+            .enqueue(
+                message_bytes(2, b"close"),
+                None,
+                OverflowPolicy::DropNewest,
+                Vec::new(),
+                Some(gate.clone()),
+            )
+            .unwrap();
+        gate.close();
+        assert!(
+            timeout(Duration::from_millis(5), queue.next())
+                .await
+                .is_err()
+        );
+        assert_eq!(stats.dropped_closed.load(Ordering::Relaxed), 1);
+        assert_eq!(queue.bytes.available_permits(), 2048);
+        assert_eq!(queue.slots.available_permits(), 2);
+        queue.close();
+        assert!(queue.next().await.is_none());
+    }
+    #[tokio::test]
+    async fn shared_payload_subscription_patch_and_rate_refill() {
+        let stats = Arc::new(TransportStats::default());
+        let queue = DataQueue::new(2, 2048, stats.clone());
+        let gate = DeliveryGate::new(2, 2048);
+        gate.set_subscription_id(91);
+        gate.add(2, 2048).unwrap();
+        gate.set_quotas(vec![RateQuota::new(1024 * 1024, 100)]);
+        let bytes = message_bytes(1, b"shared");
+        queue
+            .enqueue(
+                bytes.clone(),
+                None,
+                OverflowPolicy::DropNewest,
+                Vec::new(),
+                Some(gate.clone()),
+            )
+            .unwrap();
+        let mut item = queue.next().await.unwrap();
+        assert!(Arc::ptr_eq(&bytes, &item.bytes));
+        let (mut writer, mut reader) = tokio::io::duplex(2048);
+        write_queued(&mut writer, &item).await.unwrap();
+        let frame = read_frame(&mut reader, Limits::default())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            frame.field(field::SUBSCRIPTION_ID),
+            Some(&91u64.to_be_bytes()[..])
+        );
+        assert_eq!(frame.payload, b"shared");
+        item.finish();
+        let quota = RateQuota::new(1024 * 1024, 100);
+        let reservation = RateQuota::reserve(&[quota.clone()], 0, 100).unwrap();
+        reservation.commit();
+        gate.set_quotas(vec![quota]);
+        queue
+            .enqueue(
+                message_bytes(2, b"wait-rate"),
+                Some(Instant::now() + Duration::from_secs(1)),
+                OverflowPolicy::DropNewest,
+                Vec::new(),
+                Some(gate),
+            )
+            .unwrap();
+        assert!(
+            timeout(Duration::from_millis(1), queue.next())
+                .await
+                .is_err()
+        );
+        let mut next = timeout(Duration::from_millis(100), queue.next())
+            .await
+            .unwrap()
+            .unwrap();
+        next.finish();
+    }
+    #[tokio::test]
+    async fn hierarchical_egress_accounting_survives_eviction_cancel_and_close() {
+        let stats = Arc::new(TransportStats::default());
+        let queue = DataQueue::new(4, 4096, stats.clone());
+        let gate = DeliveryGate::new(4, 4096);
+        let global = Budget::new(2, 4096);
+        let topic = Budget::new(1, 4096);
+        gate.set_budgets(vec![global.clone(), topic.clone()]);
+        let pending = queue
+            .reserve(
+                message_bytes(1, b"cancel"),
+                None,
+                b"a".to_vec(),
+                Some(gate.clone()),
+            )
+            .unwrap();
+        assert_eq!(global.usage().messages, 1);
+        drop(pending);
+        assert_eq!(global.usage().messages, 0);
+        queue
+            .enqueue(
+                message_bytes(2, b"old"),
+                None,
+                OverflowPolicy::DropNewest,
+                b"a".to_vec(),
+                Some(gate.clone()),
+            )
+            .unwrap();
+        assert!(
+            queue
+                .enqueue(
+                    message_bytes(3, b"reject"),
+                    None,
+                    OverflowPolicy::DropNewest,
+                    b"b".to_vec(),
+                    Some(gate.clone())
+                )
+                .is_err()
+        );
+        queue
+            .enqueue(
+                message_bytes(4, b"replace"),
+                None,
+                OverflowPolicy::DropOldest,
+                b"b".to_vec(),
+                Some(gate.clone()),
+            )
+            .unwrap();
+        assert_eq!(topic.usage().messages, 1);
+        assert_eq!(global.usage().messages, 1);
+        queue.close();
+        assert_eq!(global.usage().messages, 0);
+        assert_eq!(topic.usage().messages, 0);
+        assert_eq!(stats.enqueued.load(Ordering::Relaxed), 2);
+        assert_eq!(stats.dropped_oldest.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.dropped_closed.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.dropped_shutdown.load(Ordering::Relaxed), 0);
     }
 }
