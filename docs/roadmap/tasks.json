@@ -106,13 +106,19 @@
       "depends_on": [
         "R0-01"
       ],
-      "status": "TODO",
+      "status": "DONE",
       "architecture": "14",
       "proof": "Deterministic generator self-test and append-only oracle",
       "paths": [
         "crates/testkit/"
       ],
-      "evidence": null
+      "evidence": {
+        "commit": "8cbe729c926c31d381033ecbcec6f4cea0be785e",
+        "verification": "Standalone rovqet-testkit uses real TCP SDK clients independently of broker. Deterministic SHA256 payload identities, bounded open-loop publisher queues, 256B/1KiB messages, warmup/duration/rate/burst/slow/credit-starved/idle modes, exact latency histograms, additive JSONL and strict replay. Independent oracle distinguishes admission, rejection, unknown, client shedding, copies, missing admitted and uncertain copies, duplicates/corruption and scoped order. Nine library fixtures plus four CLI tests PASS, including refused/stalled TCP setup and timeout cleanup. Six Python resource sampler/process cleanup tests PASS; independent real 1000-message preflight delivered1000 distinct copies, no corruption/duplicates/missing.",
+        "test_command": "cargo fmt --all -- --check; CARGO_HOME=/tmp/rovqet-cargo cargo check --workspace --locked; CARGO_HOME=/tmp/rovqet-cargo cargo test --workspace --locked; python3 -m unittest discover -s benchmarks -p test_*.py; python3 benchmarks/run_q0.py --profiles A-basic --repetitions 1 --output /tmp/rovqet-preflight-a",
+        "observed_result": "PASS:80 Rust tests including13 testkit and4 server configuration tests;6 Python tests. Targeted13 testkit tests and workspace check PASS after conservative closed-attempt uncertainty correction. Preflight COMPLETE; exploratory full matrix remains A-07.",
+        "limitations": "Q0-only research tool. Exact frequency distributions equivalent to a lossless histogram, not HDR compression. Real workloads and oracle share one generator monotonic origin; namespace network/socket counters are not broker-exclusive. Ordering check is a diagnostic within each publisher fixed key. Unknown outcomes are never definite loss. Log saturation invalidates a run."
+      }
     },
     {
       "id": "R0-03",
@@ -296,7 +302,7 @@
         "A-06",
         "R0-02"
       ],
-      "status": "TODO",
+      "status": "IN_PROGRESS",
       "architecture": "14",
       "proof": "Raw Q0 load evidence with process/kernel memory and p99",
       "paths": [
