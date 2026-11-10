@@ -163,7 +163,8 @@
       "architecture": "15",
       "proof": "Runnable A/B with measured CPU/RAM/fsync or explicit default rationale",
       "paths": [
-        "benchmarks/"
+        "docs/architecture/15-open-decisions.md",
+        "crates/wal/"
       ],
       "evidence": {
         "commit": "f45084436a1aebe8b2a8219e8a615bb78ccd74df",
@@ -414,7 +415,23 @@
         "limitations": "Process-exit and deterministic I/O/torn-write fault tests, not physical power-loss validation. Exclusive caller ownership and preexisting durably created directory required. No Q1 server publication path, producer dedup interpretation, retention or consumer cursors in B-01; B-02 actor integration is the next slice; no Q1 server capability is claimed.",
         "failure_findings": "Committed checksum/header/footer corruption, missing history, invalid manifest and incompatible incarnation fail closed. Uncommitted partial headers/payloads/checksum corruption truncate only beyond manifest boundary. Interrupted rotation removes unpublished orphans. Append/partial-write and all publication failures poison writer; post-rename unknown outcome may recover a newer prefix without returning false success. Count/byte/index/segment limits and cancellation/descriptor cleanup verified. Literal record/header/manifest vectors pass.",
         "ci_run": "https://github.com/AlexandrShapkin/rovqet/actions/runs/42763501369",
-        "ci_result": "PASS: docs and rust jobs on pushed ledger commit 6cfb17b893b950a213a2221e3f54e740312d9e47 (includes implementation f45084436a1aebe8b2a8219e8a615bb78ccd74df)."
+        "ci_result": "PASS: docs and rust jobs on pushed ledger commit 6cfb17b893b950a213a2221e3f54e740312d9e47 (includes implementation f45084436a1aebe8b2a8219e8a615bb78ccd74df).",
+        "followup": {
+          "commit": "851218eaf9a46c98e4d0e2fc0713903ad9490cca",
+          "ci_run": "https://github.com/AlexandrShapkin/rovqet/actions/runs/42764211411",
+          "verification": "PASS: retained Vec allocation capacity is charged to pending-byte budget; oversized capacity with short payload rejected. WAL31 tests, durable16, workspace131; required fmt/check/docs/Q0 smoke all pass.",
+          "test_command": [
+            "cargo fmt --all -- --check",
+            "CARGO_HOME=/tmp/rovqet-cargo cargo check --workspace --locked",
+            "CARGO_HOME=/tmp/rovqet-cargo cargo test -p rovqet-wal --locked",
+            "CARGO_HOME=/tmp/rovqet-cargo cargo test -p rovqet-durable --locked",
+            "CARGO_HOME=/tmp/rovqet-cargo cargo test --workspace --locked",
+            "python3 scripts/check_docs.py",
+            "CARGO_HOME=/tmp/rovqet-cargo cargo build -p rovqet-server -p rovqet-sdk --examples --bins --locked",
+            "python3 scripts/q0_smoke.py",
+            "git diff --check"
+          ]
+        }
       }
     },
     {
@@ -431,7 +448,25 @@
       "paths": [
         "crates/durable/"
       ],
-      "evidence": null
+      "evidence": {
+        "commit": "851218eaf9a46c98e4d0e2fc0713903ad9490cca",
+        "ci_run": "https://github.com/AlexandrShapkin/rovqet/actions/runs/42764211411",
+        "verification": "Local PASS: 16 durable tests (5 unit +11 integration), 31 WAL tests and131 workspace tests; format/check/docs/Q0 independent-process smoke pass on2026-11-10.",
+        "test_command": [
+          "cargo fmt --all -- --check",
+          "CARGO_HOME=/tmp/rovqet-cargo cargo check --workspace --locked",
+          "CARGO_HOME=/tmp/rovqet-cargo cargo test -p rovqet-wal --locked",
+          "CARGO_HOME=/tmp/rovqet-cargo cargo test -p rovqet-durable --locked",
+          "CARGO_HOME=/tmp/rovqet-cargo cargo test --workspace --locked",
+          "python3 scripts/check_docs.py",
+          "CARGO_HOME=/tmp/rovqet-cargo cargo build -p rovqet-server -p rovqet-sdk --examples --bins --locked",
+          "python3 scripts/q0_smoke.py",
+          "git diff --check"
+        ],
+        "observed_result": "Real dedicated-thread Q1 partition actor admits bounded count/retained-allocation bytes, persists MESSAGE+versioned scoped producer outcome through one WAL barrier before CommittedLocal, and reconstructs exact retry results on restart. Actual SIGKILL after parent records a committed outcome in an independent fsynced journal recovers unchanged message/outcome with no duplicate append. Append/partial-write/sync/manifest faults return no success and make actor unavailable until recovery. Waiter cancellation retains accepted work; shutdown/drop drains and joins. Wrong class/partition/owner, gap/conflict/fenced producer, capacity and malformed committed pairs fail explicitly.",
+        "limitations": "Not DONE: no session/server Q1 routing or wire PUB_ACK; TTL/ACL/authenticated-principal validation and coordinated authority remain caller prerequisites. Blocking open/wait/drop/shutdown require execution outside async network workers. No production timed dedup window, retention, consumer ACK/cursor or Q2 integration is claimed. SIGKILL is not physical power-loss validation.",
+        "next_unblocked": "Finish B-02: integrate session routing and asynchronous reply adapter for an explicitly configured Q1 partition; test process termination before write/fsync/ACK and lost PUB_ACK against independent received-ACK journal. Keep Q0 independent and reject unsupported Q1 until integration is complete."
+      }
     },
     {
       "id": "B-03",
