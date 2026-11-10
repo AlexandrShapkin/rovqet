@@ -10,6 +10,7 @@ members = [
     "crates/scheduler",
     "crates/q0",
     "crates/wal",
+    "crates/durable",
     "crates/testkit",
 ]
 

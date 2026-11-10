@@ -1,0 +1,11 @@
+[package]
+name = "rovqet-durable"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+rovqet-core = { path = "../core" }
+rovqet-wal = { path = "../wal" }
+rovqet-scheduler = { path = "../scheduler" }

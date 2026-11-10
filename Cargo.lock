@@ -745,6 +745,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rovqet-durable"
+version = "0.1.0"
+dependencies = [
+ "rovqet-core",
+ "rovqet-scheduler",
+ "rovqet-wal",
+]
+
+[[package]]
 name = "rovqet-protocol"
 version = "0.1.0"
 

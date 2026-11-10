@@ -16,7 +16,8 @@ pub const RECORD_OVERHEAD: usize = 88;
 pub const FOOTER_BYTES: usize = 20;
 const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 
-/// All byte limits include persistent encoding overhead. Segment bounds include header/footer.
+/// Record/segment byte limits include persistent encoding overhead. Pending byte limits
+/// charge retained payload capacity plus record overhead. Segment bounds include header/footer.
 /// Defaults are development placeholders: callers must supply their assigned partition identity
 /// and an explicitly created, unique log incarnation before using real history.
 #[derive(Debug, Clone)]
@@ -401,6 +402,7 @@ impl Wal {
     pub fn generation(&self) -> u64 {
         self.generation
     }
+    /// Retained pending payload capacity plus per-record encoding overhead.
     pub fn pending_bytes(&self) -> usize {
         self.pending_bytes
     }
@@ -417,11 +419,14 @@ impl Wal {
         let n = RECORD_OVERHEAD
             .checked_add(r.payload.len())
             .ok_or(Error::Capacity)?;
+        let charge = RECORD_OVERHEAD
+            .checked_add(r.payload.capacity())
+            .ok_or(Error::Capacity)?;
         if n > self.config.max_record_bytes
             || self.pending.len() >= self.config.max_pending_records
             || self
                 .pending_bytes
-                .checked_add(n)
+                .checked_add(charge)
                 .is_none_or(|x| x > self.config.max_pending_bytes)
             || self.index.len() + self.pending.len() >= self.config.max_records
         {
@@ -438,7 +443,7 @@ impl Wal {
         if r.logical_offset != expected {
             return Err(Error::InvalidOffset);
         }
-        self.pending_bytes += n;
+        self.pending_bytes += charge;
         self.pending.push_back(r);
         Ok(())
     }
@@ -461,8 +466,8 @@ impl Wal {
     }
     fn flush_inner(&mut self) -> Result<()> {
         while let Some(r) = self.pending.pop_front() {
+            self.pending_bytes -= RECORD_OVERHEAD + r.payload.capacity();
             let bytes = encode_record(&r)?;
-            self.pending_bytes -= bytes.len();
             let s = self.segments.last().unwrap();
             if s.sealed
                 || s.len + bytes.len() as u64 + FOOTER_BYTES as u64 > self.config.max_segment_bytes
@@ -869,6 +874,43 @@ fn segment_crc(f: &mut File, len: u64, suffix: &[u8]) -> Result<u32> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pending_budget_charges_retained_capacity_and_releases_on_flush() {
+        use super::*;
+        let dir =
+            std::env::temp_dir().join(format!("rovqet-wal-capacity-unit-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let config = Config {
+            max_record_bytes: 128,
+            max_pending_bytes: 256,
+            ..Config::default()
+        };
+        let mut wal = Wal::open(&dir, config).unwrap();
+        let make = |payload| Record {
+            kind: RecordKind::Message,
+            logical_offset: 0,
+            owner_epoch: 1,
+            producer_id: 1,
+            producer_epoch: 1,
+            sequence: 0,
+            message_id: 1,
+            server_timestamp: 0,
+            payload,
+        };
+        let mut oversized = Vec::with_capacity(1024);
+        oversized.push(1);
+        assert!(matches!(wal.enqueue(make(oversized)), Err(Error::Capacity)));
+        assert_eq!(wal.pending_bytes(), 0);
+        let mut padded = Vec::with_capacity(128);
+        padded.push(1);
+        wal.enqueue(make(padded)).unwrap();
+        assert_eq!(wal.pending_bytes(), RECORD_OVERHEAD + 128);
+        wal.flush().unwrap();
+        assert_eq!(wal.pending_bytes(), 0);
+        wal.sync().unwrap();
+        drop(wal);
+        fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn crc32c_known_vector() {
         assert_eq!(super::crc(b"123456789"), 0xe3069283);

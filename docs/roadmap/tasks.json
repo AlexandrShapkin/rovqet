@@ -179,8 +179,10 @@
           "git diff --check"
         ],
         "observed_result": "30 WAL tests (1 CRC unit + 29 integration); 114 workspace tests; format/check/docs pass; independent publisher and two subscribers exchanged Q0 over TCP and shut down cleanly. All executed 2026-11-10 on local ext4 filesystem.",
-        "limitations": "Process-exit and deterministic I/O/torn-write fault tests, not physical power-loss validation. Exclusive caller ownership and preexisting durably created directory required. No Q1 server publication path, producer dedup interpretation, retention or consumer cursors in B-01; B-02 remains TODO.",
-        "decision": "Explicit reference-default rationale in architecture15: retain Tokio/TCP, segmented append-only WAL, explicit file+manifest+directory barriers, rebuilt indexes; no QUIC/KV/Raft implementation or historical benchmark analysis."
+        "limitations": "Process-exit and deterministic I/O/torn-write fault tests, not physical power-loss validation. Exclusive caller ownership and preexisting durably created directory required. No Q1 server publication path, producer dedup interpretation, retention or consumer cursors in B-01; B-02 actor integration is the next slice; no Q1 server capability is claimed.",
+        "decision": "Explicit reference-default rationale in architecture15: retain Tokio/TCP, segmented append-only WAL, explicit file+manifest+directory barriers, rebuilt indexes; no QUIC/KV/Raft implementation or historical benchmark analysis.",
+        "ci_run": "https://github.com/AlexandrShapkin/rovqet/actions/runs/42763501369",
+        "ci_result": "PASS: docs and rust jobs on pushed ledger commit 6cfb17b893b950a213a2221e3f54e740312d9e47 (includes implementation f45084436a1aebe8b2a8219e8a615bb78ccd74df)."
       }
     },
     {
@@ -211,8 +213,10 @@
           "git diff --check"
         ],
         "observed_result": "30 WAL tests (1 CRC unit + 29 integration); 114 workspace tests; format/check/docs pass; independent publisher and two subscribers exchanged Q0 over TCP and shut down cleanly. All executed 2026-11-10 on local ext4 filesystem.",
-        "limitations": "Process-exit and deterministic I/O/torn-write fault tests, not physical power-loss validation. Exclusive caller ownership and preexisting durably created directory required. No Q1 server publication path, producer dedup interpretation, retention or consumer cursors in B-01; B-02 remains TODO.",
-        "interfaces": "Frozen concrete Wal API, v1 BE record/header/footer and checksummed generation/inventory manifest; existing protocol IDs and golden vectors unchanged. B-01 dependency reconciled with work-packages.md."
+        "limitations": "Process-exit and deterministic I/O/torn-write fault tests, not physical power-loss validation. Exclusive caller ownership and preexisting durably created directory required. No Q1 server publication path, producer dedup interpretation, retention or consumer cursors in B-01; B-02 actor integration is the next slice; no Q1 server capability is claimed.",
+        "interfaces": "Frozen concrete Wal API, v1 BE record/header/footer and checksummed generation/inventory manifest; existing protocol IDs and golden vectors unchanged. B-01 dependency reconciled with work-packages.md.",
+        "ci_run": "https://github.com/AlexandrShapkin/rovqet/actions/runs/42763501369",
+        "ci_result": "PASS: docs and rust jobs on pushed ledger commit 6cfb17b893b950a213a2221e3f54e740312d9e47 (includes implementation f45084436a1aebe8b2a8219e8a615bb78ccd74df)."
       }
     },
     {
@@ -407,8 +411,10 @@
           "git diff --check"
         ],
         "observed_result": "30 WAL tests (1 CRC unit + 29 integration); 114 workspace tests; format/check/docs pass; independent publisher and two subscribers exchanged Q0 over TCP and shut down cleanly. All executed 2026-11-10 on local ext4 filesystem.",
-        "limitations": "Process-exit and deterministic I/O/torn-write fault tests, not physical power-loss validation. Exclusive caller ownership and preexisting durably created directory required. No Q1 server publication path, producer dedup interpretation, retention or consumer cursors in B-01; B-02 remains TODO.",
-        "failure_findings": "Committed checksum/header/footer corruption, missing history, invalid manifest and incompatible incarnation fail closed. Uncommitted partial headers/payloads/checksum corruption truncate only beyond manifest boundary. Interrupted rotation removes unpublished orphans. Append/partial-write and all publication failures poison writer; post-rename unknown outcome may recover a newer prefix without returning false success. Count/byte/index/segment limits and cancellation/descriptor cleanup verified. Literal record/header/manifest vectors pass."
+        "limitations": "Process-exit and deterministic I/O/torn-write fault tests, not physical power-loss validation. Exclusive caller ownership and preexisting durably created directory required. No Q1 server publication path, producer dedup interpretation, retention or consumer cursors in B-01; B-02 actor integration is the next slice; no Q1 server capability is claimed.",
+        "failure_findings": "Committed checksum/header/footer corruption, missing history, invalid manifest and incompatible incarnation fail closed. Uncommitted partial headers/payloads/checksum corruption truncate only beyond manifest boundary. Interrupted rotation removes unpublished orphans. Append/partial-write and all publication failures poison writer; post-rename unknown outcome may recover a newer prefix without returning false success. Count/byte/index/segment limits and cancellation/descriptor cleanup verified. Literal record/header/manifest vectors pass.",
+        "ci_run": "https://github.com/AlexandrShapkin/rovqet/actions/runs/42763501369",
+        "ci_result": "PASS: docs and rust jobs on pushed ledger commit 6cfb17b893b950a213a2221e3f54e740312d9e47 (includes implementation f45084436a1aebe8b2a8219e8a615bb78ccd74df)."
       }
     },
     {
@@ -419,7 +425,7 @@
         "B-01",
         "A-05"
       ],
-      "status": "TODO",
+      "status": "IN_PROGRESS",
       "architecture": "06",
       "proof": "Crash before/after fsync no false COMMITTED_LOCAL",
       "paths": [
