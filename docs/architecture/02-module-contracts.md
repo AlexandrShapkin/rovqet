@@ -145,4 +145,7 @@ end. Typed errors distinguish invalid limits/ranges, stale incarnation, capacity
 response, unavailable storage and corruption. The actor serializes reads with commits;
 returned batches retain their budget reservation. `open_existing` fails on missing history
 rather than creating it. Detailed offset, memory, cancellation and wire boundaries are in
-[06](06-q1-storage.md). No consumer ACK or group mutation is implied by this interface.
+[06](06-q1-storage.md). No consumer ACK or group mutation is implied by this interface. The trusted protocol
+adapter uses `try_replay_encoded` at the same seam to enforce exact encoded batch bytes
+(including terminal frame), retain encoding reservations, and report typed stop reasons;
+the original memory-charge read API is unchanged.

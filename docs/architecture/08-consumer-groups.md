@@ -62,3 +62,11 @@ Reference MVP sequencing: single group with one consumer, then reconnect + ACK, 
 ## Tests and oracle
 
 Crash at ACK receive, validation, append, fsync/quorum, response; crash between DLQ commit and disposition marker; lose replies, replay retry; two consumers race at rebalance; terminate after noncontiguous ACK; expire lease; change Q1 incarnation; ensure no offset is silently skipped. The oracle records \`(group,incarnation,offset,delivery token,ACK result,terminal state,cursor)\` independently.
+
+## Standalone read-only inspection boundary
+
+B-04's READ_FETCH/READ_RECORD/READ_END and Rust `read_q1` API inspect committed history.
+They do not allocate leases, acknowledge deliveries, advance a group cursor, fence group
+generations or promise at-least-once consumer-group processing. Existing FETCH/MESSAGE
+retain their group requirements; consumer ACK/NACK/lease operations remain unsupported
+until B-05. An inspection continuation is a log reference, never consumer progress.

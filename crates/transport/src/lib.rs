@@ -44,6 +44,15 @@ pub async fn read_frame<R: AsyncRead + Unpin>(
     reader: &mut R,
     limits: Limits,
 ) -> io::Result<Option<Frame>> {
+    Ok(read_frame_sized(reader, limits)
+        .await?
+        .map(|(frame, _)| frame))
+}
+/// Like read_frame, retaining the exact received size including ignored optional TLVs.
+pub async fn read_frame_sized<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    limits: Limits,
+) -> io::Result<Option<(Frame, usize)>> {
     let mut prefix = Vec::with_capacity(24);
     let mut byte = [0];
     if reader.read(&mut byte).await? == 0 {
@@ -103,7 +112,7 @@ pub async fn read_frame<R: AsyncRead + Unpin>(
     reader.read_exact(&mut prefix[start..]).await?;
     decode_prefix(&prefix, limits)
         .map_err(wire_invalid)?
-        .map(|(f, _)| f)
+        .map(|(f, _)| (f, total))
         .ok_or_else(|| wire_invalid(CodecError::InvalidLength))
         .map(Some)
 }
@@ -678,14 +687,49 @@ impl PendingSend {
         }
     }
 }
+struct ReadWrite {
+    bytes: Vec<u8>,
+    complete: tokio::sync::oneshot::Sender<bool>,
+    _reservation: Arc<dyn Send + Sync>,
+}
 #[derive(Clone)]
 pub struct Outbound {
     data: Arc<DataQueue>,
     control_tx: mpsc::Sender<Queued>,
+    read_tx: mpsc::Sender<ReadWrite>,
     control_bytes: Arc<Semaphore>,
     limits: Limits,
 }
 impl Outbound {
+    pub fn limits(&self) -> Limits {
+        self.limits
+    }
+    /// One lossless replay frame in flight, with completion at the socket write boundary.
+    /// The actor's reservation guard lives through a cancelled/failed queued write.
+    pub async fn send_read<T: Send + Sync + 'static>(
+        &self,
+        frame: &Frame,
+        reservation: Arc<T>,
+    ) -> Result<(), ErrorCode> {
+        if !matches!(frame.frame_type, FrameType::ReadRecord | FrameType::ReadEnd) {
+            return Err(ErrorCode::BadFrame);
+        }
+        let bytes = encode(frame, self.limits).map_err(|_| ErrorCode::ResourceExhausted)?;
+        let (complete, reply) = tokio::sync::oneshot::channel();
+        self.read_tx
+            .send(ReadWrite {
+                bytes,
+                complete,
+                _reservation: reservation,
+            })
+            .await
+            .map_err(|_| ErrorCode::StorageUnavailable)?;
+        if reply.await.unwrap_or(false) {
+            Ok(())
+        } else {
+            Err(ErrorCode::StorageUnavailable)
+        }
+    }
     pub fn try_send(&self, frame: Frame) -> Result<(), ErrorCode> {
         self.try_send_shared(Arc::new(frame))
     }
@@ -778,6 +822,8 @@ impl Outbound {
 pub enum SessionReply {
     Immediate(Result<Option<Frame>, ErrorCode>),
     Deferred(Pin<Box<dyn Future<Output = Result<Option<Frame>, ErrorCode>> + Send>>),
+    /// Serial read-only batch; detects peer EOF without consuming a pipelined frame.
+    ReadOnly(Pin<Box<dyn Future<Output = Result<Option<Frame>, ErrorCode>> + Send>>),
 }
 pub trait SessionHandler: Send + Sync + 'static {
     fn handle(
@@ -934,9 +980,11 @@ async fn session(
         config.stats.clone(),
     );
     let (control_tx, mut control_rx) = mpsc::channel::<Queued>(8);
+    let (read_tx, mut read_rx) = mpsc::channel::<ReadWrite>(1);
     let mut outbound = Outbound {
         data: data.clone(),
         control_tx,
+        read_tx,
         control_bytes: Arc::new(Semaphore::new(4096)),
         limits,
     };
@@ -945,6 +993,13 @@ async fn session(
     let mut writer_task = tokio::spawn(async move {
         loop {
             let item = tokio::select! {biased; item=control_rx.recv(), if !control_rx.is_closed() || !control_rx.is_empty()=>item,
+            item=read_rx.recv(), if !read_rx.is_closed() || !read_rx.is_empty()=> {
+                let Some(item) = item else { continue; };
+                let success = matches!(timeout(write_timeout, writer.write_all(&item.bytes)).await, Ok(Ok(())));
+                let _ = item.complete.send(success);
+                if !success { return Err(io::Error::new(io::ErrorKind::TimedOut, "replay write failed or timed out")); }
+                continue;
+            },
             item=data.next()=>item};
             let Some(mut item) = item else {
                 break;
@@ -1006,9 +1061,10 @@ async fn session(
                         .map(|e| e.0)
                     {
                         Some(CodecError::UnsupportedVersion(_)) => ErrorCode::UnsupportedVersion,
-                        Some(CodecError::UnsupportedCriticalField(_)) => {
-                            ErrorCode::UnsupportedCapability
-                        }
+                        Some(
+                            CodecError::UnsupportedCriticalField(_)
+                            | CodecError::UnknownFrameType(_),
+                        ) => ErrorCode::UnsupportedCapability,
                         _ => ErrorCode::BadFrame,
                     },
                     _ => ErrorCode::LeaseExpired,
@@ -1078,6 +1134,22 @@ async fn session(
             _ if frame.frame_type == FrameType::Pong => Ok(None),
             _ => match handler.request(id, 1, frame, outbound.clone()) {
                 SessionReply::Immediate(result) => result,
+                SessionReply::ReadOnly(reply) => {
+                    let peer_closed = async {
+                        let mut byte = [0];
+                        match reader.peek(&mut byte).await {
+                            Ok(0) | Err(_) => (),
+                            // Preserve unread input; this serial profile does not pipeline batches.
+                            Ok(_) => std::future::pending::<()>().await,
+                        }
+                    };
+                    tokio::select! {
+                        result = reply => result,
+                        _ = peer_closed => break,
+                        _ = stop.changed() => break,
+                        _ = &mut writer_task => return Ok(()),
+                    }
+                }
                 SessionReply::Deferred(reply) => tokio::select! {
                     result = reply => result,
                     _ = stop.changed() => break,
@@ -1343,6 +1415,7 @@ mod tests {
             control_bytes: Arc::new(Semaphore::new(128)),
             data: DataQueue::new(1, 128, Arc::new(TransportStats::default())),
             limits: Limits::default(),
+            read_tx: mpsc::channel(1).0,
         };
         out.try_send(Frame::new(FrameType::Ping, 1)).unwrap();
         assert_eq!(
@@ -1364,6 +1437,7 @@ mod tests {
             control_tx,
             control_bytes: Arc::new(Semaphore::new(128)),
             limits: Limits::default(),
+            read_tx: mpsc::channel(1).0,
         };
         let mut message = Frame::new(FrameType::Message, 0);
         message.fields = vec![
@@ -1652,5 +1726,54 @@ mod tests {
         let mut second = queue.next().await.unwrap();
         assert!(Arc::ptr_eq(&second.bytes, &small));
         second.finish();
+    }
+    #[tokio::test]
+    async fn replay_write_completion_is_lossless_and_cancelled_write_retains_its_guard() {
+        let (control_tx, _control_rx) = mpsc::channel(1);
+        let (read_tx, mut read_rx) = mpsc::channel(1);
+        let out = Outbound {
+            data: DataQueue::new(1, 128, Arc::new(TransportStats::default())),
+            control_tx,
+            read_tx,
+            control_bytes: Arc::new(Semaphore::new(128)),
+            limits: Limits::default(),
+        };
+        let scope = rovqet_protocol::replay::ReadScope {
+            tenant: 1,
+            topic: 3,
+            partition: 0,
+            incarnation: 42,
+        };
+        let frame = rovqet_protocol::replay::record(1, scope, 0, 100, vec![1; 8192]);
+        let guard = Arc::new(());
+        let weak = Arc::downgrade(&guard);
+        let writer = tokio::spawn({
+            let out = out.clone();
+            let frame = frame.clone();
+            let guard = guard.clone();
+            async move { out.send_read(&frame, guard).await }
+        });
+        let item = read_rx.recv().await.unwrap();
+        assert!(!writer.is_finished());
+        assert!(item.bytes.len() > 4096);
+        assert_eq!(out.control_bytes.available_permits(), 128);
+        let _ = item.complete.send(true);
+        drop(item._reservation);
+        assert_eq!(writer.await.unwrap(), Ok(()));
+        let writer = tokio::spawn({
+            let out = out.clone();
+            let guard = guard.clone();
+            async move { out.send_read(&frame, guard).await }
+        });
+        let item = read_rx.recv().await.unwrap();
+        writer.abort();
+        let _ = writer.await;
+        drop(guard);
+        assert!(
+            weak.upgrade().is_some(),
+            "queued writer must retain the actor reservation"
+        );
+        drop(item);
+        assert!(weak.upgrade().is_none());
     }
 }

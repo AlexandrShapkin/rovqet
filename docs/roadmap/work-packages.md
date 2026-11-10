@@ -50,11 +50,10 @@
 
 **B-04 — Replay and log incarnation** (depends B-02). \`FETCH\` by incarnation+offset/limits and bounded segments; REPLAY_NOT_AVAILABLE for expired or lost Q1 history; explicit reset after permanent owner loss. Proof: stable replay after crash, no same-incarnation continuity with unrecoverable history.
 
-B-04 implementation boundary: the bounded actor read API, sparse MESSAGE offset mapping,
-incarnation validation and crash/lost-history proofs are implemented. Task remains
-IN_PROGRESS: frozen FETCH requires group_id and durable MESSAGE requires generation/lease;
-a standalone read-only batch/end wire contract must be corrected before TCP/SDK integration.
-B-05 implementation remains blocked; do not invent leases to satisfy B-04.
+B-04 uses additive standalone READ_FETCH/READ_RECORD/READ_END frames with exact encoded
+batch limits and mandatory completion. Existing group FETCH/MESSAGE remain unchanged.
+Real TCP/SDK, restart/journal, fault and cancellation evidence is recorded in tasks.json.
+Standalone inspection does not implement B-05 delivery, leases or cursor persistence.
 
 **B-05 — Durable group lease/ACK/cursor** (depends B-03,B-04). Lease tokens, generation fencing, bounded sparse ACK set, contiguous cursor durable barrier and idempotent duplicate ACK read. Proof: out-of-order ACK gap, stale generation, crash before/after fsync result, redelivery.
 

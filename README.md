@@ -163,9 +163,37 @@ reserving RAM or certifying capacity. The runner also checks available memory
 headroom; loopback enforcement remains mandatory. Optional
 `--metrics-interval-ms 250` emits bounded-frequency `BROKER_METRICS` JSON to stderr.
 
-The Q1 actor also supports bounded read-only committed-history replay through
-`Partition::try_replay`, including message-only results, incarnation checks and explicit
-available-history end. B-04 remains IN_PROGRESS: major-1 FETCH/MESSAGE require real
-consumer-group state and have no standalone replay completion frame. TCP/SDK replay is
-therefore not exposed; group FETCH/ACK operations fail explicitly rather than minting
-placeholder leases. See [the replay contract](docs/architecture/06-q1-storage.md).
+Standalone Q1 history inspection is available through the Rust SDK and external example:
+
+```sh
+cargo run -p rovqet-sdk --example read_q1 -- durable 1 3 0 42 0 64 65536 0
+# READ_RECORD 42 0 100 68656c6c6f
+# READ_END 42 2 0 2 173
+```
+
+Arguments are `topic tenant_id topic_id partition_id incarnation offset max_messages
+max_encoded_bytes wait_ms`. `ROVQET_ADDR` selects the loopback endpoint. The typed Rust API
+is `Client::read_q1(topic, ReadOptions { partition, from, max_messages, max_bytes, wait })`.
+It returns `ReadBatch` with original IDs/payloads, sparse incarnation-bearing offsets,
+continuation, `has_more`, `end_of_current_history`, encoded byte count and stop status.
+Stop statuses are EMPTY=1, END=2, COUNT_LIMIT=3, BYTE_LIMIT=4, WAIT_EXPIRED=5. End is the
+current committed snapshot, so later publications may extend it. Maximum encoded bytes
+includes every record frame and the terminal READ_END (78 bytes), not only payloads.
+Hard ceilings are 1024 records, 4 MiB and 30 seconds wait; aggregate partition budgets
+may reject a request below these ceilings. An oversized first record fails explicitly.
+
+The SDK returns success only after validating READ_END. EOF, timeout, malformed frames or
+cancellation cannot turn a partial multi-frame response into a completed batch; the
+uncertain socket is closed. `ReadError` exposes typed authority, incarnation/history,
+resource, storage, unsupported-peer and framing failures. The wire extension uses frames
+23–25 and fields 49–50; existing FETCH/MESSAGE and golden vectors remain unchanged.
+Read-only inspection creates no consumer leases, ACKs, cursors or at-least-once processing
+promise. B-05 is the next separate work package.
+
+```sh
+python3 scripts/test_q1_replay.py
+```
+
+The Q1 restart smoke also reads all independently journaled ACKs through an external SDK
+process and verifies IDs, offsets and payload hashes after clean restart and SIGKILL.
+See [the replay contract](docs/architecture/06-q1-storage.md).

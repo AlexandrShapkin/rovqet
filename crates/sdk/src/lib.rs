@@ -3,7 +3,9 @@
 //! the SDK never automatically republishes it and risks duplicate delivery.
 #![forbid(unsafe_code)]
 
-pub use rovqet_core::{DurableOffset, Priority, PublishOutcome, QoS};
+pub use rovqet_core::{DurableOffset, PartitionRef, Priority, PublishOutcome, QoS};
+mod replay;
+pub use replay::{ReadBatch, ReadError, ReadOptions, ReadRecord, ReadStatus};
 use rovqet_protocol::{ErrorCode, Field, Frame, FrameType, Limits, registry::field as f};
 use rovqet_transport::{read_frame, write_frame};
 use std::{
@@ -1411,6 +1413,234 @@ mod tests {
             ));
         }
         client.close().await.unwrap();
+        server.await.unwrap();
+    }
+    fn read_options() -> ReadOptions {
+        ReadOptions {
+            partition: PartitionRef {
+                tenant_id: 1,
+                topic_id: 3,
+                partition_id: 0,
+            },
+            from: DurableOffset {
+                log_incarnation: 42,
+                sequence: 0,
+            },
+            max_messages: 2,
+            max_bytes: 2048,
+            wait: Duration::ZERO,
+        }
+    }
+    fn read_scope() -> rovqet_protocol::replay::ReadScope {
+        rovqet_protocol::replay::ReadScope {
+            tenant: 1,
+            topic: 3,
+            partition: 0,
+            incarnation: 42,
+        }
+    }
+    #[tokio::test]
+    async fn standalone_read_rejects_incomplete_malformed_uncorrelated_and_overlimit_batches() {
+        use rovqet_protocol::replay::{self, ReadStatus};
+        for case in 0..13 {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let config = ClientConfig {
+                endpoint: listener.local_addr().unwrap(),
+                ..Default::default()
+            };
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                handshake(&mut stream).await;
+                let request = read_frame(&mut stream, Limits::default())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(request.frame_type, FrameType::ReadFetch);
+                assert!(request.field(f::GROUP_ID).is_none());
+                let mut record = replay::record(
+                    request.request_id,
+                    read_scope(),
+                    0,
+                    100,
+                    b"event-0".to_vec(),
+                );
+                if case == 3 {
+                    record.request_id += 1;
+                }
+                if case == 4 {
+                    record
+                        .fields
+                        .iter_mut()
+                        .find(|v| v.id == f::LOG_INCAR)
+                        .unwrap()
+                        .value = 43u128.to_be_bytes().to_vec();
+                }
+                if case == 5 {
+                    record
+                        .fields
+                        .iter_mut()
+                        .find(|v| v.id == f::OFFSET)
+                        .unwrap()
+                        .value = 2u64.to_be_bytes().to_vec();
+                }
+                if case == 8 {
+                    record.fields.push(Field::optional(127, vec![1; 4]));
+                }
+                if case == 10 {
+                    record
+                        .fields
+                        .iter_mut()
+                        .find(|v| v.id == f::TENANT_ID)
+                        .unwrap()
+                        .value = 2u64.to_be_bytes().to_vec();
+                }
+                let _ = write_frame(&mut stream, &record, Limits::default()).await;
+                if case == 12 {
+                    let second = replay::record(
+                        request.request_id,
+                        read_scope(),
+                        2,
+                        101,
+                        b"event-1".to_vec(),
+                    );
+                    let _ = write_frame(&mut stream, &second, Limits::default()).await;
+                }
+                if case == 1 {
+                    return;
+                } // complete record followed by missing terminal frame
+                let mut end = replay::end(request.request_id, read_scope(), 2, ReadStatus::End);
+                if case == 2 {
+                    end.request_id += 1;
+                }
+                if case == 6 {
+                    end.fields
+                        .iter_mut()
+                        .find(|v| v.id == f::OFFSET)
+                        .unwrap()
+                        .value = 4u64.to_be_bytes().to_vec();
+                }
+                if case == 7 {
+                    end = replay::end(request.request_id, read_scope(), 2, ReadStatus::CountLimit);
+                }
+                if case == 9 {
+                    let bytes = rovqet_protocol::encode(&end, Limits::default()).unwrap();
+                    let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, &bytes[..20]).await;
+                    return;
+                }
+                if case == 11 {
+                    end = replay::end(request.request_id, read_scope(), 2, ReadStatus::WaitExpired);
+                }
+                let _ = write_frame(&mut stream, &end, Limits::default()).await;
+            });
+            let mut client = Client::connect(config).await.unwrap();
+            let mut options = read_options();
+            if case == 8 {
+                options.max_bytes = 175;
+            }
+            if case == 12 {
+                options.max_messages = 1;
+            }
+            let result = client.read_q1("durable", options).await;
+            if case == 0 {
+                let batch = result.unwrap();
+                assert_eq!(batch.records.len(), 1);
+                assert_eq!(batch.next.sequence, 2);
+                assert_eq!(batch.encoded_bytes, 175);
+                assert!(!batch.has_more);
+            } else {
+                if matches!(case, 1 | 9) {
+                    assert!(
+                        matches!(result, Err(ReadError::Incomplete)),
+                        "case{case} must be incomplete"
+                    );
+                } else {
+                    assert!(result.is_err(), "case{case}");
+                }
+                assert!(
+                    client.stream.is_none(),
+                    "case{case} must close uncertain framing"
+                );
+            }
+            server.await.unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn cancellation_between_read_records_and_end_closes_the_entire_stream() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = ClientConfig {
+            endpoint: listener.local_addr().unwrap(),
+            ..Default::default()
+        };
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            handshake(&mut stream).await;
+            let request = read_frame(&mut stream, Limits::default())
+                .await
+                .unwrap()
+                .unwrap();
+            let record = rovqet_protocol::replay::record(
+                request.request_id,
+                read_scope(),
+                0,
+                100,
+                b"event-0".to_vec(),
+            );
+            write_frame(&mut stream, &record, Limits::default())
+                .await
+                .unwrap();
+            // No READ_END. External cancellation must close even though one full record arrived.
+            assert!(
+                read_frame(&mut stream, Limits::default())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        });
+        let mut client = Client::connect(config).await.unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                client.read_q1("durable", read_options())
+            )
+            .await
+            .is_err()
+        );
+        assert!(client.stream.is_none());
+        assert!(matches!(
+            client.read_q1("durable", read_options()).await,
+            Err(ReadError::Closed)
+        ));
+        server.await.unwrap();
+    }
+    #[tokio::test]
+    async fn standalone_read_unsupported_peer_error_is_typed_without_group_fallback() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = ClientConfig {
+            endpoint: listener.local_addr().unwrap(),
+            ..Default::default()
+        };
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            handshake(&mut stream).await;
+            let request = read_frame(&mut stream, Limits::default())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(request.frame_type, FrameType::ReadFetch);
+            let mut error = Frame::new(FrameType::Error, request.request_id);
+            error.fields = vec![
+                Field::required(f::ERROR_CODE, 3u16.to_be_bytes()),
+                Field::required(f::ERROR_RETRYABLE, [0]),
+            ];
+            write_frame(&mut stream, &error, Limits::default())
+                .await
+                .unwrap();
+        });
+        let mut client = Client::connect(config).await.unwrap();
+        assert!(matches!(
+            client.read_q1("durable", read_options()).await,
+            Err(ReadError::Unsupported)
+        ));
         server.await.unwrap();
     }
 }

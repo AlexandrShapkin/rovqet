@@ -24,7 +24,7 @@ mod replay;
 use replay::ReplayCommand;
 pub use replay::{
     MAX_REPLAY_BYTES, MAX_REPLAY_MESSAGES, MAX_REPLAY_WAIT, PendingReplay, REPLAY_BATCH_BYTES,
-    REPLAY_MESSAGE_BYTES, ReplayBatch, ReplayError, ReplayMessage, ReplayRequest,
+    REPLAY_MESSAGE_BYTES, ReplayBatch, ReplayError, ReplayMessage, ReplayRequest, ReplayStop,
 };
 
 struct WorkerOptions {

@@ -55,14 +55,28 @@ pub struct ReplayMessage {
     pub server_timestamp: u64,
     pub payload: Vec<u8>,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayStop {
+    Empty,
+    End,
+    CountLimit,
+    ByteLimit,
+    WaitExpired,
+}
+#[derive(Clone, Copy)]
+struct Sizing {
+    terminal: usize,
+    record: Option<fn(usize) -> Option<usize>>,
+}
 pub struct ReplayBatch {
     pub partition: PartitionRef,
     pub messages: Vec<ReplayMessage>,
     pub next: DurableOffset,
     /// True at the committed snapshot boundary. Later publication may extend it.
     pub end_of_available_history: bool,
-    /// Batch overhead plus per-message overhead and payload lengths.
+    /// Memory charge for ordinary reads; exact encoded batch bytes for the wire adapter.
     pub response_bytes: usize,
+    pub stop: ReplayStop,
     // Retained until the caller drops the batch, including time spent in the reply channel.
     _reservation: Reservation,
 }
@@ -74,6 +88,7 @@ impl fmt::Debug for ReplayBatch {
             .field("next", &self.next)
             .field("end_of_available_history", &self.end_of_available_history)
             .field("response_bytes", &self.response_bytes)
+            .field("stop", &self.stop)
             .finish()
     }
 }
@@ -96,6 +111,7 @@ pub(super) struct ReplayCommand {
     deadline: Instant,
     reply: oneshot::Sender<std::result::Result<ReplayBatch, ReplayError>>,
     reservation: Reservation,
+    sizing: Sizing,
 }
 impl Partition {
     /// Trusted caller must authorize the principal/route before submitting. No lease or ACK exists.
@@ -104,12 +120,44 @@ impl Partition {
         &self,
         request: ReplayRequest,
     ) -> std::result::Result<PendingReplay, ReplayError> {
+        self.submit_replay(
+            request,
+            Sizing {
+                terminal: REPLAY_BATCH_BYTES,
+                record: None,
+            },
+        )
+    }
+    /// Exact encoded response budgeting supplied by the trusted protocol adapter.
+    /// Retains additional encoding scratch under the same hard partition budget.
+    pub fn try_replay_encoded(
+        &self,
+        request: ReplayRequest,
+        terminal_bytes: usize,
+        record_bytes: fn(usize) -> Option<usize>,
+    ) -> std::result::Result<PendingReplay, ReplayError> {
+        if terminal_bytes == 0 || terminal_bytes > REPLAY_BATCH_BYTES {
+            return Err(ReplayError::InvalidLimits);
+        }
+        self.submit_replay(
+            request,
+            Sizing {
+                terminal: terminal_bytes,
+                record: Some(record_bytes),
+            },
+        )
+    }
+    fn submit_replay(
+        &self,
+        request: ReplayRequest,
+        sizing: Sizing,
+    ) -> std::result::Result<PendingReplay, ReplayError> {
         if request.partition != self.config.partition {
             return Err(ReplayError::WrongPartition);
         }
         if request.max_messages == 0
             || request.max_messages > MAX_REPLAY_MESSAGES
-            || request.max_bytes < REPLAY_BATCH_BYTES
+            || request.max_bytes < sizing.terminal
             || request.max_bytes > MAX_REPLAY_BYTES
             || request.wait > MAX_REPLAY_WAIT
         {
@@ -123,6 +171,13 @@ impl Partition {
             .and_then(|scratch| scratch.checked_add(2 * (RECORD_OVERHEAD + OUTCOME_BYTES)))
             .and_then(|scratch| scratch.checked_add(request.max_messages * REPLAY_MESSAGE_BYTES))
             .and_then(|scratch| request.max_bytes.checked_add(scratch))
+            .and_then(|charge| {
+                charge.checked_add(if sizing.record.is_some() {
+                    request.max_bytes + REPLAY_BATCH_BYTES
+                } else {
+                    0
+                })
+            })
             .ok_or(ReplayError::Capacity)?;
         let reservation =
             Budget::reserve(&[self.budget.clone()], charge).ok_or(ReplayError::Capacity)?;
@@ -135,6 +190,7 @@ impl Partition {
             deadline,
             reply,
             reservation,
+            sizing,
         });
         match self
             .sender
@@ -164,7 +220,16 @@ impl State {
                 continue;
             }
             let command = reads.swap_remove(index);
-            let result = self.replay(command.request, command.reservation);
+            let expired = !shutdown
+                && at_end
+                && !command.request.wait.is_zero()
+                && Instant::now() >= command.deadline;
+            let result = self.replay(
+                command.request,
+                command.reservation,
+                command.sizing,
+                expired,
+            );
             let _ = command.reply.send(result);
         }
     }
@@ -172,6 +237,8 @@ impl State {
         &mut self,
         r: ReplayRequest,
         reservation: Reservation,
+        sizing: Sizing,
+        expired: bool,
     ) -> std::result::Result<ReplayBatch, ReplayError> {
         if self.unhealthy {
             return Err(ReplayError::Unavailable);
@@ -183,10 +250,14 @@ impl State {
             return Err(ReplayError::ReplayNotAvailable);
         }
         let mut cursor = r.from.sequence;
-        let mut response_bytes = REPLAY_BATCH_BYTES;
-        let capacity = r
-            .max_messages
-            .min((r.max_bytes - REPLAY_BATCH_BYTES) / REPLAY_MESSAGE_BYTES);
+        let mut response_bytes = sizing.terminal;
+        let mut stop = ReplayStop::CountLimit;
+        let capacity = if sizing.record.is_some() {
+            r.max_messages
+        } else {
+            r.max_messages
+                .min((r.max_bytes - REPLAY_BATCH_BYTES) / REPLAY_MESSAGE_BYTES)
+        };
         let mut messages = Vec::with_capacity(capacity);
         while cursor < self.next && messages.len() < r.max_messages {
             let records = self
@@ -212,18 +283,22 @@ impl State {
             }
             let mut records = records.into_iter();
             let message = records.next().unwrap();
-            let required = REPLAY_MESSAGE_BYTES
-                .checked_add(message.payload.len())
-                .ok_or(ReplayError::InvalidLimits)?;
+            let required = match sizing.record {
+                Some(size) => size(message.payload.len()),
+                None => REPLAY_MESSAGE_BYTES.checked_add(message.payload.len()),
+            }
+            .filter(|&bytes| bytes >= message.payload.len())
+            .ok_or(ReplayError::InvalidLimits)?;
             if response_bytes
                 .checked_add(required)
                 .is_none_or(|n| n > r.max_bytes)
             {
                 if messages.is_empty() {
                     return Err(ReplayError::ResponseTooSmall {
-                        required_bytes: REPLAY_BATCH_BYTES + required,
+                        required_bytes: sizing.terminal + required,
                     });
                 }
+                stop = ReplayStop::ByteLimit;
                 break;
             }
             // Capacity is charged by bytes as well as message count; never grow past preallocation.
@@ -254,6 +329,17 @@ impl State {
             },
             end_of_available_history: cursor == self.next,
             response_bytes,
+            stop: if cursor == self.next {
+                if expired {
+                    ReplayStop::WaitExpired
+                } else if self.next == 0 {
+                    ReplayStop::Empty
+                } else {
+                    ReplayStop::End
+                }
+            } else {
+                stop
+            },
             _reservation: reservation,
         })
     }

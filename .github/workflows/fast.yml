@@ -37,6 +37,8 @@ jobs:
         run: python3 scripts/q0_smoke.py
       - name: Independent Q1 publishing and restart recovery
         run: python3 scripts/q1_smoke.py --check-hooks-disabled
+      - name: Standalone Q1 replay through TCP and external Rust SDK
+        run: python3 scripts/test_q1_replay.py
       - name: Q1 actor fault controls
         run: cargo test -p rovqet-durable --features fault-injection --locked
       - name: Build isolated Q1 fault-test broker

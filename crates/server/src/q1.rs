@@ -202,6 +202,113 @@ impl Route {
             .shutdown()
             .map_err(|e| io::Error::other(format!("Q1 shutdown: {e}")))
     }
+    fn read(
+        &self,
+        principal: u128,
+        frame: Frame,
+        outbound: Outbound,
+    ) -> Result<SessionReply, ErrorCode> {
+        use rovqet_durable::{ReplayRequest, ReplayStop};
+        use rovqet_protocol::replay::{self, ReadScope, ReadStatus};
+        if principal != 1 {
+            return Err(ErrorCode::PermissionDenied);
+        }
+        if frame
+            .field(f::PRINCIPAL_ID)
+            .is_some_and(|v| v != 1u64.to_be_bytes())
+        {
+            return Err(ErrorCode::PermissionDenied);
+        }
+        for (id, expected) in [
+            (f::TENANT_ID, self.options.partition.tenant_id),
+            (f::TOPIC_ID, self.options.partition.topic_id),
+        ] {
+            if frame.field(id).is_some_and(|v| v != expected.to_be_bytes()) {
+                return Err(ErrorCode::PermissionDenied);
+            }
+        }
+        if frame
+            .field(f::TOPIC_NAME)
+            .is_some_and(|v| v != self.options.topic.as_bytes())
+        {
+            return Err(ErrorCode::UnsupportedGuarantee);
+        }
+        if frame.field(f::TOPIC_NAME).is_none() && frame.field(f::TOPIC_ID).is_none() {
+            return Err(ErrorCode::BadFrame);
+        }
+        if number::<4>(&frame, f::PARTITION_ID)? != self.options.partition.partition_id as u128
+            || number::<16>(&frame, f::LOG_INCAR)? != self.options.incarnation
+        {
+            return Err(ErrorCode::ReplayNotAvailable);
+        }
+        if frame.field(f::QOS) != Some(&[1][..]) {
+            return Err(ErrorCode::UnsupportedGuarantee);
+        }
+        let request = ReplayRequest {
+            partition: self.options.partition,
+            from: rovqet_core::DurableOffset {
+                log_incarnation: self.options.incarnation,
+                sequence: number::<8>(&frame, f::OFFSET)? as u64,
+            },
+            max_messages: number::<4>(&frame, f::MAX_MESSAGES)? as usize,
+            max_bytes: number::<4>(&frame, f::MAX_BYTES)? as usize,
+            wait: Duration::from_millis(
+                frame
+                    .field(f::WAIT_MS)
+                    .map(uint::<4>)
+                    .transpose()?
+                    .unwrap_or(0) as u64,
+            ),
+        };
+        let pending = self
+            .partition
+            .try_replay_encoded(request, replay::END_BYTES, replay::record_bytes)
+            .map_err(map_read_error)?;
+        let id = frame.request_id;
+        let scope = ReadScope {
+            tenant: self.options.partition.tenant_id,
+            topic: self.options.partition.topic_id,
+            partition: self.options.partition.partition_id,
+            incarnation: self.options.incarnation,
+        };
+        Ok(SessionReply::ReadOnly(Box::pin(async move {
+            let batch = Arc::new(pending.wait_async().await.map_err(map_read_error)?);
+            let limits = outbound.limits();
+            // Validate the whole snapshot before the first write; no skipped oversized record.
+            for message in &batch.messages {
+                if message.payload.len() > limits.max_payload_bytes
+                    || replay::record_bytes(message.payload.len())
+                        .is_none_or(|n| n > limits.max_frame_bytes)
+                {
+                    return Err(ErrorCode::ResourceExhausted);
+                }
+            }
+            for message in &batch.messages {
+                let record = replay::record(
+                    id,
+                    scope,
+                    message.offset.sequence,
+                    message.message_id,
+                    message.payload.clone(),
+                );
+                outbound.send_read(&record, batch.clone()).await?;
+            }
+            let status = match batch.stop {
+                ReplayStop::Empty => ReadStatus::Empty,
+                ReplayStop::End => ReadStatus::End,
+                ReplayStop::CountLimit => ReadStatus::CountLimit,
+                ReplayStop::ByteLimit => ReadStatus::ByteLimit,
+                ReplayStop::WaitExpired => ReadStatus::WaitExpired,
+            };
+            outbound
+                .send_read(
+                    &replay::end(id, scope, batch.next.sequence, status),
+                    batch.clone(),
+                )
+                .await?;
+            Ok(None)
+        })))
+    }
     fn publish(&self, principal: u128, frame: Frame) -> Result<SessionReply, ErrorCode> {
         if frame.field(f::QOS) != Some(&[1][..]) {
             return Err(ErrorCode::UnsupportedGuarantee);
@@ -315,6 +422,15 @@ fn uint<const N: usize>(bytes: &[u8]) -> Result<u128, ErrorCode> {
 fn number<const N: usize>(frame: &Frame, id: u64) -> Result<u128, ErrorCode> {
     uint::<N>(frame.field(id).ok_or(ErrorCode::BadFrame)?)
 }
+fn map_read_error(error: rovqet_durable::ReplayError) -> ErrorCode {
+    use rovqet_durable::ReplayError::*;
+    match error {
+        WrongPartition | IncarnationMismatch | ReplayNotAvailable => ErrorCode::ReplayNotAvailable,
+        InvalidLimits => ErrorCode::BadFrame,
+        ResponseTooSmall { .. } | Capacity => ErrorCode::ResourceExhausted,
+        Unavailable | Storage(_) | Corruption(_) => ErrorCode::StorageUnavailable,
+    }
+}
 fn map_error(error: DurableError) -> ErrorCode {
     match error {
         DurableError::WrongPartition | DurableError::WrongClass => ErrorCode::UnsupportedGuarantee,
@@ -369,6 +485,17 @@ impl SessionHandler for Dispatch {
         frame: Frame,
         outbound: Outbound,
     ) -> SessionReply {
+        if frame.frame_type == FrameType::ReadFetch {
+            if self.draining.load(Ordering::Acquire) {
+                return SessionReply::Immediate(Err(ErrorCode::ServerDraining));
+            }
+            return match &self.route {
+                Some(route) => route
+                    .read(principal, frame, outbound)
+                    .unwrap_or_else(|e| SessionReply::Immediate(Err(e))),
+                None => SessionReply::Immediate(Err(ErrorCode::UnsupportedGuarantee)),
+            };
+        }
         // Major-1 durable MESSAGE requires a real group/generation/lease. Until B-05
         // there is no legal standalone FETCH response or terminal batch frame.
         if matches!(
@@ -654,5 +781,307 @@ mod tests {
             map_error(DurableError::Capacity),
             ErrorCode::ResourceExhausted
         );
+    }
+    struct ReadServer {
+        root: PathBuf,
+        route: Arc<Route>,
+        address: std::net::SocketAddr,
+        stop: tokio::sync::oneshot::Sender<()>,
+        task: tokio::task::JoinHandle<io::Result<()>>,
+    }
+    impl ReadServer {
+        async fn start(label: &str) -> Self {
+            let root =
+                std::env::temp_dir().join(format!("rovqet-read-{label}-{}", std::process::id()));
+            std::fs::create_dir(&root).unwrap();
+            let mut options = Options::parse(&values()).unwrap().unwrap();
+            options.directory = root.clone();
+            let wal = rovqet_wal::Config {
+                partition: options.partition,
+                incarnation: 42,
+                max_segment_bytes: 512,
+                max_record_bytes: 256,
+                ..Default::default()
+            };
+            let config = PartitionConfig {
+                partition: options.partition,
+                ownership_epoch: 7,
+                queue_messages: 64,
+                queue_bytes: 4 * 1024 * 1024,
+                max_outcomes: 1000,
+                max_producers: 100,
+                dedup_window: Duration::from_secs(86400),
+            };
+            let partition = Partition::open(&root, wal, config).unwrap();
+            let route = Arc::new(Route {
+                partition,
+                options,
+                _lock: File::create(root.join("SERVER.lock")).unwrap(),
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (stop, closed) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(rovqet_transport::serve(
+                listener,
+                Default::default(),
+                Arc::new(Dispatch::new(
+                    crate::development_broker(1024),
+                    Some(route.clone()),
+                )),
+                async {
+                    let _ = closed.await;
+                },
+            ));
+            Self {
+                root,
+                route,
+                address,
+                stop,
+                task,
+            }
+        }
+        async fn client(&self) -> rovqet_sdk::Client {
+            rovqet_sdk::Client::connect(rovqet_sdk::ClientConfig {
+                endpoint: self.address,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+        }
+        fn options(
+            &self,
+            offset: u64,
+            messages: u32,
+            bytes: u32,
+            wait: u64,
+        ) -> rovqet_sdk::ReadOptions {
+            rovqet_sdk::ReadOptions {
+                partition: self.route.options.partition,
+                from: rovqet_sdk::DurableOffset {
+                    log_incarnation: 42,
+                    sequence: offset,
+                },
+                max_messages: messages,
+                max_bytes: bytes,
+                wait: Duration::from_millis(wait),
+            }
+        }
+        async fn publish(client: &mut rovqet_sdk::Client, seq: u64) {
+            client
+                .publish_q1(
+                    "durable",
+                    format!("event-{seq}").as_bytes(),
+                    rovqet_sdk::Q1PublishOptions {
+                        producer_id: 11,
+                        producer_epoch: 0,
+                        sequence: seq,
+                        message_id: 100 + seq as u128,
+                        partition_id: 0,
+                        log_incarnation: 42,
+                        ownership_epoch: 7,
+                        ttl: Duration::from_secs(30),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        async fn finish(self) {
+            let _ = self.stop.send(());
+            self.task.await.unwrap().unwrap();
+            let route = Arc::try_unwrap(self.route)
+                .ok()
+                .expect("all sessions release route ownership");
+            tokio::task::spawn_blocking(move || route.shutdown().unwrap())
+                .await
+                .unwrap();
+            std::fs::remove_dir_all(self.root).unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn sdk_tcp_replay_exact_bounds_continuation_segments_and_read_only_producer_state() {
+        use rovqet_sdk::{ReadError, ReadStatus};
+        let server = ReadServer::start("limits").await;
+        let mut client = server.client().await;
+        let empty = client
+            .read_q1("durable", server.options(0, 8, 78, 0))
+            .await
+            .unwrap();
+        assert_eq!(empty.status, ReadStatus::Empty);
+        assert_eq!(empty.encoded_bytes, 78);
+        for seq in 0..7 {
+            ReadServer::publish(&mut client, seq).await;
+        }
+        let original_manifest = std::fs::read(server.root.join("MANIFEST")).unwrap();
+        assert!(
+            std::fs::read_dir(&server.root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with("segment-"))
+                .count()
+                > 1
+        );
+        let count = client
+            .read_q1("durable", server.options(0, 2, 2048, 0))
+            .await
+            .unwrap();
+        assert_eq!(count.status, ReadStatus::CountLimit);
+        assert_eq!(count.next.sequence, 4);
+        assert!(count.has_more);
+        assert_eq!(
+            count
+                .records
+                .iter()
+                .map(|r| r.offset.sequence)
+                .collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+        let byte_limit = 78 + rovqet_protocol::replay::record_bytes(7).unwrap() as u32;
+        let bytes = client
+            .read_q1("durable", server.options(4, 8, byte_limit, 0))
+            .await
+            .unwrap();
+        assert_eq!(bytes.status, ReadStatus::ByteLimit);
+        assert_eq!(bytes.encoded_bytes, byte_limit as usize);
+        assert_eq!(bytes.next.sequence, 6);
+        assert!(matches!(
+            client
+                .read_q1("durable", server.options(4, 8, byte_limit - 1, 0))
+                .await,
+            Err(ReadError::ResourceExhausted)
+        ));
+        let rest = client
+            .read_q1("durable", server.options(6, 8, 2048, 0))
+            .await
+            .unwrap();
+        assert_eq!(rest.records.len(), 4);
+        assert_eq!(rest.next.sequence, 14);
+        assert!(rest.end_of_current_history);
+        for (i, record) in rest.records.iter().enumerate() {
+            assert_eq!(record.message_id, 103 + i as u128);
+            assert_eq!(record.payload, format!("event-{}", i + 3).as_bytes());
+        }
+        let end = client
+            .read_q1("durable", server.options(14, 8, 78, 0))
+            .await
+            .unwrap();
+        assert!(end.records.is_empty());
+        assert_eq!(end.status, ReadStatus::End);
+        assert_eq!(
+            std::fs::read(server.root.join("MANIFEST")).unwrap(),
+            original_manifest
+        );
+        // All reads leave producer high-water unchanged: exact duplicate still settles, next seq commits.
+        ReadServer::publish(&mut client, 0).await;
+        assert_eq!(
+            std::fs::read(server.root.join("MANIFEST")).unwrap(),
+            original_manifest
+        );
+        ReadServer::publish(&mut client, 7).await;
+        assert_eq!(
+            client
+                .read_q1("durable", server.options(14, 8, 2048, 0))
+                .await
+                .unwrap()
+                .records[0]
+                .offset
+                .sequence,
+            14
+        );
+        client.close().await.unwrap();
+        server.finish().await;
+    }
+    #[tokio::test]
+    async fn tcp_long_poll_publication_wait_expiry_cancellation_and_authorization() {
+        use rovqet_sdk::{ReadError, ReadStatus};
+        let server = ReadServer::start("wait").await;
+        let mut reader = server.client().await;
+        let mut writer = server.client().await;
+        let waiting = reader.read_q1("durable", server.options(0, 8, 2048, 30000));
+        tokio::pin!(waiting);
+        tokio::select! {result=&mut waiting=>panic!("unexpected result {result:?}"),_=tokio::task::yield_now()=>{}}
+        ReadServer::publish(&mut writer, 0).await;
+        let batch = waiting.await.unwrap();
+        assert_eq!(batch.records.len(), 1);
+        assert_eq!(batch.status, ReadStatus::End);
+        let mut reader = server.client().await;
+        let timeout = reader
+            .read_q1("durable", server.options(2, 8, 2048, 1))
+            .await
+            .unwrap();
+        assert_eq!(timeout.status, ReadStatus::WaitExpired);
+        let mut wrong = server.options(0, 8, 2048, 0);
+        wrong.partition.tenant_id = 2;
+        assert!(matches!(
+            reader.read_q1("durable", wrong).await,
+            Err(ReadError::PermissionDenied)
+        ));
+        let mut wrong = server.options(0, 8, 2048, 0);
+        wrong.partition.partition_id = 1;
+        assert!(matches!(
+            reader.read_q1("durable", wrong).await,
+            Err(ReadError::ReplayNotAvailable)
+        ));
+        let mut wrong = server.options(0, 8, 2048, 0);
+        wrong.from.log_incarnation = 41;
+        assert!(matches!(
+            reader.read_q1("durable", wrong).await,
+            Err(ReadError::ReplayNotAvailable)
+        ));
+        assert!(matches!(
+            reader
+                .read_q1("durable", server.options(1, 8, 2048, 0))
+                .await,
+            Err(ReadError::ReplayNotAvailable)
+        ));
+        // More cancelled sessions than actor slots: EOF must release long-poll reservations promptly.
+        for _ in 0..70 {
+            let mut cancelled = server.client().await;
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(2),
+                    cancelled.read_q1("durable", server.options(2, 8, 2048, 30000))
+                )
+                .await
+                .is_err()
+            );
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while server.route.partition.usage().messages != 0 {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::task::yield_now().await;
+        }
+        ReadServer::publish(&mut writer, 1).await;
+        reader.close().await.unwrap();
+        writer.close().await.unwrap();
+        server.finish().await;
+    }
+    #[tokio::test]
+    async fn tcp_replay_corrupt_or_missing_committed_segment_never_completes_a_batch() {
+        for missing in [false, true] {
+            let server = ReadServer::start(if missing { "missing" } else { "corrupt" }).await;
+            let mut client = server.client().await;
+            ReadServer::publish(&mut client, 0).await;
+            let path = std::fs::read_dir(&server.root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .find(|entry| entry.file_name().to_string_lossy().starts_with("segment-"))
+                .unwrap()
+                .path();
+            if missing {
+                std::fs::rename(&path, server.root.join("unavailable-segment")).unwrap();
+            } else {
+                let mut bytes = std::fs::read(&path).unwrap();
+                bytes[60] ^= 1;
+                std::fs::write(&path, bytes).unwrap();
+            }
+            assert!(matches!(
+                client
+                    .read_q1("durable", server.options(0, 8, 2048, 0))
+                    .await,
+                Err(rovqet_sdk::ReadError::StorageUnavailable)
+            ));
+            client.close().await.unwrap();
+            server.finish().await;
+        }
     }
 }

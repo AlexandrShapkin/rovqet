@@ -42,6 +42,9 @@ TLV \`tag = (field_number << 1) | critical_bit\`; unknown critical tags fail UNS
 | 20 | ERROR | stable code/class/retry metadata |
 | 21 | DRAIN | server shuts down or moves owner |
 | 22 | CLOSE | final session close |
+| 23 | READ_FETCH | standalone committed Q1 inspection request |
+| 24 | READ_RECORD | committed application record, no group/lease |
+| 25 | READ_END | terminal batch status and continuation |
 
 Reserve 0 as invalid. Existing numeric assignments are immutable within wire major 1. Additions require a central registry entry and compatible codec fixtures; never assign conflicting IDs per component.
 
@@ -94,13 +97,22 @@ The opt-in TCP Q1 route uses the existing major-1 registry. In addition to the g
 
 `Client::publish_q1(topic, payload, Q1PublishOptions)` requires caller-owned producer ID, epoch, sequence, message ID, partition, incarnation, owner epoch and TTL. It validates response correlation, Q1/COMMITTED_LOCAL, partition and incarnation before decoding the offset. Transport loss, timeout, malformed/contradictory responses and OUTCOME_UNKNOWN errors produce `ClientError::OutcomeUnknown` and close the uncertain connection. Reconnect preserves caller-owned options; retry must explicitly reuse the original token and content. Definitive server errors remain typed. The original Q0 publish API remains compatible. B-03's timed dedup window and B-04 FETCH are not implemented by this API.
 
-## B-04 standalone replay integration boundary
+## B-04 standalone replay
 
-The storage actor has a complete typed read-only replay API with bounded results and
-incarnation-bearing sparse MESSAGE offsets (see [06](06-q1-storage.md)). It is not yet
-exposed through the Rust SDK or TCP: the major-1 registry requires a real group on FETCH
-and a generation/lease on durable MESSAGE, and supplies no replay batch completion frame.
-These cannot be populated without real group state. FETCH and group ACK operations return
-UNSUPPORTED_CAPABILITY. B-04 remains IN_PROGRESS. Specify an authorized standalone
-request/result/end contract as a narrow registry correction before wire implementation;
-do not invent lease semantics or start B-05 to evade its prerequisites.
+`Client::read_q1(topic, ReadOptions)` sends READ_FETCH (23) and validates zero or more
+READ_RECORD (24) frames followed by mandatory READ_END (25). `ReadOptions` carries the
+complete partition, incarnation-bearing start, message/encoded-byte limits and bounded
+wait. `ReadBatch` exposes original message IDs/payloads, sparse offset references,
+continuation, has_more/end_of_current_history, typed stop status and actual encoded bytes.
+Typed `ReadError` distinguishes unavailable history, denied authority, resource exhaustion,
+storage failure, unsupported peers, invalid responses and incomplete transport exchanges.
+
+All response scopes, request IDs, sparse offset progression, count/byte limits and terminal
+semantics are checked. Exact received bytes include ignored optional TLVs. Cancellation
+owns/closes the socket for the entire operation, including between complete records;
+transport timeout/EOF before READ_END returns Incomplete with no partial batch. The
+operation deadline is request_timeout plus the requested bounded wait; it is never reset
+per frame. Existing volatile subscription deliveries may interleave under their original
+SDK pending bounds. The read API creates no leases or consumer ACK/cursor semantics.
+The original FETCH/MESSAGE group contracts are unchanged and remain unsupported by the
+prototype. See [the binary contract](protocol-registry.md#b-04-standalone-inspection-extension-major-1-additive).

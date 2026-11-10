@@ -815,6 +815,7 @@ dependencies = [
  "rovqet-protocol",
  "rovqet-q0",
  "rovqet-router",
+ "rovqet-sdk",
  "rovqet-transport",
  "rovqet-wal",
  "sha2",

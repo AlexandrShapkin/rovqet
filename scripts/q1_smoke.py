@@ -21,6 +21,7 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 SERVER = ROOT / "target/debug/rovqet"
 Q1 = ROOT / "target/debug/examples/q1"
+READ = ROOT / "target/debug/examples/read_q1"
 Q0 = ROOT / "target/debug/examples/q0"
 
 
@@ -179,6 +180,27 @@ def journal_ack(path: Path, sequence: int, offset: int):
         os.fsync(journal.fileno())
 
 
+def replay_journal(broker, journal: Path):
+    """External SDK client verifies payloads/identities against the independent ACK journal."""
+    result = subprocess.run([str(READ), "durable", "1", "3", "0", "42", "0", "64", "65536", "0"],
+                            env=broker.environment(), capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    records = {}
+    end = None
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if parts[0] == "READ_RECORD":
+            _, incarnation, offset, message, payload = parts
+            records[int(offset)] = (int(incarnation), int(message), hashlib.sha256(bytes.fromhex(payload)).hexdigest())
+        elif parts[0] == "READ_END":
+            end = parts
+    entries = list(map(json.loads, journal.read_text().splitlines()))
+    assert len(records) == len(entries), (records, entries)
+    for entry in entries:
+        assert records[entry["offset"]] == (entry["incarnation"], entry["message_id"], entry["payload_sha256"])
+    assert end and end[1:5] == ["42", str(2 * len(entries)), "0", "2"], end
+
+
 def manifest_record_count(wal: Path):
     # Frozen v1 encoding: count is u64 BE at bytes69..77, not inferred from tails.
     manifest = (wal / "MANIFEST").read_bytes()
@@ -204,8 +226,10 @@ def main():
             for sequence in range(3):
                 committed(broker.publish(sequence), sequence * 2)
                 journal_ack(journal, sequence, sequence * 2)
+            replay_journal(broker, journal)
             broker.stop()
         with Broker(directory) as broker:
+            replay_journal(broker, journal)
             for entry in map(json.loads, journal.read_text().splitlines()):
                 committed(broker.publish(entry["sequence"]), entry["offset"])
             assert manifest_record_count(broker.wal) == 6, "retry inserted duplicates"
@@ -213,11 +237,12 @@ def main():
             journal_ack(journal, 3, 6)
             broker.kill()  # Actual process crash, after independently journaled PUB_ACK.
         with Broker(directory) as broker:
+            replay_journal(broker, journal)
             for entry in map(json.loads, journal.read_text().splitlines()):
                 committed(broker.publish(entry["sequence"]), entry["offset"])
             assert manifest_record_count(broker.wal) == 8
             broker.stop()
-        print("PASS: Q1 SDK/TCP COMMITTED_LOCAL; clean restart and SIGKILL recovered all4 independently journaled ACKs with stable retry offsets and no duplicate insertion")
+        print("PASS: Q1 SDK/TCP COMMITTED_LOCAL; clean restart and SIGKILL recovered all4 independently journaled ACKs with stable retry offsets, SDK/TCP payload replay and no duplicate insertion")
 
 
 if __name__ == "__main__":

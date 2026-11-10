@@ -169,7 +169,7 @@ restart/rollback/unavailable evidence, separate quotas, recovered high-water/fen
 and 512 concurrent retries with one durable pair. Existing model, actor fault and
 independent TCP ACK-journal/SIGKILL fixtures continue to verify stable original offsets.
 
-## B-04 actor-owned committed replay (wire integration pending)
+## B-04 actor-owned committed replay and standalone TCP inspection
 
 `Partition::try_replay(ReplayRequest)` submits to the same storage owner as publication.
 The request carries the exact `PartitionRef`, incarnation-bearing starting offset,
@@ -221,16 +221,30 @@ allocation remains configuration authority's responsibility; the broker cannot p
 global uniqueness after loss of every copy of configuration/storage. An intact ordinary
 restart reuses its configured identity and committed index.
 
-**Precise integration blocker:** frozen major-1 FETCH requires group_id; durable MESSAGE
-requires group_id, generation and lease_id; there is no registered standalone replay batch
-or completion/end-of-history frame. Emitting placeholder groups/leases or an empty MESSAGE
-would violate that contract. The server therefore explicitly rejects FETCH/CONSUMER_ACK/
-CONSUMER_NACK/EXTEND_LEASE with UNSUPPORTED_CAPABILITY. No SDK standalone replay API is
-claimed. B-04 stays **IN_PROGRESS** until an approved standalone read-only request/result
-contract (including authorization, per-frame limits, batching and terminal response) is
-specified and implemented, or the real B-05 group model makes the existing wire legal.
-B-05 implementation remains blocked by the roadmap; do not fabricate group state to
-close B-04. The next bounded work is the standalone wire contract correction, not B-05.
+Standalone TCP uses the additive READ_FETCH/READ_RECORD/READ_END contract in
+[the registry](protocol-registry.md#b-04-standalone-inspection-extension-major-1-additive).
+FETCH/MESSAGE keep their original group requirements. The prototype explicitly rejects
+FETCH/CONSUMER_ACK/CONSUMER_NACK/EXTEND_LEASE; no group state is fabricated.
+
+The authenticated principal and configured Q1 route authorize inspection. Topic-name/ID,
+tenant/principal assertions, partition and incarnation are checked before actor admission.
+`try_replay_encoded` refines the existing read seam with trusted terminal/record sizing;
+legacy actor memory-charge reads are unchanged. It returns the exact stop reason and
+reserves additional space for encoding, vector capacity and retained response bytes.
+Client wire max_bytes includes all READ_RECORD frames plus the 78-byte READ_END. The
+partition's aggregate queue budget can reject requests below the hard 4 MiB wire ceiling;
+no reservation or dedup guarantee is silently relaxed to accommodate reads.
+
+Networking awaits the actor without blocking Tokio. A separate one-slot lossless reply
+path writes one bounded frame at a time and awaits write completion; every queued write
+holds the actor batch reservation. Q0's volatile queues, credits and control reserve stay
+independent. Dropping a read-only session cancels its actor waiter; a peek detects EOF
+without consuming a partial pipelined frame. This serial profile does not pipeline batches;
+unread pipelined input can defer EOF recognition until the bounded wait ends. Blocking
+filesystem IO remains non-preemptible. The SDK owns the stream for the whole operation,
+so cancellation or interruption between frames closes it. Only a validated READ_END
+returns a successful typed batch; partial records never escape as a completed result.
+Standalone reads never persist group cursors or mutate producer state.
 
 Actor proofs cover clean/SIGKILL recovery against the independent ACK journal, segment
 boundaries, message/byte limits, metadata exclusion, empty/end/invalid ranges, stale
@@ -239,4 +253,4 @@ publication, cancellation/retained-response quotas, asynchronous wait and bounde
 expiry/shutdown. Fault-enabled tests hold an unsynced append and prove queued replay cannot
 expose it; cancellation releases the retained read budget. Disposable loss fixtures never
 invoke broker deletion or reset operations. TCP tests prove unsupported group operations
-and fail-closed lost-history startup, not SDK replay compatibility.
+fail-closed lost-history startup and explicit group-operation rejection. Real TCP/SDK tests add exact encoded bounds, multi-frame validation, continuation, long polling, negotiated frame limits, cancellation and read-only producer-state checks. The independent process ACK journal verifies message IDs, offsets and payload hashes through the SDK after clean restart and SIGKILL.

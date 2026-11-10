@@ -803,3 +803,42 @@ fn replay_queued_during_unsynced_append_cannot_expose_it_and_cancellation_releas
     assert_eq!(p.usage().messages, 0);
     p.shutdown().unwrap();
 }
+
+#[test]
+fn encoded_replay_limits_report_exact_count_byte_end_and_empty_reasons() {
+    use rovqet_durable::ReplayStop;
+    fn bytes(payload: usize) -> Option<usize> {
+        payload.checked_add(90)
+    }
+    let t = Temp::new();
+    let p = open(&t);
+    let mut r = replay_request(0);
+    r.max_bytes = 78;
+    let batch = p.try_replay_encoded(r, 78, bytes).unwrap().wait().unwrap();
+    assert_eq!(batch.stop, ReplayStop::Empty);
+    assert_eq!(batch.response_bytes, 78);
+    drop(batch);
+    for i in 0..3 {
+        publish(&p, request(i)).unwrap();
+    }
+    let mut r = replay_request(0);
+    r.max_bytes = 175;
+    let batch = p.try_replay_encoded(r, 78, bytes).unwrap().wait().unwrap();
+    assert_eq!(batch.stop, ReplayStop::ByteLimit);
+    assert_eq!(batch.response_bytes, 175);
+    assert_eq!(batch.next.sequence, 2);
+    drop(batch);
+    let mut r = replay_request(0);
+    r.max_messages = 2;
+    let batch = p.try_replay_encoded(r, 78, bytes).unwrap().wait().unwrap();
+    assert_eq!(batch.stop, ReplayStop::CountLimit);
+    assert_eq!(batch.next.sequence, 4);
+    drop(batch);
+    let batch = p
+        .try_replay_encoded(replay_request(4), 78, bytes)
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert_eq!(batch.stop, ReplayStop::End);
+    assert_eq!(batch.next.sequence, 6);
+}

@@ -236,6 +236,36 @@ class Q1ProcessFaults(unittest.TestCase):
         self.assertEqual(output.strip(), "COMMITTED_LOCAL 42 0")
         broker.stop()
 
+    def test_standalone_replay_cannot_expose_an_unsynced_tcp_publication(self):
+        stage = "after-append-before-sync"
+        broker = self.broker(stage=stage)
+        publisher = self.pending(broker)
+        broker.barrier(stage)
+        with connect(broker) as reader:
+            request = {9: b"durable", 12: b"\x01", 19: bytes(4),
+                       20: (42).to_bytes(16, "big"), 21: bytes(8),
+                       31: (8).to_bytes(4, "big"), 32: (65536).to_bytes(4, "big")}
+            reader.sendall(frame(23, 998, request))
+            reader.settimeout(0.02)
+            with self.assertRaises(socket.timeout):
+                reader.recv(1)
+            self.assertEqual(manifest_record_count(broker.wal), 0)
+            broker.release(stage)
+            output, error = publisher.communicate(timeout=15)
+            self.assertEqual(publisher.returncode, 0, error)
+            self.assertEqual(output.strip(), "COMMITTED_LOCAL 42 0")
+            journal_ack(self.directory / "received-acks.jsonl", 0, 0)
+            reader.settimeout(5)
+            kind, correlation, record = read_frame(reader)
+            self.assertEqual((kind, correlation), (24, 998))
+            self.assertEqual(record[15], (100).to_bytes(16, "big"))
+            self.assertEqual(record[21], bytes(8))
+            kind, correlation, end = read_frame(reader)
+            self.assertEqual((kind, correlation), (25, 998))
+            self.assertEqual(end[21], (2).to_bytes(8, "big"))
+            self.assertEqual(end[49], b"\x02")
+        broker.stop()
+
     def test_admitted_queued_expiry_rejects_before_append_without_consuming_sequence(self):
         stage = "before-append"
         broker = self.broker(stage=stage)

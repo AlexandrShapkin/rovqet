@@ -23,3 +23,6 @@ sha2 = "0.10"
 
 [features]
 fault-injection = ["rovqet-durable/fault-injection"]
+
+[dev-dependencies]
+rovqet-sdk = { path = "../sdk" }
