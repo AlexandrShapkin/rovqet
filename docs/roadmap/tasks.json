@@ -530,7 +530,7 @@
           "python3 scripts/test_q1_faults.py",
           "git diff --check"
         ],
-        "observed_result": "24 default durable tests (including4 controlled-time tests), server canonical-attribute test,148 workspace tests,29 WAL tests, Q0 TCP smoke, Q1 clean/SIGKILL restart with4 independently journaled ACKs and17 TCP/process fault tests pass. Retry storm512 requests leaves exactly one committed MESSAGE/outcome pair.",
+        "observed_result": "24 default durable tests (including4 controlled-time tests), server canonical-attribute test,148 workspace tests,31 WAL tests (2 unit/29 storage integration), Q0 TCP smoke, Q1 clean/SIGKILL restart with4 independently journaled ACKs and17 TCP/process fault tests pass. Retry storm512 requests leaves exactly one committed MESSAGE/outcome pair.",
         "window_semantics": "Default86400000ms; configurable and startup/CLI-advertised. Logical monotonic elapsed time, excluding barrier IO/downtime/uncertain intervals; expiration at age>=window; zero legacy timestamps never expire. Recover from unchanged v1 paired-record timestamps. High-water/epoch state never expires; expired old sequences return OutcomeUnavailable (wire OUTCOME_UNKNOWN) and cannot append. Quotas reject before append without unexpired eviction.",
         "limitations": "Loopback static identity, one direct Q1 route; TTL is admission-only and key/priority are ineffective route hints. No wire route-policy discovery: operator advertisement. Retention may conservatively extend after restart/clock uncertainty. Producer cardinality is lifetime-bounded; no watermark reclamation. No physical power-loss certification.",
         "next_unblocked": [
@@ -545,13 +545,40 @@
       "depends_on": [
         "B-02"
       ],
-      "status": "TODO",
+      "status": "IN_PROGRESS",
       "architecture": "06",
       "proof": "Replay/crash/reset with no old-incarnation continuity",
       "paths": [
-        "crates/durable/"
+        "crates/durable/",
+        "crates/server/",
+        "scripts/q1_smoke.py",
+        "scripts/test_q1_faults.py"
       ],
-      "evidence": null
+      "evidence": {
+        "commit": "6d0e32f",
+        "verification": "PASS: complete bounded actor-level committed replay and fail-closed lost-history startup. NOT COMPLETE: TCP/SDK standalone replay cannot use the frozen group-oriented wire without real leases or a standalone batch/end contract.",
+        "test_command": [
+          "cargo fmt --all -- --check",
+          "CARGO_HOME=/tmp/rovqet-cargo cargo check --workspace --locked --offline",
+          "CARGO_HOME=/tmp/rovqet-cargo cargo test -p rovqet-wal --locked --offline",
+          "CARGO_HOME=/tmp/rovqet-cargo cargo test -p rovqet-durable --locked --offline",
+          "CARGO_HOME=/tmp/rovqet-cargo cargo test --workspace --locked --offline",
+          "CARGO_HOME=/tmp/rovqet-cargo cargo test -p rovqet-durable --features fault-injection --locked --offline",
+          "CARGO_HOME=/tmp/rovqet-cargo cargo build -p rovqet-server -p rovqet-sdk --examples --bins --locked --offline",
+          "python3 scripts/check_docs.py",
+          "python3 scripts/q0_smoke.py",
+          "python3 scripts/q1_smoke.py --check-hooks-disabled",
+          "CARGO_HOME=/tmp/rovqet-cargo cargo build -p rovqet-server --features fault-injection --locked --offline",
+          "python3 scripts/test_q1_faults.py",
+          "git diff --check"
+        ],
+        "observed_result": "159 workspace tests,31 WAL tests,34 default durable tests,36 fault-enabled durable tests, Q0 TCP smoke, Q1 clean/SIGKILL restart with4 independently journaled ACKs and19 TCP/process fault tests pass. Actor replay verifies journaled offset/payload after SIGKILL;11 new replay tests cover cross-segment stable sparse offsets, only MESSAGE results, exact bytes/count, empty/end, invalid ranges/incarnation/partition/limits, committed MESSAGE/outcome corruption, uncommitted incomplete tail, lost storage, explicit fresh disposable incarnation, async/concurrent publish, waiting/cancellation/shutdown and response quotas. Unsynced append barrier proves no early replay.",
+        "replay_semantics": "MESSAGE offsets0,2,4,...; odd internal outcome offsets unavailable; next includes incarnation. Hard1024 messages/4MiB response charge/30s wait. Empty at committed end is explicit and may wait without blocking publish. Bound retained batch memory plus decoding scratch; first oversized message is ResponseTooSmall. Corruption returns no partial result and poisons actor. No retention deletion or reset API.",
+        "incarnation_semantics": "open_existing and default TCP startup require an existing manifest; complete loss/empty replacement fails without creating files. Explicit --q1-initialize-new-log true only accepts empty new storage and requires a fresh caller-allocated incarnation; global incarnation uniqueness belongs to configuration authority. Existing storage is never reset. Ordinary restart retains sparse offsets/incarnation.",
+        "integration_dependency": "Frozen major-1 FETCH requires group_id; durable MESSAGE requires group_id/generation/lease_id; no standalone batch/end response exists. TCP explicitly rejects group FETCH/ACK/NACK/lease operations with UNSUPPORTED_CAPABILITY. No placeholder leases or SDK replay API. Implement a narrow standalone request/result/end registry contract, authorization and size-limited TCP/SDK integration before marking B-04 DONE.",
+        "limitations": "Actor API trusts its caller for authorization. No wire/SDK replay, consumer ACK/cursor, retention deletion, Q2 or physical power-loss certification. Wait bounds actor pending time; blocking filesystem IO has no hard cancellation/latency guarantee. Incarnation allocation remains external configuration authority.",
+        "next_unblocked": "B-04 standalone read-only wire contract correction and TCP/SDK integration; B-05 implementation remains blocked until B-04 is DONE."
+      }
     },
     {
       "id": "B-05",
