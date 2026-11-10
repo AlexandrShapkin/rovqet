@@ -8,13 +8,17 @@ Q1 publication returns \`COMMITTED_LOCAL\` only after the current owner has pers
 
 Owned by one Q1 partition actor: \`PartitionRef, durable_class=Q1, ownership_epoch, log_incarnation, next_offset, last_committed_offset, WAL handle, retention boundary, producer_dedup, group_cursors\`. Mutable access is serialized by the actor. Data records are immutable after commit. Multiple Q1 partitions may share a WAL writer but must retain independent logical offsets, retention and ACL.
 
-## Reference on-disk format v1
+## Frozen B-01 on-disk format v1
 
 ~~~text
 directory: data/q1/<tenant>/<topic>/<partition>/<incarnation>/
-MANIFEST: magic, format_version, cluster_id, node_id, partition_ref,
-          durable_class=Q1, log_incarnation, segment_list, recovery_watermark,
-          manifest_generation, checksum
+MANIFEST:
+  magic "RQWM" | major:u16=1 | minor:u16=0 |
+  cluster_id:u64 | node_id:u64 | tenant_id:u64 | topic_id:u64 |
+  partition_id:u32 | durable_class:u8=1 | incarnation:u128 |
+  generation:u64 | committed_record_count:u64 | segment_count:u32 |
+  segment[segment_count]: {id:u64, committed_len:u64, record_count:u64,
+                           last_offset:u64, sealed:u8} | manifest_crc32c:u32
 segment-N.wal header:
   magic "RQWL" | major:u16 | minor:u16 | segment_id:u64 |
   partition_or_shard_id:u64 | incarnation:u128 | created_at:u64 | header_crc32c
@@ -28,9 +32,11 @@ segment footer (sealed):
   last_complete_offset:u64 | record_count:u64 | segment_crc32c
 ~~~
 
-This is an MVP **reference** physical layout; actual \`producer\` identity also contains the authenticated principal/partition scope in an associated metadata record. Record kinds: MESSAGE, PRODUCER_OUTCOME, CONSUMER_ACK, TERMINAL_DISPOSITION, CURSOR_CHECKPOINT, TOMBSTONE. Keep fields named and versioned; never cast structs directly to disk. Prefer checksum over all record fields including length/version and a separate manifest generation.
+All fixed-width integers use big endian. Header size is 52 bytes; record length includes its own four bytes and trailing CRC (88 bytes plus payload); footer size is 20 bytes. Record version is 1, flags are zero, and kind codes are MESSAGE=1, PRODUCER_OUTCOME=2, CONSUMER_ACK=3, TERMINAL_DISPOSITION=4, CURSOR_CHECKPOINT=5, TOMBSTONE=6. Empty segments use `u64::MAX` as last offset. Published segment IDs start at zero and increase by one, with no reuse of committed inventory. Segment identity is scoped by partition and log incarnation. `created_at` is zero in v1 and is not used for correctness. The record CRC covers every preceding record byte including length; header and manifest CRCs cover their complete preceding bytes. The footer CRC covers the complete segment header/records plus its last-offset/count fields. Unsupported versions fail closed; no automatic cross-version migration is provided.
 
-WAL format is frozen before M2 recovery tests. Metadata and dedup must be in a recoverable ordering relation to log records. A \`manifest.tmp→fsync→atomic rename→directory fsync\` publication pattern is required where the filesystem contract supports it. Preallocate segments only if benchmarks show value; preallocation is not a durability barrier.
+This is the frozen MVP physical layout; actual \`producer\` identity also contains the authenticated principal/partition scope in an associated metadata record. Record kinds: MESSAGE, PRODUCER_OUTCOME, CONSUMER_ACK, TERMINAL_DISPOSITION, CURSOR_CHECKPOINT, TOMBSTONE. Keep fields named and versioned; never cast structs directly to disk. Prefer checksum over all record fields including length/version and a separate manifest generation.
+
+The manifest inventory lengths and record count establish the exact recoverable boundary; uncommitted tails are excluded even when their checksums validate. The manifest generation starts at one and increases on each successful barrier. The decoder caps manifest bytes at 16 MiB and validates all counts/lengths before allocating or scanning. Each typed record has a strictly sequential offset beginning at zero. WAL format is frozen by R0-05 before B-01 recovery tests. Metadata and dedup must be in a recoverable ordering relation to log records. A \`manifest.tmp→fsync→atomic rename→directory fsync\` publication pattern is required where the filesystem contract supports it. Preallocate segments only if benchmarks show value; preallocation is not a durability barrier.
 
 ## Append and commit algorithm
 
@@ -72,3 +78,22 @@ Q1 migration: PREPARE/CATCH_UP (copy and verify WAL/snapshot, replay delta) → 
 Inject stop after write, before fsync, during fsync, after fsync before PUB_ACK, during segment rotation, after checkpoint before manifest rename and after rename before directory sync. Assert: no COMMITTED_LOCAL without proven barrier, all acknowledged records recover with intact disk, no duplicate insertion from a same-sequence retry in the dedup window, no cursor skips, no old-incarnation replay after irrecoverable loss.
 
 The **independent oracle** journal lives outside Q1's storage and records received ACKs and original message checksums. WAL metrics: append/sync p50/p99, pending batch bytes, segment count, recovery scan time, dedup count and Q1 pending backlog.
+
+## B-01 storage infrastructure boundary
+
+The concrete `rovqet-wal::Wal` API is frozen in [02](02-module-contracts.md). B-01 owns storage, not publication authorization or the Q1 actor. Each WAL directory contains one configured Q1 partition and incarnation. The caller supplies a preexisting directory, ensures its creation is durable in its parent, and guarantees a single exclusive owner; this crate does not supply multiprocess file locking. Cluster, node, tenant, topic, partition and incarnation are checked on open; no automatic incarnation reset, retention or Q1/Q2 conversion is supported. Authenticated principal scope and the saved producer result belong in a typed `PRODUCER_OUTCOME` payload supplied by the later actor; fixed producer ID fields alone are not a dedup key.
+
+The durability states are distinct:
+
+| State | Evidence | Readable as committed? |
+|---|---|---|
+| queued | bounded in-memory ownership | no |
+| written | complete append returned from filesystem write | no |
+| synchronized | segment barriers plus manifest publication and directory barrier succeeded | yes, through the returned boundary |
+| recovered | reopening validated persisted identity, inventory and checksummed committed records | yes, through the recovered boundary |
+
+A batch can include a message and its associated typed metadata. Each typed record has a sequential WAL offset; a producer-outcome payload binds its original message offset. The durable boundary records a physical complete-record boundary as well as logical position; a checksum-valid tail alone does not establish commitment. An unsynchronized message or producer outcome must never become broker success simply because scanning finds its bytes. B-02 returns the message reference only after its associated outcome is included in the same successful barrier.
+
+The writer serializes append, rotation and barriers. A barrier synchronizes all segments needed by its record prefix, writes the next manifest generation to a temporary file, synchronizes that file, atomically renames it to `MANIFEST`, then synchronizes the WAL directory. Rename alone is insufficient. A synchronization or publication failure poisons the writer: no successful durable result follows until recovery. Such failure can leave a newer manifest visible, so a caller must treat the outcome as unknown rather than definite rollback. Cancellation removes only still-pending memory work; issued writes remain uncertain until an explicit successful barrier or reopening resolves them.
+
+Recovery trusts only a valid published manifest, validates its exact committed inventory, and fails on missing/corrupt committed data. An interrupted temporary manifest never replaces the authority of a valid published generation. Only bytes and unreferenced files beyond the last proven committed boundary may be discarded. Storage tests simulate process termination, short/torn writes and injected I/O failures in temporary directories. They do not demonstrate physical power-loss durability. Deployment requires a local filesystem supporting the documented file synchronization, same-directory atomic replacement and directory synchronization semantics; unsupported operations return errors. Hardware/controller flush honesty and power-cut validation remain separate qualification work.

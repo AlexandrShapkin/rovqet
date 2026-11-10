@@ -20,9 +20,9 @@
 
 **R0-03 — Baseline runner** (depends R0-02). Supply reproducible NATS Core Q0 and JetStream reliable reference configs, scripts to bring up isolated baseline and run equal-rate workload; record versions/semantics and raw results. No invented baseline measurements. Proof: one successful repeatable baseline smoke with committed fixtures, or explicit NOT_RUN if unavailable.
 
-**R0-04 — Transport and storage spikes** (depends R0-01). Implement tiny isolated TCP-vs-QUIC framing prototype and Q1 WAL fsync benchmark only if needed to choose interfaces; record RAM/CPU/fsync/p99 and limited decision. Default TCP and segment WAL if evidence inconclusive. Proof: artifact with exact commands/seeds; don't write a major research report.
+**R0-04 — Transport and storage spikes** (depends R0-01). Use the existing Tokio/TCP and segmented WAL reference defaults unless a concrete defect requires a bounded spike. A documented reference-default rationale is sufficient; do not build QUIC solely for a checkbox. If a filesystem experiment is needed, record exact commands, bounded workload and observed sync/rotation behavior without an extended performance study. Proof: executable evidence or explicit default rationale in architecture chapter 15.
 
-**R0-05 — Reference decision freeze** (depends R0-03,R0-04). Freeze provisional wire registry, basic session and StorageEngine API, exact MVP profile and OpenRaft integration assumption. Proof: architecture updated with decision and a runnable codec fixture plan; no approval ceremony.
+**R0-05 — Reference decision freeze** (depends R0-03,R0-04). Freeze the existing major-1 wire registry, basic session and concrete local WAL API, exact MVP profile and OpenRaft integration assumption. Proof: architecture updated with decision and a runnable codec fixture plan; no approval ceremony.
 
 ## A — Single-node Q0 and Rust SDK
 

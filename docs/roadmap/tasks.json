@@ -159,7 +159,7 @@
       "depends_on": [
         "R0-01"
       ],
-      "status": "TODO",
+      "status": "IN_PROGRESS",
       "architecture": "15",
       "proof": "Runnable A/B with measured CPU/RAM/fsync or explicit default rationale",
       "paths": [
@@ -175,7 +175,7 @@
         "R0-03",
         "R0-04"
       ],
-      "status": "TODO",
+      "status": "IN_PROGRESS",
       "architecture": "04",
       "proof": "Central wire draft and storage interface documented with fixtures",
       "paths": [
@@ -353,9 +353,9 @@
       "phase": "B",
       "depends_on": [
         "A-01",
-        "R0-01"
+        "R0-05"
       ],
-      "status": "TODO",
+      "status": "IN_PROGRESS",
       "architecture": "06",
       "proof": "Torn tail, checksum, rotate, fsync tests pass",
       "paths": [

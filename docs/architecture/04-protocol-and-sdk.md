@@ -1,6 +1,6 @@
 # 04 — Wire protocol and Rust SDK implementation contract
 
-The normative specification defines a versioned binary envelope and explicit error registry (§5). The [reference binary registry](protocol-registry.md) fixes field IDs, frame IDs, error IDs and wire types for implementation; verify/freeze golden vectors by M1. This chapter fixes **reference MVP encodings** to prevent per-component re-design. Freeze exact numeric IDs and golden vectors at the M1 boundary; until then the registry below is a design decision, not yet an implemented standard.
+The normative specification defines a versioned binary envelope and explicit error registry (§5). The [reference binary registry](protocol-registry.md) and `crates/protocol/src/registry.rs` freeze wire-major-1 frame IDs 1–22, error IDs 1–27 and field IDs 1–48. R0-05 preserves the A-01 implemented encoding and golden vectors; storage implementation does not allocate or renumber wire IDs. Reserved durable frames describe compatibility, not an implemented Q1/Q2 server capability.
 
 ## Frame layout and parser
 
@@ -16,7 +16,7 @@ payload: exactly payload_len bytes | optional checksum: CRC32C u32 BE
 
 TLV \`tag = (field_number << 1) | critical_bit\`; unknown critical tags fail UNSUPPORTED_CAPABILITY, unknown optional tags are skipped after bounds check. Duplicate singular fields and invalid UTF-8 names are rejected. A protocol registry assigns numeric field IDs before M1; do not silently invent incompatible IDs inside separate crates. For prototype, checksum absent by default over TLS/TCP; WAL always has its own checksums.
 
-## Provisional frame registry
+## Frozen major-1 frame registry
 
 | ID | Frame | Request/response |
 |---:|---|---|
@@ -43,7 +43,7 @@ TLV \`tag = (field_number << 1) | critical_bit\`; unknown critical tags fail UNS
 | 21 | DRAIN | server shuts down or moves owner |
 | 22 | CLOSE | final session close |
 
-Reserve 0 as invalid. Numbers become immutable only when golden vectors are generated. Use stable named symbolic error codes from requirements; assign their IDs centrally by M1, not per component.
+Reserve 0 as invalid. Existing numeric assignments are immutable within wire major 1. Additions require a central registry entry and compatible codec fixtures; never assign conflicting IDs per component.
 
 ## Session sequence
 
@@ -81,7 +81,7 @@ A \`Delivery\` contains stable offset/incarnation, delivery ID, group generation
 
 ## Contract vectors
 
-Before M1: create \`protocol/registry.yaml\` and committed hex/golden fixtures for every frame, malformed length and version cases, stale incarnation and unknown critical/optional tags. The parser must run with a fixed 1 MiB max frame and explicit test lower limits. Preserve a structured schema-to-wire table; tests perform encode→decode and compare expected binary exactly, not merely round-trip an internally wrong codec.
+The central schema-to-wire table is [protocol-registry.md](protocol-registry.md); the executable registry is `crates/protocol/src/registry.rs`. Existing independent `crates/protocol/tests/fixtures/golden-v1.txt` vectors fix Q1/Q2 PUB_ACK and NO_QUORUM bytes, and codec tests fix HELLO and reject malformed lengths, versions, missing durable incarnation and unknown critical fields. `cargo test -p rovqet-protocol --locked` validates them. Add byte-exact fixtures when a reserved durable operation becomes executable; a Q1 PUB_ACK codec fixture does not authorize the current Q0 server to send durable success. Keep the 1 MiB parser limit and explicit smaller test limits.
 
 ## Future transport
 

@@ -15,7 +15,7 @@ This register is a **technical choice table**, not an approval or change-control
 | DEC-09 | Metadata topology | 3 static seed voters in MVP | join/rebalance experiments | epoch/fence and CP outage contract |
 | DEC-10 | Metrics | structured log, bounded counters, raw benchmark histograms | profiling overhead and product need | no exporter hot-path block |
 | DEC-11 | Secondary SDK | Rust first, Go or Python after MVP | use-case demand after proof | exact protocol semantics |
-| DEC-12 | Protocol numbers | provisional central registry from 04, frozen at M1 | golden-vector compatibility | no conflicting independent IDs |
+| DEC-12 | Protocol numbers | major-1 central registry from 04 and existing A-01 golden vectors, frozen by R0-05 | golden-vector compatibility | no conflicting independent IDs |
 | DEC-13 | Q1 lost-history | new unique log incarnation + explicit SDK reset | none without changing documented failure class | no silent replay continuity |
 | DEC-14 | Q1/Q2 per partition | immutable durable_class | none in v1 | no mixed committed prefix |
 | DEC-15 | DLQ inter-shard | idempotent durable two-step disposition | crash tests may require refinement | no source cursor skip |
@@ -42,3 +42,15 @@ As checked from docs.rs, OpenRaft pre-1.0 API evolves; pin the exact crate versi
 - M5: experimentally selected scheduler, transport default and grouping thresholds.
 
 These are bounded **interface freezes**, not whole-system architecture discovery; roadmap work packages supply defaults and acceptance tests.
+
+## R0-04 bounded reference decisions (2026-11-10)
+
+Retain Tokio and the existing framed TCP transport. The operational Q0 implementation already supplies the runtime/session seam, bounded codec and real-socket tests. No concrete transport defect requires QUIC; QUIC remains deferred by the MVP profile. This is the explicitly permitted reference-default rationale, not a TCP-versus-QUIC performance finding. No historical broker benchmark data is collected or reinterpreted for this decision.
+
+For B-01 retain append-only segmented files, explicit file synchronization, atomic manifest replacement followed by directory synchronization, and indexes reconstructed from the committed WAL. No separate KV engine is needed to establish this ordering; a KV candidate would introduce another durable publication boundary without a demonstrated requirement. Use a single exclusive writer per WAL with bounded submissions and batches. Storage calls run outside the Tokio executor's asynchronous worker threads when integrated by B-02. Q0 has no storage dependency.
+
+OpenRaft remains the external library assumption for Q2, isolated in the future consensus adapter. Pin its exact version when C-03 implements that adapter; B-01 introduces neither Raft dependencies nor simulated quorum success. Q1 and Q2 must have distinct histories.
+
+Evidence commands: `CARGO_HOME=/tmp/rovqet-cargo cargo test -p rovqet-protocol --locked --offline` passed 13 unit and 3 golden-vector tests on 2026-11-10. The B-01 filesystem/fault tests validate the selected storage seam; no extended performance study or power-loss claim is part of R0-04. The existing reference defaults are selected on implementation fit and correctness, without a claimed fsync latency distribution.
+
+R0-05 fixes the existing major-1 protocol registry and the B-01 concrete storage contract in [06](06-q1-storage.md). Future producer dedup retention and consumer ACK checkpoint policy remain B-03/B-05 actor concerns; the typed WAL records preserve their recoverable ordering seam.

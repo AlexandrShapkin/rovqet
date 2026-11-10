@@ -116,3 +116,13 @@ No two tasks may mutate a partition's offset allocator or cursor directly. A con
 ## Compatibility
 
 Rust internal structs may evolve without wire changes. Wire registry identifiers freeze by M1. WAL versions freeze for Q1 at M2 and Q2 at M4; migrations must declare a method. Changes to identifier scope, Q1/Q2 partition class, ACK meaning or cursor closure require a new explicit architecture+fixture revision.
+
+## R0-05 / B-01 concrete local storage seam
+
+`rovqet-wal::Wal` is a concrete synchronous, exclusive owner of one Q1 partition/incarnation directory. It is not a generic storage-engine framework. `Config` fixes cluster/node identity, `PartitionRef`, incarnation, segment/record byte limits, pending record/byte limits, and segment/index-entry limits. B-02 must place this blocking owner on a dedicated worker or equivalent blocking execution context and preserve bounded admission. The Q0 crate does not depend on it.
+
+The stable operations are `open(path, config)`, `enqueue(record)`, `cancel_pending()`, `flush()`, `append(record)`, `sync()`, `committed_position()`, `read(from, max_records, max_bytes)`, `pending_bytes()` and `generation()`. `Record` carries a typed kind, logical offset, owner epoch, producer ID/epoch/sequence, message ID, server timestamp and opaque payload. `sync()` returns the established optional `DurableOffset`; `read` accepts an incarnation-bearing offset and exposes only the committed prefix. See [06](06-q1-storage.md) for physical encoding and failure ordering.
+
+`enqueue` establishes bounded in-memory ownership; `cancel_pending` removes only that memory queue. `append` and `flush` write into the operating-system page cache and never imply durable commitment. `sync` establishes a durable boundary only after segment and manifest publication barriers succeed. A failed write/sync makes the writer unavailable until recovery; caller cancellation cannot roll back already issued writes or prove noncommitment. Successful reopening validates the persisted boundary and reconstructs the committed index; it supplies restart evidence distinct from a write or sync result. Storage does not emit `COMMITTED_LOCAL`: the Q1 actor must include both message and recoverable scoped producer outcome in the successful barrier before issuing that broker result.
+
+Typed errors distinguish write, synchronization/publication uncertainty, capacity/queue exhaustion, incompatible version/identity/incarnation, invalid or missing offset and committed corruption. `Error::Io` preserves `IoFailureKind::{Read, Write, Sync}`, the operation name and underlying I/O source. Unsupported versions and identity mismatches fail closed. Retention, consumer state policy and dedup interpretation remain outside this crate.
