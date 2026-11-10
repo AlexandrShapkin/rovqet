@@ -845,13 +845,19 @@ pub async fn serve(
     let slots = Arc::new(Semaphore::new(config.max_connections));
     let (stop, _) = tokio::sync::watch::channel(false);
     let mut sessions = JoinSet::new();
+    let mut accept_error = None;
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
             _ = &mut shutdown => break,
             done = sessions.join_next(), if !sessions.is_empty() => { let _ = done; },
             accepted = listener.accept() => {
-                let (mut stream, _) = accepted?;
+                // Drain session owners even when the listener fails. The composition
+                // root must regain exclusive storage ownership before joining its worker.
+                let (mut stream, _) = match accepted {
+                    Ok(connection) => connection,
+                    Err(error) => { accept_error = Some(error); break; },
+                };
                 let Ok(slot) = slots.clone().try_acquire_owned() else {
                     let f = error_frame(0, ErrorCode::ResourceExhausted);
                     let _ = timeout(config.write_timeout, write_frame(&mut stream, &f, config.limits)).await; continue;
@@ -871,7 +877,10 @@ pub async fn serve(
         sessions.abort_all();
         while sessions.join_next().await.is_some() {}
     }
-    Ok(())
+    match accept_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SessionState {
@@ -1138,6 +1147,83 @@ mod tests {
             .await
             .unwrap()
             .unwrap()
+    }
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn listener_failure_drains_deferred_sessions_before_returning() {
+        struct Deferred {
+            started: Notify,
+            disconnected: std::sync::atomic::AtomicBool,
+        }
+        impl SessionHandler for Deferred {
+            fn handle(&self, _: u128, _: Frame, _: Outbound) -> Result<Option<Frame>, ErrorCode> {
+                unreachable!("this handler defers active requests")
+            }
+            fn request(&self, _: u128, principal: u128, _: Frame, _: Outbound) -> SessionReply {
+                assert_eq!(principal, 1);
+                self.started.notify_one();
+                SessionReply::Deferred(Box::pin(std::future::pending()))
+            }
+            fn disconnected(&self, _: u128) {
+                self.disconnected.store(true, Ordering::Release);
+            }
+        }
+        let standard = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        standard.set_nonblocking(true).unwrap();
+        let control = standard.try_clone().unwrap();
+        let address = standard.local_addr().unwrap();
+        let listener = TcpListener::from_std(standard).unwrap();
+        let handler = Arc::new(Deferred {
+            started: Notify::new(),
+            disconnected: std::sync::atomic::AtomicBool::new(false),
+        });
+        let task = tokio::spawn(serve(
+            listener,
+            Config::default(),
+            handler.clone(),
+            std::future::pending(),
+        ));
+        let mut client = TcpStream::connect(address).await.unwrap();
+        assert_eq!(
+            exchange(&mut client, hello()).await.frame_type,
+            FrameType::Welcome
+        );
+        let mut auth = Frame::new(FrameType::Auth, 2);
+        auth.fields = vec![
+            Field::required(field::AUTH_METHOD, [0]),
+            Field::required(field::AUTH_DATA, b"dev".to_vec()),
+        ];
+        assert_eq!(
+            exchange(&mut client, auth).await.frame_type,
+            FrameType::AuthOk
+        );
+        write_frame(
+            &mut client,
+            &Frame::new(FrameType::Drain, 3),
+            Limits::default(),
+        )
+        .await
+        .unwrap();
+        timeout(Duration::from_secs(5), handler.started.notified())
+            .await
+            .unwrap();
+        // Linux shutdown of the listening socket deterministically makes accept fail.
+        socket2::SockRef::from(&control)
+            .shutdown(std::net::Shutdown::Both)
+            .unwrap();
+        assert!(
+            timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        assert!(handler.disconnected.load(Ordering::Acquire));
+        assert_eq!(
+            Arc::strong_count(&handler),
+            1,
+            "no session may retain the storage owner"
+        );
     }
     #[tokio::test]
     async fn lifecycle_and_unsupported_operation() {

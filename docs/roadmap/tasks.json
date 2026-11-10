@@ -481,7 +481,24 @@
           "B-04"
         ],
         "ci_run": "https://github.com/AlexandrShapkin/rovqet/actions/runs/42767650646",
-        "ci_result": "PASS: docs and rust jobs on pushed acceptance commit04543485b76e279f1bebca22db01a69f071e14fd, including Q1 restart smoke, feature actor faults and17 TCP/process faults."
+        "ci_result": "PASS: docs and rust jobs on pushed acceptance commit04543485b76e279f1bebca22db01a69f071e14fd, including Q1 restart smoke, feature actor faults and17 TCP/process faults.",
+        "shutdown_followup": {
+          "verification": "PASS: deterministic Linux listener shutdown forces accept error while an authenticated session awaits a deferred reply. Serve drains/joins all sessions and returns the original accept error only after disconnected cleanup releases storage-owner references.",
+          "test_command": [
+            "CARGO_HOME=/tmp/rovqet-cargo cargo test -p rovqet-transport --offline listener_failure_drains_deferred_sessions_before_returning",
+            "cargo fmt --all -- --check",
+            "CARGO_HOME=/tmp/rovqet-cargo cargo check --workspace --locked",
+            "CARGO_HOME=/tmp/rovqet-cargo cargo test --workspace --locked",
+            "CARGO_HOME=/tmp/rovqet-cargo cargo build -p rovqet-server -p rovqet-sdk --examples --bins --locked",
+            "python3 scripts/q0_smoke.py",
+            "python3 scripts/q1_smoke.py --check-hooks-disabled",
+            "CARGO_HOME=/tmp/rovqet-cargo cargo build -p rovqet-server --features fault-injection --locked",
+            "python3 scripts/test_q1_faults.py",
+            "python3 scripts/check_docs.py",
+            "git diff --check"
+          ],
+          "observed_result": "143 workspace tests pass (12 transport including accept-failure regression); Q0 smoke, Q1 clean-restart/journaled SIGKILL smoke and17 process fault tests pass again. socket2 already in lockfile is a transport dev-only dependency for safe socket shutdown in this Linux regression; no new runtime dependency."
+        }
       }
     },
     {

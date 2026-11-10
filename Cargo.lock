@@ -839,6 +839,7 @@ version = "0.1.0"
 dependencies = [
  "rovqet-protocol",
  "rovqet-scheduler",
+ "socket2",
  "tokio",
 ]
 

@@ -9,3 +9,6 @@ publish = false
 rovqet-scheduler = { path = "../scheduler" }
 rovqet-protocol = { path = "../protocol" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
+
+[dev-dependencies]
+socket2 = "0.6"
