@@ -25,6 +25,9 @@ pub enum FrameType {
     Error = 20,
     Drain = 21,
     Close = 22,
+    ReadFetch = 23,
+    ReadRecord = 24,
+    ReadEnd = 25,
 }
 
 impl TryFrom<u64> for FrameType {
@@ -55,6 +58,9 @@ impl TryFrom<u64> for FrameType {
             20 => Error,
             21 => Drain,
             22 => Close,
+            23 => ReadFetch,
+            24 => ReadRecord,
+            25 => ReadEnd,
             _ => return Err(()),
         })
     }
@@ -179,5 +185,7 @@ pub mod field {
     pub const NONCE: u64 = 46;
     pub const SOURCE_LOG_INCAR: u64 = 47;
     pub const MAX_INFLIGHT: u64 = 48;
-    pub const LAST_KNOWN: u64 = 48;
+    pub const READ_STATUS: u64 = 49;
+    pub const HAS_MORE: u64 = 50;
+    pub const LAST_KNOWN: u64 = 50;
 }

@@ -48,6 +48,9 @@ Decoder order: confirm magic/version → parse bounded varint lengths without al
 | 20 | ERROR | UTF-8 diagnostics MAY be TLV, not raw payload |
 | 21 | DRAIN | none |
 | 22 | CLOSE | none |
+| 23 | READ_FETCH | none; standalone Q1 inspection |
+| 24 | READ_RECORD | committed application bytes; no lease |
+| 25 | READ_END | none; terminal continuation/status |
 
 ## Field IDs, encoding and scope
 
@@ -103,8 +106,10 @@ All TLVs use \`(field_id << 1) | critical\` as encoded tag, **not** the field nu
 | 46 | nonce | u64 BE | PING/PONG correlation |
 | 47 | source_log_incarnation | u128 BE | optional DLQ internal record |
 | 48 | max_inflight | u32 BE | SUBSCRIBE/group configuration |
+| 49 | read_status | u8:1 EMPTY,2 END,3 COUNT_LIMIT,4 BYTE_LIMIT,5 WAIT_EXPIRED | READ_END |
+| 50 | has_more | u8:0/1 | READ_END |
 
-Field IDs 49–127 reserved for compatible additions; every new field must be registered centrally. Keep name-based topic resolution for MVP until topic IDs are negotiated. Q0 PUBLISH does not need producer fields. Q1/Q2 requires producer_id/epoch/sequence and immutable class from policy. Public reference to an offset always includes incarnation; do not send offset alone as a durable cursor token.
+Field IDs 51–127 reserved for compatible additions; every new field must be registered centrally. Keep name-based topic resolution for MVP until topic IDs are negotiated. Q0 PUBLISH does not need producer fields. Q1/Q2 requires producer_id/epoch/sequence and immutable class from policy. Public reference to an offset always includes incarnation; do not send offset alone as a durable cursor token.
 
 ## Required fields and message validation
 
@@ -122,6 +127,9 @@ Field IDs 49–127 reserved for compatible additions; every new field must be re
 | CONSUMER_ACK, CONSUMER_NACK, EXTEND_LEASE | topic_name or topic_id, partition_id, group_id, generation, lease_id, ownership_epoch, incarnation, offset | full partition scope and previously delivered committed record |
 | CONSUMER_ACK_RESULT | ack_outcome | correlation by identical request_id |
 | FETCH | topic_name or topic_id, partition_id, group_id, incarnation, offset, max_bytes, max_messages | no unbounded or ambiguous group fetch |
+| READ_FETCH | topic_name or topic_id, qos=1, partition_id, incarnation, offset, max_bytes, max_messages | optional wait_ms; no group/lease fields |
+| READ_RECORD | tenant_id, topic_id, qos=1, partition_id, incarnation, offset, message_id | original committed payload; request correlation |
+| READ_END | tenant_id, topic_id, qos=1, partition_id, incarnation, offset, read_status, has_more | mandatory terminal response; offset is continuation |
 | FLOW_CREDIT | subscription_id or group_id, flow_credit_messages/bytes | cannot exceed negotiated credit |
 | REDIRECT | owner_node_id, ownership_epoch, metadata_revision | bounded hop/retry |
 | ERROR | error_code, error_retryable | diagnostic fields optional; never success |
@@ -168,8 +176,57 @@ OUTCOME_UNKNOWN (13), never an invented success or a fresh insertion. The config
 24-hour-default window and independent producer/outcome quotas are advertised by the
 operator-facing startup diagnostic and CLI; major 1 has no route-policy discovery field.
 
-B-04 actor replay does not alter this registry. Major-1 FETCH's required group and durable
-MESSAGE's generation/lease cannot represent a standalone read-only batch or its terminal
-end result. Until a compatible standalone contract is approved, the TCP server rejects
-FETCH and group ACK/NACK/lease operations with UNSUPPORTED_CAPABILITY. No placeholder lease,
-synthetic consumer ACK, unregistered frame or SDK replay success is emitted.
+B-04 standalone READ_FETCH/READ_RECORD/READ_END is additive. Existing group FETCH and
+group ACK/NACK/lease operations remain unsupported by the prototype. No placeholder leases
+or consumer ACKs are produced. The exact standalone contract follows.
+
+## B-04 standalone inspection extension (major 1, additive)
+
+New frames **23 READ_FETCH**, **24 READ_RECORD**, **25 READ_END** use the existing
+major-1 envelope, canonical varints and BE TLVs, flags zero (no optional CRC in this
+profile). IDs 1–22 and fields 1–48, including FETCH/MESSAGE group requirements, stay
+unchanged. New singular fields: **49 read_status:u8**, **50 has_more:u8 (0/1)**.
+Older peers reject unknown frames/critical fields; new peers map unknown frame types to
+UNSUPPORTED_CAPABILITY. This opt-in exchange never substitutes for group delivery.
+
+READ_FETCH has no payload. Required: topic_name or topic_id, qos=1, partition_id,
+log_incarnation, offset, max_messages:u32 (1–1024), max_bytes:u32 (78–4194304).
+Optional wait_ms:u32 (0–30000, default zero); principal_id/tenant_id are assertions
+checked against authenticated context, never authorization sources. Both topic forms
+must match the configured route when supplied together. No group/lease/ACK fields
+are legal. An odd/out-of-range offset or obsolete incarnation is REPLAY_NOT_AVAILABLE.
+
+Each READ_RECORD echoes request_id and requires tenant_id, topic_id, partition_id,
+log_incarnation, original offset, qos=1, message_id; payload is the original committed
+application bytes. No producer-outcome metadata records or synthetic leases are sent.
+READ_END echoes request_id and requires the same scope, qos=1, offset (continuation),
+read_status and has_more. It has no payload. Status values are 1 EMPTY (offset zero,
+no history), 2 END (current committed end), 3 COUNT_LIMIT, 4 BYTE_LIMIT, 5 WAIT_EXPIRED
+(no record became available before a requested bounded wait ended). has_more is one
+exactly for statuses 3/4 and zero otherwise. Empty/end without wait completes immediately;
+nonzero wait at current end completes on new commit or expires boundedly. Empty at
+wait expiry has status 5 and continuation zero. End has precedence over count/byte
+limits when the same snapshot is fully exhausted; count takes precedence over byte when
+both limits are reached. A nonempty batch never has status 5.
+
+Offsets remain sparse MESSAGE indexes 0,2,4,...; continuation is the last returned
+MESSAGE offset plus two, or unchanged for an empty batch. Only READ_END makes a batch
+complete. A stream failure, cancellation, ERROR or malformed response before READ_END
+invalidates the entire batch. No consumer cursor or producer state is mutated.
+
+max_bytes counts **all encoded READ_RECORD bytes plus READ_END**, including magic,
+length varints and TLVs. Canonical response fields are ordered tenant, topic, partition,
+incarnation, offset, qos, then message_id for records or status/has_more for end.
+Canonical record header is 84 bytes: total = 89 + varint_size(payload_len) + payload_len.
+Canonical READ_END is exactly 78 bytes. The actor uses this sizing at its existing read
+seam so limits are exact, not estimates based on its memory-charge API. A first record
+that cannot fit, or cannot fit the negotiated per-frame/payload limit, returns
+RESOURCE_EXHAUSTED; no empty success or skipped offset. Extra memory reservations cover
+encoding and retained batches; partition quotas may reject requests below hard ceilings.
+
+The server serializes one batch per session, writes through a one-slot lossless reply
+channel with per-write completion/timeout, and keeps the partition reservation until the
+last retained write is released. Q0 delivery/credit queues and WAL independence remain
+unchanged. Standalone readers must not pipeline requests within a batch; the Rust SDK
+serializes requests and closes a cancelled/partial stream. The network task awaits the
+actor asynchronously; filesystem IO remains on the existing partition owner.

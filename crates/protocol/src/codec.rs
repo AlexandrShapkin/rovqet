@@ -171,7 +171,9 @@ fn validate_fields(frame: &Frame) -> Result<(), CodecError> {
             | f::PRIORITY
             | f::PUB_OUTCOME
             | f::ACK_OUTCOME
-            | f::ERROR_RETRYABLE => Some(1),
+            | f::ERROR_RETRYABLE
+            | f::READ_STATUS
+            | f::HAS_MORE => Some(1),
             f::SESSION_ID
             | f::MESSAGE_ID
             | f::PRODUCER_ID
@@ -210,6 +212,8 @@ fn validate_fields(frame: &Frame) -> Result<(), CodecError> {
             || (item.id == f::PUB_OUTCOME && !(1..=3).contains(&item.value[0]))
             || (item.id == f::ACK_OUTCOME && !(1..=3).contains(&item.value[0]))
             || (item.id == f::ERROR_RETRYABLE && item.value[0] > 1)
+            || (item.id == f::HAS_MORE && item.value[0] > 1)
+            || (item.id == f::READ_STATUS && !(1..=5).contains(&item.value[0]))
         {
             return Err(CodecError::InvalidFieldValue(item.id));
         }
@@ -235,6 +239,12 @@ fn validate_fields(frame: &Frame) -> Result<(), CodecError> {
         require(f::LOG_INCAR)?;
         require(f::OFFSET)
     };
+    if matches!(
+        frame.frame_type,
+        FrameType::ReadFetch | FrameType::ReadRecord | FrameType::ReadEnd
+    ) {
+        crate::replay::validate(frame)?;
+    }
     match frame.frame_type {
         FrameType::Hello => {
             require(f::PROTOCOL_MINOR)?;

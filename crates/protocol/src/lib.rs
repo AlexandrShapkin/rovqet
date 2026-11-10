@@ -9,6 +9,7 @@
 mod codec;
 mod handshake;
 pub mod registry;
+pub mod replay;
 
 pub use codec::{CodecError, Field, Frame, Limits, decode_prefix, encode};
 pub use handshake::{Negotiated, NegotiationError, negotiate_hello};
