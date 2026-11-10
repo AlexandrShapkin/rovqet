@@ -159,13 +159,29 @@
       "depends_on": [
         "R0-01"
       ],
-      "status": "IN_PROGRESS",
+      "status": "DONE",
       "architecture": "15",
       "proof": "Runnable A/B with measured CPU/RAM/fsync or explicit default rationale",
       "paths": [
         "benchmarks/"
       ],
-      "evidence": null
+      "evidence": {
+        "commit": "f45084436a1aebe8b2a8219e8a615bb78ccd74df",
+        "verification": "PASS: cargo fmt --all -- --check; CARGO_HOME=/tmp/rovqet-cargo cargo check --workspace --locked; CARGO_HOME=/tmp/rovqet-cargo cargo test -p rovqet-wal --locked; CARGO_HOME=/tmp/rovqet-cargo cargo test --workspace --locked; python3 scripts/check_docs.py; CARGO_HOME=/tmp/rovqet-cargo cargo build -p rovqet-server -p rovqet-sdk --examples --bins --locked --offline; python3 scripts/q0_smoke.py; git diff --check",
+        "test_command": [
+          "cargo fmt --all -- --check",
+          "CARGO_HOME=/tmp/rovqet-cargo cargo check --workspace --locked",
+          "CARGO_HOME=/tmp/rovqet-cargo cargo test -p rovqet-wal --locked",
+          "CARGO_HOME=/tmp/rovqet-cargo cargo test --workspace --locked",
+          "python3 scripts/check_docs.py",
+          "CARGO_HOME=/tmp/rovqet-cargo cargo build -p rovqet-server -p rovqet-sdk --examples --bins --locked --offline",
+          "python3 scripts/q0_smoke.py",
+          "git diff --check"
+        ],
+        "observed_result": "30 WAL tests (1 CRC unit + 29 integration); 114 workspace tests; format/check/docs pass; independent publisher and two subscribers exchanged Q0 over TCP and shut down cleanly. All executed 2026-11-10 on local ext4 filesystem.",
+        "limitations": "Process-exit and deterministic I/O/torn-write fault tests, not physical power-loss validation. Exclusive caller ownership and preexisting durably created directory required. No Q1 server publication path, producer dedup interpretation, retention or consumer cursors in B-01; B-02 remains TODO.",
+        "decision": "Explicit reference-default rationale in architecture15: retain Tokio/TCP, segmented append-only WAL, explicit file+manifest+directory barriers, rebuilt indexes; no QUIC/KV/Raft implementation or historical benchmark analysis."
+      }
     },
     {
       "id": "R0-05",
@@ -175,13 +191,29 @@
         "R0-03",
         "R0-04"
       ],
-      "status": "IN_PROGRESS",
+      "status": "DONE",
       "architecture": "04",
       "proof": "Central wire draft and storage interface documented with fixtures",
       "paths": [
         "docs/architecture/"
       ],
-      "evidence": null
+      "evidence": {
+        "commit": "f45084436a1aebe8b2a8219e8a615bb78ccd74df",
+        "verification": "PASS: cargo fmt --all -- --check; CARGO_HOME=/tmp/rovqet-cargo cargo check --workspace --locked; CARGO_HOME=/tmp/rovqet-cargo cargo test -p rovqet-wal --locked; CARGO_HOME=/tmp/rovqet-cargo cargo test --workspace --locked; python3 scripts/check_docs.py; CARGO_HOME=/tmp/rovqet-cargo cargo build -p rovqet-server -p rovqet-sdk --examples --bins --locked --offline; python3 scripts/q0_smoke.py; git diff --check",
+        "test_command": [
+          "cargo fmt --all -- --check",
+          "CARGO_HOME=/tmp/rovqet-cargo cargo check --workspace --locked",
+          "CARGO_HOME=/tmp/rovqet-cargo cargo test -p rovqet-wal --locked",
+          "CARGO_HOME=/tmp/rovqet-cargo cargo test --workspace --locked",
+          "python3 scripts/check_docs.py",
+          "CARGO_HOME=/tmp/rovqet-cargo cargo build -p rovqet-server -p rovqet-sdk --examples --bins --locked --offline",
+          "python3 scripts/q0_smoke.py",
+          "git diff --check"
+        ],
+        "observed_result": "30 WAL tests (1 CRC unit + 29 integration); 114 workspace tests; format/check/docs pass; independent publisher and two subscribers exchanged Q0 over TCP and shut down cleanly. All executed 2026-11-10 on local ext4 filesystem.",
+        "limitations": "Process-exit and deterministic I/O/torn-write fault tests, not physical power-loss validation. Exclusive caller ownership and preexisting durably created directory required. No Q1 server publication path, producer dedup interpretation, retention or consumer cursors in B-01; B-02 remains TODO.",
+        "interfaces": "Frozen concrete Wal API, v1 BE record/header/footer and checksummed generation/inventory manifest; existing protocol IDs and golden vectors unchanged. B-01 dependency reconciled with work-packages.md."
+      }
     },
     {
       "id": "A-01",
@@ -355,13 +387,29 @@
         "A-01",
         "R0-05"
       ],
-      "status": "IN_PROGRESS",
+      "status": "DONE",
       "architecture": "06",
       "proof": "Torn tail, checksum, rotate, fsync tests pass",
       "paths": [
         "crates/wal/"
       ],
-      "evidence": null
+      "evidence": {
+        "commit": "f45084436a1aebe8b2a8219e8a615bb78ccd74df",
+        "verification": "PASS: cargo fmt --all -- --check; CARGO_HOME=/tmp/rovqet-cargo cargo check --workspace --locked; CARGO_HOME=/tmp/rovqet-cargo cargo test -p rovqet-wal --locked; CARGO_HOME=/tmp/rovqet-cargo cargo test --workspace --locked; python3 scripts/check_docs.py; CARGO_HOME=/tmp/rovqet-cargo cargo build -p rovqet-server -p rovqet-sdk --examples --bins --locked --offline; python3 scripts/q0_smoke.py; git diff --check",
+        "test_command": [
+          "cargo fmt --all -- --check",
+          "CARGO_HOME=/tmp/rovqet-cargo cargo check --workspace --locked",
+          "CARGO_HOME=/tmp/rovqet-cargo cargo test -p rovqet-wal --locked",
+          "CARGO_HOME=/tmp/rovqet-cargo cargo test --workspace --locked",
+          "python3 scripts/check_docs.py",
+          "CARGO_HOME=/tmp/rovqet-cargo cargo build -p rovqet-server -p rovqet-sdk --examples --bins --locked --offline",
+          "python3 scripts/q0_smoke.py",
+          "git diff --check"
+        ],
+        "observed_result": "30 WAL tests (1 CRC unit + 29 integration); 114 workspace tests; format/check/docs pass; independent publisher and two subscribers exchanged Q0 over TCP and shut down cleanly. All executed 2026-11-10 on local ext4 filesystem.",
+        "limitations": "Process-exit and deterministic I/O/torn-write fault tests, not physical power-loss validation. Exclusive caller ownership and preexisting durably created directory required. No Q1 server publication path, producer dedup interpretation, retention or consumer cursors in B-01; B-02 remains TODO.",
+        "failure_findings": "Committed checksum/header/footer corruption, missing history, invalid manifest and incompatible incarnation fail closed. Uncommitted partial headers/payloads/checksum corruption truncate only beyond manifest boundary. Interrupted rotation removes unpublished orphans. Append/partial-write and all publication failures poison writer; post-rename unknown outcome may recover a newer prefix without returning false success. Count/byte/index/segment limits and cancellation/descriptor cleanup verified. Literal record/header/manifest vectors pass."
+      }
     },
     {
       "id": "B-02",
