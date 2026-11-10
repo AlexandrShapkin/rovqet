@@ -2,7 +2,7 @@
 
 Rovqet is an experimental, Rust/Tokio message broker focused on dense client connectivity, predictable tail latency, priority isolation and selective durability.
 
-**Status: operational development-only Q0 TCP pub/sub and Rust SDK; durability and quantitative validation remain unfinished.** The repository is initialized with the normative v1.1.1 requirements, a deliberately reduced research-MVP delivery profile, detailed component contracts, implementation roadmap and instructions for autonomous AI coding agents. Do not interpret architectural designs or proposed interfaces as implemented features.
+**Status: operational development-only Q0 pub/sub and opt-in Q1 local-durable TCP publishing with restart recovery. Replay, durable consumers, full dedup-window qualification and quantitative validation remain unfinished.** The repository is initialized with the normative v1.1.1 requirements, a deliberately reduced research-MVP delivery profile, detailed component contracts, implementation roadmap and instructions for autonomous AI coding agents. Do not interpret architectural designs or proposed interfaces as implemented features.
 
 ## Read in this order
 
@@ -44,7 +44,7 @@ cargo run -p rovqet-sdk --example q0 -- pub demo hello
 
 The fixed development topics are `demo` and `telemetry` (four partitions each).
 The listener refuses non-loopback addresses; AUTH method 0 uses the static `dev`
-identity. Q1/Q2 and durable consumer operations are rejected. `Admitted` means
+identity (principal 1, tenant 1). Q1 requires the explicit configuration below; Q2 and durable consumer operations are rejected. `Admitted` means
 bounded volatile admission, with no promise of durability or subscriber receipt.
 
 Reproduce the independent-process smoke (one publisher, two subscribers):
@@ -56,6 +56,47 @@ cargo fmt --all -- --check
 cargo check --workspace --locked
 cargo test --workspace --locked
 ```
+
+## Experimental Q1 publisher
+
+Create a disposable directory once and retain its path when restarting the broker:
+
+```sh
+Q1_DATA=$(mktemp -d /tmp/rovqet-q1.XXXXXX)
+cargo run -p rovqet-server -- --listen 127.0.0.1:7443 \
+  --q1-data-dir "$Q1_DATA" --q1-topic durable \
+  --q1-tenant-id 1 --q1-topic-id 3 --q1-partition-id 0 \
+  --q1-incarnation 42 --q1-owner-epoch 7
+```
+
+In another terminal, publish with an explicit stable producer token:
+
+```sh
+cargo run -p rovqet-sdk --example q1 -- durable 11 0 0 100 0 42 7 hello 30000
+# COMMITTED_LOCAL 42 0
+```
+
+Arguments are `topic producer_id producer_epoch sequence message_id partition_id incarnation owner_epoch payload [ttl_ms]`. `ROVQET_ADDR` overrides the default `127.0.0.1:7443`. The Rust API is `Client::publish_q1(topic, payload, Q1PublishOptions { ... })`; Q0's existing `publish` API is unchanged.
+
+Stop with Ctrl-C, restart using the **same directory and identity**, then repeat the identical command: it returns the original offset. The next publication uses sequence 1 and a new message ID, for example `durable 11 0 1 101 0 42 7 next 30000`. Message offsets are 0, 2, 4, ... because each message has a paired producer-outcome record. No time-bounded dedup window is advertised yet. Keep the original token, message ID and payload when retrying `OutcomeUnknown`; reconnecting never changes them automatically. No Q1-to-Q0 fallback occurs.
+
+`COMMITTED_LOCAL` follows synchronization of the message, scoped producer outcome, manifest and directory. It survives a process crash with the same intact functioning storage; permanent disk loss and physical power-loss certification are outside this evidence. Never reuse an old incarnation after lost history. The server requires an existing directory, holds an exclusive advisory lock, and refuses corrupted or incompatible committed storage without resetting it. The configured route is Q1-only; unsupported partitions/classes are rejected. The development identity can publish only in tenant 1; Q1 topic IDs must exceed the fixed Q0 IDs 1 and 2. TTL must be 1–30000 ms. Q1 admission allows 64 queued/active commands and 4 MiB of retained payload capacity plus record/outcome overhead; saved outcomes have a hard 100000-entry limit with no eviction.
+
+Storage startup and shutdown run on blocking workers; per-request results use asynchronous replies. Q0 never calls WAL or waits for its barriers. Shutdown stops ingress and drains accepted Q1 work; unresolved storage after the five-second final drain deadline causes a non-successful process exit and requires recovery. A lost reply during shutdown is an uncertain outcome.
+
+Run the independent process smoke and deterministic fault suite:
+
+```sh
+cargo build -p rovqet-server -p rovqet-sdk --examples --bins --locked
+python3 scripts/q1_smoke.py --check-hooks-disabled
+cargo test -p rovqet-durable --features fault-injection --locked
+cargo build -p rovqet-server --features fault-injection --locked
+python3 scripts/test_q1_faults.py
+```
+
+Fault controls exist only in an explicit `fault-injection` build and use disposable marker directories. Default builds reject their environment variables. Tests pause before append, after append/before sync and after sync/before reply; the parent records received ACKs in a separate append-only fsynced journal. SIGKILL tests do not simulate physical power loss.
+
+## Q0 resource bounds
 
 Current bounds: 1,024 connections including incomplete handshakes; one inbound
 frame per session (1 MiB frame, 256 KiB payload); 64 outbound data slots and

@@ -35,6 +35,14 @@ jobs:
         run: cargo build -p rovqet-server -p rovqet-sdk --examples --bins --locked
       - name: Independent TCP publisher and subscribers
         run: python3 scripts/q0_smoke.py
+      - name: Independent Q1 publishing and restart recovery
+        run: python3 scripts/q1_smoke.py --check-hooks-disabled
+      - name: Q1 actor fault controls
+        run: cargo test -p rovqet-durable --features fault-injection --locked
+      - name: Build isolated Q1 fault-test broker
+        run: cargo build -p rovqet-server --features fault-injection --locked
+      - name: Q1 TCP crash boundaries and Q0 isolation
+        run: python3 scripts/test_q1_faults.py
       - name: Independent testkit fixtures and sampler tests
         run: python3 -m unittest discover -s benchmarks -p 'test_*.py'
       - name: Build load generator

@@ -86,3 +86,10 @@ Each failure emits \`component, partition/shard, epoch, log_incarnation (where r
 8. No unbounded memory growth during failure storms.
 
 TEST-004/005/011/013/015/017 each map to these scenarios. Reduced MVP runs the subset touching current slice; full production matrix later.
+
+
+## Executable B-02 process boundaries
+
+`scripts/test_q1_faults.py` uses an explicitly fault-enabled loopback broker and external SDK processes. Marker/release events pause the storage owner before append, after complete append/before sync, and after durable sync/before the actor reply. A killed caller receives no fabricated result: SDK transport loss is OUTCOME_UNKNOWN. Recovery discards the first two uncommitted tails and preserves the third boundary. Lost committed replies settle through the same scoped token without another insertion. Received successful ACKs are journaled and synchronized by the parent outside the WAL directory before SIGKILL.
+
+Injected append/partial-write, segment-sync, manifest-write/sync/rename and directory-sync errors never yield COMMITTED_LOCAL and poison the actor. Corrupted committed bytes or configuration identity disagreement fail startup without resetting history. A pending Q1 storage barrier does not stop Q0 publishes even with one Tokio worker. Shutdown drains accepted writes; a disappearing response remains unknown. These tests cover process termination on intact storage, not a physical power-cut or production qualification.

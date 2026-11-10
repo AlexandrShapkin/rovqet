@@ -38,3 +38,8 @@ Honest Q0 \`ADMITTED\` outcome; honest Q1 local fsync and Q2 durable quorum ACKs
 ## MVP exit report
 
 Record build SHA, machine/profile, exact command, actual connection count, offered/admitted/committed/delivered rates, p95/p99, CPU and process+socket memory, test cases, failures and comparisons. Explicitly name unsupported product requirements. An unrun test is NOT_RUN rather than PASS.
+
+
+## Implemented B-02 boundary
+
+The loopback development server optionally exposes one explicitly configured Q1 publisher route with real local fsync, scoped recoverable outcomes and SDK retry identity. Q0 remains independent. This is not the full B slice: time-bounded dedup qualification, FETCH/replay, durable consumer ACK/cursor, retention and Q2 remain separate work. The `fault-injection` build is for disposable isolated tests only; the default build has no active crash barriers and rejects test-control environment settings.

@@ -4,8 +4,9 @@ use rovqet_core::{Priority, QoS};
 use rovqet_q0::Broker;
 use rovqet_router::{OverflowPolicy, TopicConfig};
 use rovqet_transport::{Config, TransportStats, serve};
+mod q1;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     io,
     net::SocketAddr,
     sync::{Arc, atomic::Ordering},
@@ -24,6 +25,7 @@ struct Options {
     max_connections: usize,
     connection_budget_bytes: usize,
     metrics_interval: Option<Duration>,
+    q1: Option<q1::Options>,
 }
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
@@ -35,7 +37,9 @@ impl Options {
             max_connections: DEFAULT_CONNECTIONS,
             connection_budget_bytes: DEFAULT_CONNECTIONS * CONNECTION_ENVELOPE_BYTES,
             metrics_interval: None,
+            q1: None,
         };
+        let mut q1_values = HashMap::new();
         let mut seen = HashSet::new();
         let mut explicit_budget = false;
         for pair in args.chunks(2) {
@@ -68,6 +72,10 @@ impl Options {
                     }
                     result.metrics_interval = Some(Duration::from_millis(ms));
                 }
+                "--q1-data-dir" | "--q1-topic" | "--q1-tenant-id" | "--q1-topic-id"
+                | "--q1-partition-id" | "--q1-incarnation" | "--q1-owner-epoch" => {
+                    q1_values.insert(pair[0].clone(), pair[1].clone());
+                }
                 _ => return Err(invalid("unknown option; see --help")),
             }
         }
@@ -94,6 +102,7 @@ impl Options {
                 "connection envelope requires at least {required} bytes; kernel socket memory and other broker queues are additional"
             )));
         }
+        result.q1 = q1::Options::parse(&q1_values)?;
         Ok(result)
     }
 }
@@ -183,6 +192,9 @@ async fn main() -> io::Result<()> {
         println!(concat!(
             "Usage: rovqet [--listen 127.0.0.1:7443] [--max-connections N]\n",
             "  [--connection-budget-bytes N] [--metrics-interval-ms 250]\n",
+            "  Q1 opt-in (all required): --q1-data-dir EXISTING_DIR --q1-topic NAME\n",
+            "    --q1-tenant-id 1 --q1-topic-id ID --q1-partition-id ID\n",
+            "    --q1-incarnation U128 --q1-owner-epoch U64\n",
             "Development only: plaintext, static dev identity, loopback required.\n",
             "Q0 topics: demo, telemetry. Default connection limit: 1024.\n",
             "Higher limits (ceiling 20000) require an explicit user-space envelope budget\n",
@@ -193,7 +205,23 @@ async fn main() -> io::Result<()> {
         return Ok(());
     }
     let options = Arc::new(Options::parse(&args)?);
+    q1::validate_test_environment()?;
     let listener = tokio::net::TcpListener::bind(options.listen).await?;
+    let route = if let Some(q1) = options.q1.clone() {
+        Some(Arc::new(
+            tokio::task::spawn_blocking(move || q1::Route::open(q1))
+                .await
+                .map_err(io::Error::other)??,
+        ))
+    } else {
+        None
+    };
+    if let Some(q1) = &options.q1 {
+        eprintln!(
+            "Q1 recovered: topic={} partition={:?} incarnation={} owner_epoch={}",
+            q1.topic, q1.partition, q1.incarnation, q1.owner_epoch
+        );
+    }
     eprintln!(
         "rovqet development profile listening on {}",
         listener.local_addr()?
@@ -219,12 +247,32 @@ async fn main() -> io::Result<()> {
             }}
         })
     });
-    let drain = broker.clone();
-    let result = serve(listener, config, broker.clone(), async move {
+    let handler = Arc::new(q1::Dispatch::new(broker.clone(), route.clone()));
+    let drain = handler.clone();
+    let result = serve(listener, config, handler.clone(), async move {
         let _ = tokio::signal::ctrl_c().await;
         drain.drain();
     })
     .await;
+    drop(handler);
+    if let Some(route) = route {
+        let owned = Arc::try_unwrap(route)
+            .map_err(|_| io::Error::other("Q1 route retained after session shutdown"))?;
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || owned.shutdown()),
+        )
+        .await
+        {
+            Ok(done) => done.map_err(io::Error::other)??,
+            Err(_) => {
+                eprintln!(
+                    "Q1 shutdown deadline exceeded; pending outcomes unknown; restart recovery required"
+                );
+                std::process::exit(1);
+            }
+        }
+    }
     let _ = stop.send(true);
     let _ = dispatcher.await;
     if let Some(task) = metrics_task {

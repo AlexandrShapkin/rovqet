@@ -1,6 +1,7 @@
-//! Blocking Q1 partition actor foundation. Not connected to the server wire path.
+//! Dedicated-thread Q1 partition actor used by the opt-in TCP publication route.
 //! Callers provide authenticated principal, routing authority and prevalidated TTL/ACL.
-//! Open, wait and shutdown must run outside a network/async executor.
+//! Open, blocking wait and shutdown must run outside a network/async executor.
+//! Network callers await PendingPublish::wait_async without blocking their worker.
 #![forbid(unsafe_code)]
 use rovqet_core::{DurableOffset, PartitionRef, PublishOutcome, QoS};
 use rovqet_scheduler::{Budget, Reservation, Usage};
@@ -11,12 +12,25 @@ use std::{
     path::Path,
     sync::{
         Arc,
-        mpsc::{self, Receiver, SyncSender, TrySendError},
+        mpsc::{self, SyncSender, TrySendError},
     },
     thread::{self, JoinHandle},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
+use tokio::sync::oneshot;
+
 const OUTCOME_BYTES: usize = 30;
+
+#[derive(Default)]
+struct WorkerOptions {
+    #[cfg(feature = "fault-injection")]
+    control: Option<TestControl>,
+}
+
+#[cfg(feature = "fault-injection")]
+mod test_control;
+#[cfg(feature = "fault-injection")]
+pub use test_control::{TestControl, TestStage};
 #[derive(Debug, Clone)]
 pub struct PartitionConfig {
     pub partition: PartitionRef,
@@ -47,6 +61,7 @@ pub enum Error {
     SequenceGap,
     SequenceConflict,
     Capacity,
+    Expired,
     Storage(rovqet_wal::Error),
     Corruption(&'static str),
     OutcomeUnknown,
@@ -69,17 +84,24 @@ impl std::error::Error for Error {
 }
 pub type Result<T> = std::result::Result<T, Error>;
 pub struct PendingPublish {
-    reply: Receiver<Result<PublishOutcome>>,
+    reply: oneshot::Receiver<Result<PublishOutcome>>,
 }
 impl PendingPublish {
     /// Wait for a known barrier outcome. Dropping this waiter never cancels submitted IO.
     pub fn wait(self) -> Result<PublishOutcome> {
-        self.reply.recv().unwrap_or(Err(Error::OutcomeUnknown))
+        self.reply
+            .blocking_recv()
+            .unwrap_or(Err(Error::OutcomeUnknown))
+    }
+    /// Await storage completion without blocking a Tokio networking worker.
+    pub async fn wait_async(self) -> Result<PublishOutcome> {
+        self.reply.await.unwrap_or(Err(Error::OutcomeUnknown))
     }
 }
 struct Command {
     request: PublishRequest,
-    reply: mpsc::Sender<Result<PublishOutcome>>,
+    reply: oneshot::Sender<Result<PublishOutcome>>,
+    deadline: Option<Instant>,
     _reservation: Reservation,
 }
 /// One caller-owned handle; shared references may submit concurrently. No socket or Q0 dependencies.
@@ -96,6 +118,31 @@ impl Partition {
         path: impl AsRef<Path>,
         wal_config: WalConfig,
         config: PartitionConfig,
+    ) -> Result<Self> {
+        Self::open_inner(path, wal_config, config, WorkerOptions::default())
+    }
+    /// Test-only deterministic storage barriers, unavailable in normal builds.
+    #[cfg(feature = "fault-injection")]
+    pub fn open_with_test_control(
+        path: impl AsRef<Path>,
+        wal_config: WalConfig,
+        config: PartitionConfig,
+        control: TestControl,
+    ) -> Result<Self> {
+        Self::open_inner(
+            path,
+            wal_config,
+            config,
+            WorkerOptions {
+                control: Some(control),
+            },
+        )
+    }
+    fn open_inner(
+        path: impl AsRef<Path>,
+        wal_config: WalConfig,
+        config: PartitionConfig,
+        _options: WorkerOptions,
     ) -> Result<Self> {
         if config.partition != wal_config.partition
             || config.queue_messages == 0
@@ -120,11 +167,15 @@ impl Partition {
                         let _ = ready_tx.send(Err(e));
                     }
                     Ok(mut state) => {
+                        #[cfg(feature = "fault-injection")]
+                        {
+                            state.control = _options.control;
+                        }
                         if ready_tx.send(Ok(())).is_err() {
                             return;
                         }
                         while let Ok(command) = rx.recv() {
-                            let result = state.publish(command.request);
+                            let result = state.publish_before(command.request, command.deadline);
                             drop(command._reservation);
                             let _ = command.reply.send(result);
                         }
@@ -154,6 +205,18 @@ impl Partition {
     }
     /// Nonblocking admission; the reservation covers queued and actively synchronizing records.
     pub fn try_publish(&self, request: PublishRequest) -> Result<PendingPublish> {
+        self.submit(request, None)
+    }
+    /// A new publication that expires while queued is rejected before any WAL append.
+    /// An identical already-committed retry still resolves its saved durable outcome.
+    pub fn try_publish_before(
+        &self,
+        request: PublishRequest,
+        deadline: Instant,
+    ) -> Result<PendingPublish> {
+        self.submit(request, Some(deadline))
+    }
+    fn submit(&self, request: PublishRequest, deadline: Option<Instant>) -> Result<PendingPublish> {
         if request.partition != self.config.partition {
             return Err(Error::WrongPartition);
         }
@@ -177,10 +240,11 @@ impl Partition {
             .checked_add(2 * RECORD_OVERHEAD + OUTCOME_BYTES)
             .ok_or(Error::Capacity)?;
         let reservation = Budget::reserve(&[self.budget.clone()], charge).ok_or(Error::Capacity)?;
-        let (reply, rx) = mpsc::channel();
+        let (reply, rx) = oneshot::channel();
         let command = Command {
             request,
             reply,
+            deadline,
             _reservation: reservation,
         };
         match self
@@ -231,6 +295,8 @@ struct State {
     producers: HashMap<(u128, u128), (u64, u64)>,
     next: u64,
     unhealthy: bool,
+    #[cfg(feature = "fault-injection")]
+    control: Option<TestControl>,
 }
 impl State {
     fn open(path: &Path, wal_config: WalConfig, config: PartitionConfig) -> Result<Self> {
@@ -243,9 +309,22 @@ impl State {
             producers: HashMap::new(),
             next: 0,
             unhealthy: false,
+            #[cfg(feature = "fault-injection")]
+            control: None,
         };
         s.recover()?;
         Ok(s)
+    }
+    #[cfg(feature = "fault-injection")]
+    fn test_barrier(&mut self, stage: TestStage, sequence: u64) -> Result<()> {
+        let result = match &mut self.control {
+            Some(control) => control.pause(stage, sequence),
+            None => Ok(()),
+        };
+        if result.is_err() {
+            self.unhealthy = true;
+        }
+        result
     }
     fn recover(&mut self) -> Result<()> {
         let count = self
@@ -362,7 +441,15 @@ impl State {
             }
         }
     }
+    #[cfg(test)]
     fn publish(&mut self, r: PublishRequest) -> Result<PublishOutcome> {
+        self.publish_before(r, None)
+    }
+    fn publish_before(
+        &mut self,
+        r: PublishRequest,
+        deadline: Option<Instant>,
+    ) -> Result<PublishOutcome> {
         if self.unhealthy {
             return Err(Error::Unavailable);
         }
@@ -414,6 +501,9 @@ impl State {
                 sequence: offset,
             }));
         }
+        if deadline.is_some_and(|end| Instant::now() >= end) {
+            return Err(Error::Expired);
+        }
         self.validate_token(token)?;
         if self.outcomes.len() >= self.config.max_outcomes
             || self
@@ -423,6 +513,20 @@ impl State {
             || token.sequence == u64::MAX
         {
             return Err(Error::Capacity);
+        }
+        #[cfg(feature = "fault-injection")]
+        {
+            self.test_barrier(TestStage::BeforeAppend, token.sequence)?;
+            if let Some(control) = &mut self.control {
+                if control.sequence == token.sequence {
+                    if let Some(point) = control.wal_fault.take() {
+                        self.wal.inject_fault(point);
+                    }
+                }
+            }
+        }
+        if deadline.is_some_and(|end| Instant::now() >= end) {
+            return Err(Error::Expired);
         }
         let offset = self.next;
         let timestamp = SystemTime::now()
@@ -457,14 +561,18 @@ impl State {
             payload: outcome_payload,
         };
         let result = (|| {
-            self.wal.append(message)?;
-            self.wal.append(outcome)?;
-            self.wal.sync()?;
-            Ok::<_, rovqet_wal::Error>(())
+            self.wal.append(message).map_err(Error::Storage)?;
+            self.wal.append(outcome).map_err(Error::Storage)?;
+            #[cfg(feature = "fault-injection")]
+            self.test_barrier(TestStage::AfterAppendBeforeSync, token.sequence)?;
+            self.wal.sync().map_err(Error::Storage)?;
+            #[cfg(feature = "fault-injection")]
+            self.test_barrier(TestStage::AfterSyncBeforeReply, token.sequence)?;
+            Ok::<_, Error>(())
         })();
         if let Err(e) = result {
             self.unhealthy = true;
-            return Err(Error::Storage(e));
+            return Err(e);
         }
         self.next += 2;
         self.outcomes.insert(token, offset);
@@ -620,7 +728,7 @@ mod tests {
     }
     #[test]
     fn disconnected_response_is_unknown() {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = oneshot::channel();
         drop(tx);
         assert!(matches!(
             PendingPublish { reply: rx }.wait(),
@@ -643,5 +751,100 @@ mod tests {
             })
         );
         reopened.shutdown().unwrap();
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_wait_yields_to_the_runtime_and_disconnect_is_unknown() {
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            let _ = tx.send(Ok(PublishOutcome::CommittedLocal(DurableOffset {
+                log_incarnation: 1,
+                sequence: 0,
+            })));
+        });
+        assert_eq!(
+            PendingPublish { reply: rx }.wait_async().await.unwrap(),
+            PublishOutcome::CommittedLocal(DurableOffset {
+                log_incarnation: 1,
+                sequence: 0
+            })
+        );
+        let (tx, rx) = oneshot::channel();
+        drop(tx);
+        assert!(matches!(
+            PendingPublish { reply: rx }.wait_async().await,
+            Err(Error::OutcomeUnknown)
+        ));
+    }
+
+    #[test]
+    fn expired_fresh_work_never_appends_but_committed_retry_still_resolves() {
+        let d = Dir::new();
+        let (w, p) = config();
+        let mut state = State::open(&d.0, w, p).unwrap();
+        assert!(matches!(
+            state.publish_before(request(0), Some(Instant::now())),
+            Err(Error::Expired)
+        ));
+        assert_eq!(state.wal.committed_position(), None);
+        let committed = state.publish(request(0)).unwrap();
+        assert_eq!(
+            state
+                .publish_before(request(0), Some(Instant::now()))
+                .unwrap(),
+            committed
+        );
+        assert!(matches!(
+            state.publish_before(request(1), Some(Instant::now())),
+            Err(Error::Expired)
+        ));
+        assert_eq!(state.wal.committed_position().unwrap().sequence, 1);
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn deterministic_barriers_hold_only_the_storage_worker_until_release() {
+        for stage in [
+            TestStage::BeforeAppend,
+            TestStage::AfterAppendBeforeSync,
+            TestStage::AfterSyncBeforeReply,
+        ] {
+            let d = Dir::new();
+            let marker = Dir::new();
+            let (w, p) = config();
+            let actor = Partition::open_with_test_control(
+                &d.0,
+                w,
+                p,
+                TestControl {
+                    directory: marker.0.clone(),
+                    stage: Some(stage),
+                    sequence: 0,
+                    wal_fault: None,
+                },
+            )
+            .unwrap();
+            let pending = actor.try_publish(request(0)).unwrap();
+            let end = Instant::now() + std::time::Duration::from_secs(5);
+            let reached = marker.0.join(format!("reached-{}", stage.as_str()));
+            while !reached.exists() {
+                assert!(
+                    Instant::now() < end,
+                    "storage worker did not reach {stage:?}"
+                );
+                thread::yield_now();
+            }
+            assert_eq!(actor.usage().messages, 1);
+            std::fs::write(
+                marker.0.join(format!("release-{}", stage.as_str())),
+                b"release",
+            )
+            .unwrap();
+            assert!(matches!(
+                pending.wait(),
+                Ok(PublishOutcome::CommittedLocal(_))
+            ));
+            actor.shutdown().unwrap();
+        }
     }
 }

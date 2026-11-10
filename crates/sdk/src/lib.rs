@@ -88,6 +88,21 @@ impl Default for PublishOptions {
         }
     }
 }
+/// Explicit Q1 identity. Keep these values and the original payload for an unresolved retry.
+/// Reconnecting never changes this caller-owned producer token or retries automatically.
+/// This API does not promise a time-bounded producer deduplication window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Q1PublishOptions {
+    pub producer_id: u128,
+    pub producer_epoch: u64,
+    pub sequence: u64,
+    pub message_id: u128,
+    pub partition_id: u32,
+    pub log_incarnation: u128,
+    pub ownership_epoch: u64,
+    pub ttl: Duration,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Delivery {
     pub topic: String,
@@ -346,6 +361,88 @@ impl Client {
         }
         Ok(PublishOutcome::Admitted)
     }
+    /// Publish to an explicitly configured local-durable Q1 partition.
+    /// Only a validated COMMITTED_LOCAL response yields success. A timeout, malformed
+    /// response or disconnect after sending is unresolved and closes this connection.
+    /// Reconnect and retry with identical options and payload to settle that outcome.
+    pub async fn publish_q1(
+        &mut self,
+        topic: &str,
+        payload: &[u8],
+        options: Q1PublishOptions,
+    ) -> Result<PublishOutcome, ClientError> {
+        if self.stream.is_none() {
+            return Err(ClientError::Closed);
+        }
+        if payload.len() > self.limits.max_payload_bytes || topic.is_empty() || topic.len() > 255 {
+            return Err(ClientError::Protocol("publish exceeds wire bounds"));
+        }
+        let ttl = u32::try_from(options.ttl.as_millis())
+            .map_err(|_| ClientError::Protocol("TTL exceeds wire bound"))?;
+        if ttl == 0 || options.producer_id == 0 || options.log_incarnation == 0 {
+            return Err(ClientError::Protocol("Q1 identity and TTL must be nonzero"));
+        }
+        let mut frame = self.request(FrameType::Publish)?;
+        frame.fields = vec![
+            Field::required(f::TOPIC_NAME, topic.as_bytes().to_vec()),
+            Field::required(f::PARTITION_KEY, []),
+            Field::required(f::QOS, [1]),
+            Field::required(f::TTL_MS, ttl.to_be_bytes()),
+            Field::required(f::MESSAGE_ID, options.message_id.to_be_bytes()),
+            Field::required(f::PRODUCER_ID, options.producer_id.to_be_bytes()),
+            Field::required(f::PRODUCER_EPOCH, options.producer_epoch.to_be_bytes()),
+            Field::required(f::PRODUCER_SEQUENCE, options.sequence.to_be_bytes()),
+            Field::required(f::PARTITION_ID, options.partition_id.to_be_bytes()),
+            Field::required(f::LOG_INCAR, options.log_incarnation.to_be_bytes()),
+            Field::required(f::OWNERSHIP_EPOCH, options.ownership_epoch.to_be_bytes()),
+        ];
+        frame.payload = payload.to_vec();
+        rovqet_protocol::encode(&frame, self.limits)
+            .map_err(|_| ClientError::Protocol("invalid Q1 publish"))?;
+        let result = match self.exchange(frame, FrameType::PubAck).await {
+            Ok(result) => result,
+            Err(ClientError::Remote {
+                code: Some(ErrorCode::OutcomeUnknown),
+                ..
+            }) => {
+                self.stream = None;
+                return Err(ClientError::OutcomeUnknown);
+            }
+            Err(remote @ ClientError::Remote { .. }) => return Err(remote),
+            Err(_) => {
+                self.stream = None;
+                return Err(ClientError::OutcomeUnknown);
+            }
+        };
+        let decoded = (|| {
+            if result.field(f::QOS) != Some(&[1][..])
+                || result.field(f::PUB_OUTCOME) != Some(&[2][..])
+                || u32_field(&result, f::PARTITION_ID)? != options.partition_id
+            {
+                return Err(ClientError::OutcomeUnknown);
+            }
+            let incarnation = u128::from_be_bytes(
+                required(&result, f::LOG_INCAR)?
+                    .try_into()
+                    .map_err(|_| ClientError::OutcomeUnknown)?,
+            );
+            if incarnation != options.log_incarnation {
+                return Err(ClientError::OutcomeUnknown);
+            }
+            Ok(PublishOutcome::CommittedLocal(DurableOffset {
+                log_incarnation: incarnation,
+                sequence: u64_field(&result, f::OFFSET)?,
+            }))
+        })();
+        match decoded {
+            Ok(outcome) => Ok(outcome),
+            Err(_) => {
+                self.stream = None;
+                Err(ClientError::OutcomeUnknown)
+            }
+        }
+    }
+
     pub async fn subscribe(&mut self, topic: &str) -> Result<u64, ClientError> {
         self.subscribe_with_credit(
             topic,
@@ -1041,6 +1138,276 @@ mod tests {
         let mut client = Client::connect(config).await.unwrap();
         client.subscribe("demo").await.unwrap();
         assert_eq!(client.receive().await.unwrap().payload, [1]);
+        server.await.unwrap();
+    }
+    fn q1_options() -> Q1PublishOptions {
+        Q1PublishOptions {
+            producer_id: 77,
+            producer_epoch: 3,
+            sequence: 4,
+            message_id: 88,
+            partition_id: 2,
+            log_incarnation: 99,
+            ownership_epoch: 7,
+            ttl: Duration::from_secs(1),
+        }
+    }
+    fn q1_ack(request: u64) -> Frame {
+        let mut ack = Frame::new(FrameType::PubAck, request);
+        ack.fields = vec![
+            Field::required(f::QOS, [1]),
+            Field::required(f::PUB_OUTCOME, [2]),
+            Field::required(f::PARTITION_ID, 2_u32.to_be_bytes()),
+            Field::required(f::LOG_INCAR, 99_u128.to_be_bytes()),
+            Field::required(f::OFFSET, 10_u64.to_be_bytes()),
+        ];
+        ack
+    }
+    #[tokio::test]
+    async fn q1_lost_reply_reconnect_reuses_original_token_and_payload() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = ClientConfig {
+            endpoint: listener.local_addr().unwrap(),
+            ..Default::default()
+        };
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            handshake(&mut first).await;
+            let original = read_frame(&mut first, Limits::default())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(original.field(f::QOS), Some(&[1][..]));
+            assert_eq!(
+                original.field(f::PRODUCER_ID),
+                Some(&77_u128.to_be_bytes()[..])
+            );
+            assert_eq!(
+                original.field(f::PRODUCER_EPOCH),
+                Some(&3_u64.to_be_bytes()[..])
+            );
+            assert_eq!(
+                original.field(f::PRODUCER_SEQUENCE),
+                Some(&4_u64.to_be_bytes()[..])
+            );
+            assert_eq!(
+                original.field(f::MESSAGE_ID),
+                Some(&88_u128.to_be_bytes()[..])
+            );
+            assert_eq!(
+                original.field(f::PARTITION_ID),
+                Some(&2_u32.to_be_bytes()[..])
+            );
+            assert_eq!(
+                original.field(f::LOG_INCAR),
+                Some(&99_u128.to_be_bytes()[..])
+            );
+            assert_eq!(
+                original.field(f::OWNERSHIP_EPOCH),
+                Some(&7_u64.to_be_bytes()[..])
+            );
+            drop(first);
+            let (mut second, _) = listener.accept().await.unwrap();
+            handshake(&mut second).await;
+            let retry = read_frame(&mut second, Limits::default())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(retry.fields, original.fields);
+            assert_eq!(retry.payload, original.payload);
+            write_frame(&mut second, &q1_ack(retry.request_id), Limits::default())
+                .await
+                .unwrap();
+        });
+        let mut client = Client::connect(config).await.unwrap();
+        let options = q1_options();
+        assert!(matches!(
+            client
+                .publish_q1("durable", b"same-payload", options.clone())
+                .await,
+            Err(ClientError::OutcomeUnknown)
+        ));
+        assert!(client.stream.is_none());
+        client.reconnect().await.unwrap();
+        assert_eq!(
+            client
+                .publish_q1("durable", b"same-payload", options)
+                .await
+                .unwrap(),
+            PublishOutcome::CommittedLocal(DurableOffset {
+                log_incarnation: 99,
+                sequence: 10
+            })
+        );
+        server.await.unwrap();
+    }
+    #[tokio::test]
+    async fn q1_invalid_ack_identity_class_correlation_or_encoding_is_unknown() {
+        for fault in 0..5 {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let config = ClientConfig {
+                endpoint: listener.local_addr().unwrap(),
+                ..Default::default()
+            };
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                handshake(&mut stream).await;
+                let request = read_frame(&mut stream, Limits::default())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let mut ack = q1_ack(request.request_id);
+                match fault {
+                    0 => {
+                        ack.fields[2] = Field::required(f::PARTITION_ID, 3_u32.to_be_bytes());
+                    }
+                    1 => {
+                        ack.fields[3] = Field::required(f::LOG_INCAR, 100_u128.to_be_bytes());
+                    }
+                    2 => {
+                        ack.fields = vec![
+                            Field::required(f::QOS, [0]),
+                            Field::required(f::PUB_OUTCOME, [1]),
+                        ];
+                    }
+                    3 => {
+                        ack.request_id += 1;
+                    }
+                    4 => {}
+                    _ => unreachable!(),
+                }
+                let mut bytes = rovqet_protocol::encode(&ack, Limits::default()).unwrap();
+                if fault == 4 {
+                    bytes[2] = 2;
+                }
+                tokio::io::AsyncWriteExt::write_all(&mut stream, &bytes)
+                    .await
+                    .unwrap();
+                // The client closes the ambiguous connection instead of issuing Q0 or a new token.
+                match read_frame(&mut stream, Limits::default()).await {
+                    Ok(None) => {}
+                    Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {}
+                    other => panic!("uncertain client must close without another frame: {other:?}"),
+                }
+            });
+            let mut client = Client::connect(config).await.unwrap();
+            assert!(
+                matches!(
+                    client.publish_q1("durable", b"body", q1_options()).await,
+                    Err(ClientError::OutcomeUnknown)
+                ),
+                "fault {fault}"
+            );
+            assert!(client.stream.is_none());
+            assert!(matches!(
+                client.publish_q1("durable", b"body", q1_options()).await,
+                Err(ClientError::Closed)
+            ));
+            server.await.unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn q1_server_unknown_is_unresolved_and_other_errors_remain_typed() {
+        for code in [
+            ErrorCode::OutcomeUnknown,
+            ErrorCode::SequenceConflict,
+            ErrorCode::StorageUnavailable,
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let config = ClientConfig {
+                endpoint: listener.local_addr().unwrap(),
+                ..Default::default()
+            };
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                handshake(&mut stream).await;
+                let request = read_frame(&mut stream, Limits::default())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let error = rovqet_transport::error_frame(request.request_id, code);
+                write_frame(&mut stream, &error, Limits::default())
+                    .await
+                    .unwrap();
+            });
+            let mut client = Client::connect(config).await.unwrap();
+            let result = client.publish_q1("durable", b"body", q1_options()).await;
+            if code == ErrorCode::OutcomeUnknown {
+                assert!(matches!(result, Err(ClientError::OutcomeUnknown)));
+                assert!(client.stream.is_none());
+            } else {
+                assert!(
+                    matches!(result, Err(ClientError::Remote { code: Some(actual), .. }) if actual == code)
+                );
+            }
+            server.await.unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn q1_reply_timeout_is_unknown_and_does_not_resubmit() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = ClientConfig {
+            endpoint: listener.local_addr().unwrap(),
+            request_timeout: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            handshake(&mut stream).await;
+            let request = read_frame(&mut stream, Limits::default())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(request.field(f::QOS), Some(&[1][..]));
+            // Hold the reply until the client's own deadline closes its socket.
+            assert!(
+                read_frame(&mut stream, Limits::default())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        });
+        let mut client = Client::connect(config).await.unwrap();
+        assert!(matches!(
+            client.publish_q1("durable", b"body", q1_options()).await,
+            Err(ClientError::OutcomeUnknown)
+        ));
+        assert!(client.stream.is_none());
+        server.await.unwrap();
+    }
+    #[tokio::test]
+    async fn q1_invalid_local_options_are_not_sent() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = ClientConfig {
+            endpoint: listener.local_addr().unwrap(),
+            ..Default::default()
+        };
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            handshake(&mut stream).await;
+            assert_eq!(
+                read_frame(&mut stream, Limits::default())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .frame_type,
+                FrameType::Close
+            );
+        });
+        let mut client = Client::connect(config).await.unwrap();
+        for fault in 0..3 {
+            let mut options = q1_options();
+            match fault {
+                0 => options.producer_id = 0,
+                1 => options.log_incarnation = 0,
+                _ => options.ttl = Duration::ZERO,
+            }
+            assert!(matches!(
+                client.publish_q1("durable", b"body", options).await,
+                Err(ClientError::Protocol(_))
+            ));
+        }
+        client.close().await.unwrap();
         server.await.unwrap();
     }
 }

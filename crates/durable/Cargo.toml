@@ -5,7 +5,15 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+default = []
+fault-injection = []
+
 [dependencies]
 rovqet-core = { path = "../core" }
 rovqet-wal = { path = "../wal" }
 rovqet-scheduler = { path = "../scheduler" }
+tokio = { version = "1", features = ["sync"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "time"] }

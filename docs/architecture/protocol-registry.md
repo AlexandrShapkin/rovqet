@@ -73,7 +73,7 @@ All TLVs use \`(field_id << 1) | critical\` as encoded tag, **not** the field nu
 | 16 | producer_id | u128 BE | Q1/Q2 PUBLISH |
 | 17 | producer_epoch | u64 BE | Q1/Q2 PUBLISH |
 | 18 | producer_sequence | u64 BE | Q1/Q2 PUBLISH |
-| 19 | partition_id | u32 BE | PUB_ACK/MESSAGE/FETCH/ACK |
+| 19 | partition_id | u32 BE | direct Q1 PUBLISH/PUB_ACK/MESSAGE/FETCH/ACK |
 | 20 | log_incarnation | u128 BE | every durable offset reference |
 | 21 | offset | u64 BE | every durable offset reference |
 | 22 | pub_outcome | u8: 1=ADMITTED,2=COMMITTED_LOCAL,3=COMMITTED_QUORUM | PUB_ACK |
@@ -156,3 +156,6 @@ A producer persisted token is independent of request_id. A retry after socket lo
 ## Golden fixture plan
 
 Generate canonical vectors from a *reference encoder* and hand-checked decoder for: HELLO, AUTH, PUBLISH Q0, Q1 PUB_ACK, Q2 PUB_ACK, MESSAGE with incarnation, FETCH with old incarnation, CONSUMER_ACK/RESULT, ERROR each class, unknown optional field, unknown critical field, overlong varint, truncated payload, duplicate singular field, bad max_frame, checksum mismatch. Pin vectors in \`crates/protocol/tests/fixtures\` and assert byte-for-byte equivalence across codec revisions. The registry is design-frozen here; empirical freezing/validation is an M1 task.
+
+
+B-02's implemented single-partition development route requires existing fields 19 (partition_id), 20 (log_incarnation) and 27 (ownership_epoch) on Q1 PUBLISH in addition to the generic row above. This fixes the direct-route profile without new numeric assignments. The Q1 response uses outcome 2 only after the actor barrier and includes the complete configured partition identity. General codec vectors remain unchanged; Q2 and consumer operations remain unsupported by the development server.

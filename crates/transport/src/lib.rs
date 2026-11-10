@@ -9,6 +9,7 @@ use std::{
     collections::{HashSet, VecDeque},
     future::Future,
     io,
+    pin::Pin,
     sync::{
         Arc, Mutex, Weak,
         atomic::{AtomicU64, Ordering},
@@ -774,6 +775,10 @@ impl Outbound {
         })
     }
 }
+pub enum SessionReply {
+    Immediate(Result<Option<Frame>, ErrorCode>),
+    Deferred(Pin<Box<dyn Future<Output = Result<Option<Frame>, ErrorCode>> + Send>>),
+}
 pub trait SessionHandler: Send + Sync + 'static {
     fn handle(
         &self,
@@ -781,6 +786,17 @@ pub trait SessionHandler: Send + Sync + 'static {
         frame: Frame,
         outbound: Outbound,
     ) -> Result<Option<Frame>, ErrorCode>;
+    /// Called only after authentication. The principal comes from AUTH, never the request.
+    /// Q0 keeps its immediate, allocation-free dispatch; durable work can defer its reply.
+    fn request(
+        &self,
+        session: u128,
+        _principal: u128,
+        frame: Frame,
+        outbound: Outbound,
+    ) -> SessionReply {
+        SessionReply::Immediate(self.handle(session, frame, outbound))
+    }
     fn disconnected(&self, _session: u128) {}
 }
 pub struct NoopHandler;
@@ -1051,7 +1067,14 @@ async fn session(
                 Ok(Some(f))
             }
             _ if frame.frame_type == FrameType::Pong => Ok(None),
-            _ => handler.handle(id, frame, outbound.clone()),
+            _ => match handler.request(id, 1, frame, outbound.clone()) {
+                SessionReply::Immediate(result) => result,
+                SessionReply::Deferred(reply) => tokio::select! {
+                    result = reply => result,
+                    _ = stop.changed() => break,
+                    _ = &mut writer_task => return Ok(()),
+                },
+            },
         };
         match result {
             Ok(Some(f)) => {
