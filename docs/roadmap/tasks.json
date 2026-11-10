@@ -479,7 +479,9 @@
         "next_unblocked": [
           "B-03",
           "B-04"
-        ]
+        ],
+        "ci_run": "https://github.com/AlexandrShapkin/rovqet/actions/runs/42767650646",
+        "ci_result": "PASS: docs and rust jobs on pushed acceptance commit04543485b76e279f1bebca22db01a69f071e14fd, including Q1 restart smoke, feature actor faults and17 TCP/process faults."
       }
     },
     {
@@ -489,13 +491,28 @@
       "depends_on": [
         "B-02"
       ],
-      "status": "TODO",
+      "status": "IN_PROGRESS",
       "architecture": "06",
       "proof": "Same seq same outcome, conflict, gap, fencing tests",
       "paths": [
         "crates/durable/"
       ],
-      "evidence": null
+      "evidence": {
+        "commit": "fa73047bb1f0ba19cb4f357d35d3d53c9e141dfd",
+        "verification": "PASS: initial bounded producer recovery proof only; B-03 acceptance remains unfinished.",
+        "test_command": [
+          "CARGO_HOME=/tmp/rovqet-cargo cargo test -p rovqet-durable --locked --test producer_model",
+          "CARGO_HOME=/tmp/rovqet-cargo cargo test -p rovqet-durable --locked",
+          "CARGO_HOME=/tmp/rovqet-cargo cargo test --workspace --locked",
+          "CARGO_HOME=/tmp/rovqet-cargo cargo test -p rovqet-durable --features fault-injection --locked",
+          "cargo fmt --all -- --check",
+          "python3 scripts/check_docs.py",
+          "git diff --check"
+        ],
+        "observed_result": "2 deterministic model tests pass:31 fresh publications/11 clean restarts,4 principal/producer scopes,2 epochs, exact duplicate outcomes, payload/message-ID conflicts, gaps, fencing, hard24-outcome capacity/no eviction, committed-pair integrity and independent partitions/principals with identical producer tokens.20 default durable tests,21 fault-enabled durable tests and142 workspace tests pass.",
+        "limitations": "No production behavior changed. Canonical effective publication attributes/digest contract and advertised configurable timed dedup window remain unqualified. No B-03 DONE claim or B-04 FETCH implementation.",
+        "next_unblocked": "Continue B-03 with canonical retry attributes and separately verified time-window/quota/clock/cardinality semantics; B-04 is also dependency-ready after B-02 and requires actor-owned bounded reads plus incarnation-aware SDK FETCH."
+      }
     },
     {
       "id": "B-04",
