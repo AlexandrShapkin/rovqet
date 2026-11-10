@@ -66,7 +66,7 @@ Q1_DATA=$(mktemp -d /tmp/rovqet-q1.XXXXXX)
 cargo run -p rovqet-server -- --listen 127.0.0.1:7443 \
   --q1-data-dir "$Q1_DATA" --q1-topic durable \
   --q1-tenant-id 1 --q1-topic-id 3 --q1-partition-id 0 \
-  --q1-incarnation 42 --q1-owner-epoch 7
+  --q1-incarnation 42 --q1-owner-epoch 7 --q1-initialize-new-log true
 ```
 
 In another terminal, publish with an explicit stable producer token:
@@ -78,9 +78,9 @@ cargo run -p rovqet-sdk --example q1 -- durable 11 0 0 100 0 42 7 hello 30000
 
 Arguments are `topic producer_id producer_epoch sequence message_id partition_id incarnation owner_epoch payload [ttl_ms]`. `ROVQET_ADDR` overrides the default `127.0.0.1:7443`. The Rust API is `Client::publish_q1(topic, payload, Q1PublishOptions { ... })`; Q0's existing `publish` API is unchanged.
 
-Stop with Ctrl-C, restart using the **same directory and identity**, then repeat the identical command: it returns the original offset. The next publication uses sequence 1 and a new message ID, for example `durable 11 0 1 101 0 42 7 next 30000`. Message offsets are 0, 2, 4, ... because each message has a paired producer-outcome record. No time-bounded dedup window is advertised yet. Keep the original token, message ID and payload when retrying `OutcomeUnknown`; reconnecting never changes them automatically. No Q1-to-Q0 fallback occurs.
+Stop with Ctrl-C, restart using the **same directory and identity**, omitting `--q1-initialize-new-log true`, then repeat the identical command: it returns the original offset. The next publication uses sequence 1 and a new message ID, for example `durable 11 0 1 101 0 42 7 next 30000`. Message offsets are 0, 2, 4, ... because each message has a paired producer-outcome record. The startup diagnostic advertises the dedup window (default 24 hours, configurable with `--q1-dedup-window-ms`). Downtime and uncertain clock intervals extend retention; expired historical tokens return OUTCOME_UNKNOWN and cannot reinsert records because sequence watermarks remain. Keep the original token, message ID and payload when retrying `OutcomeUnknown`; reconnecting never changes them automatically. No Q1-to-Q0 fallback occurs.
 
-`COMMITTED_LOCAL` follows synchronization of the message, scoped producer outcome, manifest and directory. It survives a process crash with the same intact functioning storage; permanent disk loss and physical power-loss certification are outside this evidence. Never reuse an old incarnation after lost history. The server requires an existing directory, holds an exclusive advisory lock, and refuses corrupted or incompatible committed storage without resetting it. The configured route is Q1-only; unsupported partitions/classes are rejected. The development identity can publish only in tenant 1; Q1 topic IDs must exceed the fixed Q0 IDs 1 and 2. TTL must be 1–30000 ms. Q1 admission allows 64 queued/active commands and 4 MiB of retained payload capacity plus record/outcome overhead; saved outcomes have a hard 100000-entry limit with no eviction.
+`COMMITTED_LOCAL` follows synchronization of the message, scoped producer outcome, manifest and directory. It survives a process crash with the same intact functioning storage; permanent disk loss and physical power-loss certification are outside this evidence. Never reuse an old incarnation after lost history. Startup resumes existing history by default and rejects a missing manifest without recreating it. `--q1-initialize-new-log true` explicitly initializes only an empty new directory with a fresh caller-allocated incarnation; it never resets existing storage. The server requires an existing directory, holds an exclusive advisory lock, and refuses corrupted or incompatible committed storage without resetting it. The configured route is Q1-only; unsupported partitions/classes are rejected. The development identity can publish only in tenant 1; Q1 topic IDs must exceed the fixed Q0 IDs 1 and 2. TTL must be 1–30000 ms. Q1 admission allows 64 queued/active commands and 4 MiB of retained payload capacity plus record/outcome overhead; producer watermarks and unexpired saved outcomes each have a configurable hard 100000-entry default limit, with no eviction of unexpired outcomes.
 
 Storage startup and shutdown run on blocking workers; per-request results use asynchronous replies. Q0 never calls WAL or waits for its barriers. Existing `BROKER_METRICS` counters cover Q0; Q1 results are verified through the SDK and independent ACK journal. Shutdown stops ingress and drains accepted Q1 work; unresolved storage after the five-second final drain deadline causes a non-successful process exit and requires recovery. A lost reply during shutdown is an uncertain outcome.
 
@@ -162,3 +162,10 @@ conservative per-session envelope. This validates a configured bound rather than
 reserving RAM or certifying capacity. The runner also checks available memory
 headroom; loopback enforcement remains mandatory. Optional
 `--metrics-interval-ms 250` emits bounded-frequency `BROKER_METRICS` JSON to stderr.
+
+The Q1 actor also supports bounded read-only committed-history replay through
+`Partition::try_replay`, including message-only results, incarnation checks and explicit
+available-history end. B-04 remains IN_PROGRESS: major-1 FETCH/MESSAGE require real
+consumer-group state and have no standalone replay completion frame. TCP/SDK replay is
+therefore not exposed; group FETCH/ACK operations fail explicitly rather than minting
+placeholder leases. See [the replay contract](docs/architecture/06-q1-storage.md).

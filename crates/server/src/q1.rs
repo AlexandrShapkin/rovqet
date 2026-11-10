@@ -27,6 +27,7 @@ pub struct Options {
     pub dedup_window: Duration,
     pub max_producers: usize,
     pub max_outcomes: usize,
+    pub initialize_new_log: bool,
 }
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
@@ -67,6 +68,12 @@ impl Options {
                 .parse()
                 .map_err(|_| invalid("invalid Q1 incarnation"))?,
             owner_epoch: number("--q1-owner-epoch")?,
+            initialize_new_log: values
+                .get("--q1-initialize-new-log")
+                .map(|v| v.parse())
+                .transpose()
+                .map_err(|_| invalid("initialize-new-log must be true or false"))?
+                .unwrap_or(false),
             dedup_window: Duration::from_millis(
                 values
                     .get("--q1-dedup-window-ms")
@@ -114,6 +121,19 @@ impl Route {
     /// Blocking startup: acquire exclusive ownership, validate/recover storage, then allow session processing.
     pub fn open(options: Options) -> io::Result<Self> {
         let dir = std::fs::canonicalize(&options.directory)?;
+        // Resuming an incarnation is fail-closed even if every WAL file was lost.
+        // Explicit initialization is only for new empty storage with a caller-allocated fresh incarnation.
+        if options.initialize_new_log {
+            if std::fs::read_dir(&dir)?.next().is_some() {
+                return Err(invalid(
+                    "new-log initialization requires an empty directory and fresh incarnation",
+                ));
+            }
+        } else if !dir.join("MANIFEST").is_file() {
+            return Err(io::Error::other(
+                "REPLAY_NOT_AVAILABLE: existing Q1 history missing; no automatic initialization",
+            ));
+        }
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
@@ -126,6 +146,15 @@ impl Route {
                 format!("Q1 storage already owned or locking unavailable: {e}"),
             )
         })?;
+        if options.initialize_new_log {
+            for entry in std::fs::read_dir(&dir)? {
+                if entry?.file_name() != "SERVER.lock" {
+                    return Err(invalid(
+                        "new-log initialization raced with existing history",
+                    ));
+                }
+            }
+        }
         // Persist the caller-created directory and lock entry. No data-directory creation or reset.
         if let Some(parent) = dir.parent() {
             File::open(parent)?.sync_all()?;
@@ -148,11 +177,17 @@ impl Route {
         #[cfg(feature = "fault-injection")]
         let partition = if let Some(control) = test_control()? {
             Partition::open_with_test_control(&dir, wal, config, control)
-        } else {
+        } else if options.initialize_new_log {
             Partition::open(&dir, wal, config)
+        } else {
+            Partition::open_existing(&dir, wal, config)
         };
         #[cfg(not(feature = "fault-injection"))]
-        let partition = Partition::open(&dir, wal, config);
+        let partition = if options.initialize_new_log {
+            Partition::open(&dir, wal, config)
+        } else {
+            Partition::open_existing(&dir, wal, config)
+        };
         let partition = partition.map_err(|e| {
             io::Error::other(format!("Q1 recovery failed (history preserved): {e}"))
         })?;
@@ -288,6 +323,7 @@ fn map_error(error: DurableError) -> ErrorCode {
         DurableError::SequenceGap => ErrorCode::SequenceGap,
         DurableError::SequenceConflict => ErrorCode::SequenceConflict,
         DurableError::OutcomeUnavailable => ErrorCode::OutcomeUnknown,
+        DurableError::HistoryUnavailable => ErrorCode::ReplayNotAvailable,
         DurableError::Capacity => ErrorCode::ResourceExhausted,
         DurableError::Expired => ErrorCode::ExpiredBeforeDelivery,
         DurableError::Unavailable | DurableError::InvalidConfig | DurableError::WorkerStart(_) => {
@@ -333,6 +369,17 @@ impl SessionHandler for Dispatch {
         frame: Frame,
         outbound: Outbound,
     ) -> SessionReply {
+        // Major-1 durable MESSAGE requires a real group/generation/lease. Until B-05
+        // there is no legal standalone FETCH response or terminal batch frame.
+        if matches!(
+            frame.frame_type,
+            FrameType::Fetch
+                | FrameType::ConsumerAck
+                | FrameType::ConsumerNack
+                | FrameType::ExtendLease
+        ) {
+            return SessionReply::Immediate(Err(ErrorCode::UnsupportedCapability));
+        }
         if frame.frame_type == FrameType::Publish {
             if self.draining.load(Ordering::Acquire) {
                 return SessionReply::Immediate(Err(ErrorCode::ServerDraining));
@@ -435,6 +482,7 @@ mod tests {
             }
         );
         assert_eq!(parsed.incarnation, 42);
+        assert!(!parsed.initialize_new_log);
         for key in config.keys() {
             let mut incomplete = config.clone();
             incomplete.remove(key);
@@ -461,6 +509,7 @@ mod tests {
         std::fs::create_dir(&path).unwrap();
         let mut options = Options::parse(&values()).unwrap().unwrap();
         options.directory = path.clone();
+        options.initialize_new_log = true;
         let route = Route::open(options).unwrap();
         let mut frame = Frame::new(FrameType::Publish, 1);
         frame.fields = vec![
@@ -559,6 +608,29 @@ mod tests {
         assert_eq!(wal.committed_position().unwrap().sequence, 1);
         drop(wal);
         std::fs::remove_dir_all(path).unwrap();
+    }
+    #[test]
+    fn resumption_never_initializes_missing_history_and_initialization_never_resets_it() {
+        let root = std::env::temp_dir().join(format!("rovqet-route-resume-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("wal");
+        std::fs::create_dir(&path).unwrap();
+        let mut options = Options::parse(&values()).unwrap().unwrap();
+        options.directory = path.clone();
+        assert!(Route::open(options.clone()).is_err());
+        assert_eq!(std::fs::read_dir(&path).unwrap().count(), 0);
+        options.initialize_new_log = true;
+        Route::open(options.clone()).unwrap().shutdown().unwrap();
+        let manifest = std::fs::read(path.join("MANIFEST")).unwrap();
+        assert!(Route::open(options.clone()).is_err());
+        assert_eq!(std::fs::read(path.join("MANIFEST")).unwrap(), manifest);
+        options.initialize_new_log = false;
+        Route::open(options.clone()).unwrap().shutdown().unwrap();
+        std::fs::rename(&path, root.join("unavailable-history")).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(Route::open(options).is_err());
+        assert_eq!(std::fs::read_dir(&path).unwrap().count(), 0);
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn admitted_storage_failures_are_uncertain_but_unavailable_is_explicit() {

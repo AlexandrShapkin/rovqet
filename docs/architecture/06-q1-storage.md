@@ -168,3 +168,75 @@ starts at sequence zero and fences only after its first successful durable commi
 restart/rollback/unavailable evidence, separate quotas, recovered high-water/fencing,
 and 512 concurrent retries with one durable pair. Existing model, actor fault and
 independent TCP ACK-journal/SIGKILL fixtures continue to verify stable original offsets.
+
+## B-04 actor-owned committed replay (wire integration pending)
+
+`Partition::try_replay(ReplayRequest)` submits to the same storage owner as publication.
+The request carries the exact `PartitionRef`, incarnation-bearing starting offset,
+message/response-byte limits and optional wait. Results are typed `ReplayBatch` /
+`ReplayError`; there are no deliveries, leases, group generations or consumer ACKs.
+Each `ReplayMessage.offset` and `ReplayBatch.next` retains the incarnation.
+
+The B-02 mapping is now explicit: MESSAGE offsets are `0,2,4,...`; each associated
+PRODUCER_OUTCOME occupies the next odd offset. Continuation advances by two per message.
+An odd offset is not an application cursor. Internal outcomes are validated but never
+returned or counted against the application message limit. Reads use the existing
+WAL-derived committed record index, one complete verified pair at a time, across
+segments. Both recovery and runtime reads share the exact v1 pair-binding validator.
+A checksum/binding failure returns no partial batch, poisons the partition, and leaves
+storage unchanged. The actor advances its visible end only after the durability barrier.
+
+Hard request ceilings are 1024 messages, 4 MiB response charge and 30 seconds wait.
+Zero messages, less than 128 response bytes and over-limit requests are InvalidLimits.
+Response charge is 128 batch bytes plus 128 bytes per message plus payload length;
+these conservative application/memory charges are **not wire frame sizes**. Message
+count and byte limits both apply. The first message exceeding the limit returns
+ResponseTooSmall with the required charge; no false empty/end response is fabricated.
+Admission additionally reserves bounded WAL decoding scratch and the preallocated
+message vector. Pending requests, waits, channel-held responses and returned batches
+retain reservations against the shared partition message/byte budget until dropped.
+Oversized aggregate requests return Capacity before allocation/IO. A caller can exhaust
+its own partition budget by retaining batches, but cannot silently allocate broker
+responses without reservations. Queue limits may be stricter than the hard API ceiling.
+
+`from == committed_end` returns an empty batch with `end_of_available_history=true` and
+the same incarnation-bearing continuation, or waits until publication/deadline/shutdown.
+`from > end` or an odd offset returns ReplayNotAvailable; a stale incarnation returns
+IncarnationMismatch. End refers to a serialized committed snapshot, not permanent EOF.
+There is currently no retention deletion, so every earlier even committed offset is
+available. Waits live in bounded actor-owned pending state and do not block publications.
+Idle waits poll at most every 10 ms for cancellation/deadline; shutdown resolves waiting
+reads immediately against the final drained snapshot. Dropping a waiter cancels read-only
+work before IO when possible, or discards an already executing result. Filesystem IO
+itself is blocking and cannot promise a hard OS-level cancellation/latency bound.
+
+`Partition::open_existing` refuses missing MANIFEST/history with HistoryUnavailable and
+never initializes a replacement log. The TCP server likewise resumes by default; an
+empty replacement directory is REPLAY_NOT_AVAILABLE even if all old files disappeared.
+`--q1-initialize-new-log true` is deliberate initialization of **new empty storage**,
+requiring the caller to allocate a fresh incarnation; it refuses nonempty directories.
+This is not a reset/erase operation or an incarnation allocator. No reset API, automatic
+data deletion or offset continuity across independent incarnations exists. Incarnation
+allocation remains configuration authority's responsibility; the broker cannot prove
+global uniqueness after loss of every copy of configuration/storage. An intact ordinary
+restart reuses its configured identity and committed index.
+
+**Precise integration blocker:** frozen major-1 FETCH requires group_id; durable MESSAGE
+requires group_id, generation and lease_id; there is no registered standalone replay batch
+or completion/end-of-history frame. Emitting placeholder groups/leases or an empty MESSAGE
+would violate that contract. The server therefore explicitly rejects FETCH/CONSUMER_ACK/
+CONSUMER_NACK/EXTEND_LEASE with UNSUPPORTED_CAPABILITY. No SDK standalone replay API is
+claimed. B-04 stays **IN_PROGRESS** until an approved standalone read-only request/result
+contract (including authorization, per-frame limits, batching and terminal response) is
+specified and implemented, or the real B-05 group model makes the existing wire legal.
+B-05 implementation remains blocked by the roadmap; do not fabricate group state to
+close B-04. The next bounded work is the standalone wire contract correction, not B-05.
+
+Actor proofs cover clean/SIGKILL recovery against the independent ACK journal, segment
+boundaries, message/byte limits, metadata exclusion, empty/end/invalid ranges, stale
+incarnation, committed message/outcome corruption, incomplete uncommitted tail, concurrent
+publication, cancellation/retained-response quotas, asynchronous wait and bounded wait
+expiry/shutdown. Fault-enabled tests hold an unsynced append and prove queued replay cannot
+expose it; cancellation releases the retained read budget. Disposable loss fixtures never
+invoke broker deletion or reset operations. TCP tests prove unsupported group operations
+and fail-closed lost-history startup, not SDK replay compatibility.

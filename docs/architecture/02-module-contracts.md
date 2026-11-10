@@ -134,3 +134,15 @@ Typed errors distinguish write, synchronization/publication uncertainty, capacit
 The opt-in server route validates the authenticated development principal, configured topic/partition, Q1 class, incarnation, ownership epoch and TTL before bounded submission. `try_publish_before` carries a monotonic deadline; expired fresh queued work does not append, while an already committed retry can return its established result. `PendingPublish::wait_async` awaits a Tokio oneshot without occupying a blocking worker. `SessionHandler::request` defaults to an immediate result for Q0 and permits a deferred future for Q1. Accepted durable operations survive dropped response receivers.
 
 The actor persists paired message/outcome records and reconstructs scoped results on restart. It has no eviction or advertised timed dedup window: exhausted outcome capacity rejects new tokens. The server owns an exclusive advisory `SERVER.lock` through recovery and drain. Startup and final actor shutdown run through `spawn_blocking`; the Q0 crate has no filesystem dependency. Durable consumer delivery, replay/FETCH and Q2 remain unsupported.
+
+### B-04 concrete read-only actor API
+
+`rovqet_durable::Partition::try_replay(ReplayRequest)` returns `PendingReplay` with blocking
+and asynchronous waits. Requests specify partition, `DurableOffset`, maximum messages,
+maximum response charge and bounded wait. `ReplayBatch` contains only `ReplayMessage`
+values, an incarnation-bearing next offset, charged bytes and explicit available-history
+end. Typed errors distinguish invalid limits/ranges, stale incarnation, capacity, too-small
+response, unavailable storage and corruption. The actor serializes reads with commits;
+returned batches retain their budget reservation. `open_existing` fails on missing history
+rather than creating it. Detailed offset, memory, cancellation and wire boundaries are in
+[06](06-q1-storage.md). No consumer ACK or group mutation is implied by this interface.

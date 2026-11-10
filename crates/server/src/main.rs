@@ -81,7 +81,8 @@ impl Options {
                 | "--q1-owner-epoch"
                 | "--q1-dedup-window-ms"
                 | "--q1-max-producers"
-                | "--q1-max-outcomes" => {
+                | "--q1-max-outcomes"
+                | "--q1-initialize-new-log" => {
                     q1_values.insert(pair[0].clone(), pair[1].clone());
                 }
                 _ => return Err(invalid("unknown option; see --help")),
@@ -203,6 +204,7 @@ async fn main() -> io::Result<()> {
             "  Q1 opt-in (all required): --q1-data-dir EXISTING_DIR --q1-topic NAME\n",
             "    --q1-tenant-id 1 --q1-topic-id ID --q1-partition-id ID\n",
             "    --q1-incarnation U128 --q1-owner-epoch U64\n",
+            "    [--q1-initialize-new-log true] ONLY for new empty storage and a fresh incarnation\n",
             "    [--q1-dedup-window-ms 86400000 --q1-max-producers 100000 --q1-max-outcomes 100000]\n",
             "Development only: plaintext, static dev identity, loopback required.\n",
             "Q0 topics: demo, telemetry. Default connection limit: 1024.\n",

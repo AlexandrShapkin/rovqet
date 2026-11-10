@@ -41,6 +41,8 @@ class Broker:
         self.wal = Path(data_directory) if data_directory else directory / "wal"
         self.controls = directory / "controls"
         self.controls.mkdir(exist_ok=True)
+        # Explicit test authorization only for a newly allocated disposable directory.
+        initialize_new_log = data_directory is None and not self.wal.exists()
         if data_directory is None:
             self.wal.mkdir(exist_ok=True)
         self.lines = []
@@ -62,6 +64,8 @@ class Broker:
                         "--q1-tenant-id", "1", "--q1-topic-id", "3",
                         "--q1-partition-id", "0", "--q1-incarnation", str(incarnation),
                         "--q1-owner-epoch", "7"]
+            if initialize_new_log:
+                command += ["--q1-initialize-new-log", "true"]
         self.process = subprocess.Popen(command, env=env, stdout=subprocess.DEVNULL,
                                         stderr=subprocess.PIPE, text=True)
         self.reader = threading.Thread(target=self._read, daemon=True)

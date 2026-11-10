@@ -50,6 +50,12 @@
 
 **B-04 — Replay and log incarnation** (depends B-02). \`FETCH\` by incarnation+offset/limits and bounded segments; REPLAY_NOT_AVAILABLE for expired or lost Q1 history; explicit reset after permanent owner loss. Proof: stable replay after crash, no same-incarnation continuity with unrecoverable history.
 
+B-04 implementation boundary: the bounded actor read API, sparse MESSAGE offset mapping,
+incarnation validation and crash/lost-history proofs are implemented. Task remains
+IN_PROGRESS: frozen FETCH requires group_id and durable MESSAGE requires generation/lease;
+a standalone read-only batch/end wire contract must be corrected before TCP/SDK integration.
+B-05 implementation remains blocked; do not invent leases to satisfy B-04.
+
 **B-05 — Durable group lease/ACK/cursor** (depends B-03,B-04). Lease tokens, generation fencing, bounded sparse ACK set, contiguous cursor durable barrier and idempotent duplicate ACK read. Proof: out-of-order ACK gap, stale generation, crash before/after fsync result, redelivery.
 
 **B-06 — Q1 terminal disposition** (depends B-05). Retry/NACK, quarantine and DLQ idempotent two-step protocol using Q1; keep source incomplete if DLQ fails. Proof: crash between DLQ commit and terminal record, no cursor skip. Can follow first Q1 PoC if strict time pressure; cannot claim terminal support until tested.

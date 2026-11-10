@@ -93,3 +93,14 @@ An identical frame codec works over TCP/TLS and QUIC reliable streams. QUIC DATA
 The opt-in TCP Q1 route uses the existing major-1 registry. In addition to the generic PUBLISH fields and producer ID/epoch/sequence, this directly addressed profile requires partition_id, log_incarnation and ownership_epoch. The server resolves topic_name against its explicit Q1 configuration and binds principal from successful AUTH; request identity claims cannot replace it. Successful Q1 PUB_ACK includes tenant/topic/partition IDs, incarnation and message offset with the exact request ID. No frame/field IDs or existing golden bytes changed.
 
 `Client::publish_q1(topic, payload, Q1PublishOptions)` requires caller-owned producer ID, epoch, sequence, message ID, partition, incarnation, owner epoch and TTL. It validates response correlation, Q1/COMMITTED_LOCAL, partition and incarnation before decoding the offset. Transport loss, timeout, malformed/contradictory responses and OUTCOME_UNKNOWN errors produce `ClientError::OutcomeUnknown` and close the uncertain connection. Reconnect preserves caller-owned options; retry must explicitly reuse the original token and content. Definitive server errors remain typed. The original Q0 publish API remains compatible. B-03's timed dedup window and B-04 FETCH are not implemented by this API.
+
+## B-04 standalone replay integration boundary
+
+The storage actor has a complete typed read-only replay API with bounded results and
+incarnation-bearing sparse MESSAGE offsets (see [06](06-q1-storage.md)). It is not yet
+exposed through the Rust SDK or TCP: the major-1 registry requires a real group on FETCH
+and a generation/lease on durable MESSAGE, and supplies no replay batch completion frame.
+These cannot be populated without real group state. FETCH and group ACK operations return
+UNSUPPORTED_CAPABILITY. B-04 remains IN_PROGRESS. Specify an authorized standalone
+request/result/end contract as a narrow registry correction before wire implementation;
+do not invent lease semantics or start B-05 to evade its prerequisites.

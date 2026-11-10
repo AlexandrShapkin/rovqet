@@ -167,3 +167,9 @@ disposition publication attributes are rejected. Expired producer outcomes use e
 OUTCOME_UNKNOWN (13), never an invented success or a fresh insertion. The configured
 24-hour-default window and independent producer/outcome quotas are advertised by the
 operator-facing startup diagnostic and CLI; major 1 has no route-policy discovery field.
+
+B-04 actor replay does not alter this registry. Major-1 FETCH's required group and durable
+MESSAGE's generation/lease cannot represent a standalone read-only batch or its terminal
+end result. Until a compatible standalone contract is approved, the TCP server rejects
+FETCH and group ACK/NACK/lease operations with UNSUPPORTED_CAPABILITY. No placeholder lease,
+synthetic consumer ACK, unregistered frame or SDK replay success is emitted.

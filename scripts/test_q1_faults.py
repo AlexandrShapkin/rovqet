@@ -367,6 +367,41 @@ class Q1ProcessFaults(unittest.TestCase):
         self.assertEqual(manifest_record_count(broker.wal), 2)
         broker.stop()
 
+    def test_lost_entire_history_is_not_silently_recreated(self):
+        broker = self.broker()
+        committed(broker.publish(), 0)
+        journal_ack(self.directory / "received-acks.jsonl", 0, 0)
+        broker.stop()
+        # Isolated disposable loss fixture. The broker itself never renames/deletes storage.
+        broker.wal.rename(self.directory / "unavailable-wal")
+        broker.wal.mkdir()
+        rejected = Broker(self.directory)
+        self.brokers.append(rejected)
+        diagnostics = rejected.reject_startup()
+        self.assertIn("REPLAY_NOT_AVAILABLE", diagnostics)
+        self.assertEqual(list(broker.wal.iterdir()), [])
+        self.assertTrue((self.directory / "unavailable-wal" / "MANIFEST").exists())
+
+    def test_group_fetch_and_ack_are_explicitly_unsupported_without_fake_leases(self):
+        broker = self.broker()
+        committed(broker.publish(), 0)
+        with connect(broker) as connection:
+            fetch = {9: b"durable", 19: (0).to_bytes(4, "big"),
+                     24: (1).to_bytes(8, "big"), 20: (42).to_bytes(16, "big"),
+                     21: (0).to_bytes(8, "big"), 31: (8).to_bytes(4, "big"),
+                     32: (2048).to_bytes(4, "big")}
+            ack = {9: b"durable", 19: (0).to_bytes(4, "big"),
+                   24: (1).to_bytes(8, "big"), 25: (1).to_bytes(8, "big"),
+                   26: (1).to_bytes(16, "big"), 27: (7).to_bytes(8, "big"),
+                   20: (42).to_bytes(16, "big"), 21: (0).to_bytes(8, "big")}
+            for request, (kind, fields) in enumerate([(17, fetch), (13, ack), (15, ack), (16, ack)], 10):
+                connection.sendall(frame(kind, request, fields))
+                response, correlation, fields = read_frame(connection)
+                self.assertEqual((response, correlation), (20, request))
+                self.assertEqual(int.from_bytes(fields[28], "big"), 3)
+        self.assertEqual(manifest_record_count(broker.wal), 2)
+        broker.stop()
+
     def test_missing_storage_and_wrong_incarnation_fail_startup(self):
         missing = Broker(self.directory, data_directory=self.directory / "missing")
         self.brokers.append(missing)

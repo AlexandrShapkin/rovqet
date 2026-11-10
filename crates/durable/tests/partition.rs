@@ -362,6 +362,19 @@ fn acknowledged_publication_recovers_after_sigkill_against_independent_journal()
     );
     let p = Partition::open(t.0.join("wal"), wal_config(), actor_config()).unwrap();
     assert_eq!(publish(&p, request(0)).unwrap(), outcome(0));
+    let batch = p.try_replay(replay_request(0)).unwrap().wait().unwrap();
+    assert_eq!(batch.messages.len(), 1);
+    assert_eq!(
+        batch.messages[0].offset,
+        DurableOffset {
+            log_incarnation: 42,
+            sequence: 0
+        }
+    );
+    assert_eq!(batch.messages[0].message_id, request(0).message_id);
+    assert_eq!(batch.messages[0].payload, request(0).payload);
+    assert!(batch.end_of_available_history);
+    drop(batch);
     p.shutdown().unwrap();
     let w = Wal::open(t.0.join("wal"), wal_config()).unwrap();
     let rows = w
@@ -422,4 +435,371 @@ fn malformed_committed_publication_pairs_fail_recovery_without_discarding_histor
         let w = Wal::open(t.0.join("wal"), wal_config()).unwrap();
         assert_eq!(w.committed_position(), committed);
     }
+}
+
+fn replay_request(offset: u64) -> rovqet_durable::ReplayRequest {
+    rovqet_durable::ReplayRequest {
+        partition: partition_id(),
+        from: DurableOffset {
+            log_incarnation: 42,
+            sequence: offset,
+        },
+        max_messages: 8,
+        max_bytes: 2048,
+        wait: std::time::Duration::ZERO,
+    }
+}
+#[test]
+fn replay_clean_restart_crosses_segments_counts_only_messages_and_keeps_sparse_offsets() {
+    let t = Temp::new();
+    let p = open(&t);
+    for i in 0..7 {
+        publish(&p, request(i)).unwrap();
+    }
+    p.shutdown().unwrap();
+    assert!(
+        fs::read_dir(t.0.join("wal"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with("segment-"))
+            .count()
+            > 1
+    );
+    let p = Partition::open_existing(t.0.join("wal"), wal_config(), actor_config()).unwrap();
+    let mut cursor = 0;
+    let mut seen = Vec::new();
+    loop {
+        let mut r = replay_request(cursor);
+        r.max_messages = 2;
+        let batch = p.try_replay(r).unwrap().wait().unwrap();
+        assert!(batch.messages.len() <= 2);
+        assert!(batch.response_bytes <= 2048);
+        for message in &batch.messages {
+            assert_eq!(message.offset.log_incarnation, 42);
+            assert_eq!(message.offset.sequence, message.sequence * 2);
+            assert_eq!(message.payload, request(message.sequence).payload);
+            seen.push(message.message_id);
+        }
+        cursor = batch.next.sequence;
+        if batch.end_of_available_history {
+            break;
+        }
+    }
+    assert_eq!(cursor, 14);
+    assert_eq!(
+        seen,
+        (0..7).map(|i| request(i).message_id).collect::<Vec<_>>()
+    );
+    let end = p
+        .try_replay(replay_request(cursor))
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert!(end.messages.is_empty() && end.end_of_available_history);
+    assert_eq!(end.next.sequence, 14);
+}
+#[test]
+fn replay_empty_history_invalid_offsets_incarnation_partition_and_limits_are_typed() {
+    use rovqet_durable::ReplayError;
+    let t = Temp::new();
+    let p = open(&t);
+    let batch = p.try_replay(replay_request(0)).unwrap().wait().unwrap();
+    assert!(batch.messages.is_empty() && batch.end_of_available_history);
+    assert_eq!(batch.next.sequence, 0);
+    drop(batch);
+    for offset in [1, 2, u64::MAX] {
+        assert!(matches!(
+            p.try_replay(replay_request(offset)).unwrap().wait(),
+            Err(ReplayError::ReplayNotAvailable)
+        ));
+    }
+    let mut r = replay_request(0);
+    r.from.log_incarnation = 41;
+    assert!(matches!(
+        p.try_replay(r).unwrap().wait(),
+        Err(ReplayError::IncarnationMismatch)
+    ));
+    let mut r = replay_request(0);
+    r.partition.partition_id += 1;
+    assert!(matches!(p.try_replay(r), Err(ReplayError::WrongPartition)));
+    for (messages, bytes, wait) in [
+        (0, 2048, 0),
+        (1025, 2048, 0),
+        (8, 0, 0),
+        (8, 4 * 1024 * 1024 + 1, 0),
+        (8, 2048, 30001),
+    ] {
+        let mut r = replay_request(0);
+        r.max_messages = messages;
+        r.max_bytes = bytes;
+        r.wait = std::time::Duration::from_millis(wait);
+        assert!(matches!(p.try_replay(r), Err(ReplayError::InvalidLimits)));
+    }
+    publish(&p, request(0)).unwrap();
+    assert!(matches!(
+        p.try_replay(replay_request(1)).unwrap().wait(),
+        Err(ReplayError::ReplayNotAvailable)
+    ));
+}
+#[test]
+fn replay_byte_limits_are_exact_and_oversize_first_message_is_not_a_false_empty_end() {
+    use rovqet_durable::{REPLAY_BATCH_BYTES, REPLAY_MESSAGE_BYTES, ReplayError};
+    let t = Temp::new();
+    let p = open(&t);
+    for i in 0..3 {
+        publish(&p, request(i)).unwrap();
+    }
+    let bytes = REPLAY_BATCH_BYTES + REPLAY_MESSAGE_BYTES + request(0).payload.len();
+    let mut r = replay_request(0);
+    r.max_bytes = bytes;
+    let batch = p.try_replay(r.clone()).unwrap().wait().unwrap();
+    assert_eq!(batch.messages.len(), 1);
+    assert_eq!(batch.response_bytes, bytes);
+    assert_eq!(batch.next.sequence, 2);
+    assert!(!batch.end_of_available_history);
+    drop(batch);
+    r.max_bytes -= 1;
+    assert!(
+        matches!(p.try_replay(r).unwrap().wait(), Err(ReplayError::ResponseTooSmall { required_bytes }) if required_bytes == bytes)
+    );
+}
+#[test]
+fn waiting_replay_yields_to_publication_shutdown_and_cancellation_without_leases() {
+    let t = Temp::new();
+    let p = open(&t);
+    let mut r = replay_request(0);
+    r.wait = std::time::Duration::from_secs(30);
+    let pending = p.try_replay(r.clone()).unwrap();
+    publish(&p, request(0)).unwrap(); // a waiting read never blocks the publisher
+    let batch = pending.wait().unwrap();
+    assert_eq!(batch.messages[0].message_id, request(0).message_id);
+    assert!(batch.end_of_available_history);
+    drop(batch);
+    r.from.sequence = 2;
+    let cancelled = p.try_replay(r.clone()).unwrap();
+    drop(cancelled);
+    // A subsequent actor reply fences the cancelled request's queue traversal.
+    drop(p.try_replay(replay_request(2)).unwrap().wait().unwrap());
+    let waiting = p.try_replay(r).unwrap();
+    p.shutdown().unwrap(); // no 30-second wait on shutdown
+    let batch = waiting.wait().unwrap();
+    assert!(batch.messages.is_empty() && batch.end_of_available_history);
+}
+#[test]
+fn replay_wait_deadline_returns_explicit_empty_available_end() {
+    let t = Temp::new();
+    let p = open(&t);
+    let mut r = replay_request(0);
+    r.wait = std::time::Duration::from_millis(1);
+    let batch = p.try_replay(r).unwrap().wait().unwrap();
+    assert!(batch.messages.is_empty() && batch.end_of_available_history);
+}
+#[test]
+fn replay_batch_and_cancelled_waiter_retain_and_release_explicit_memory_quota() {
+    use rovqet_durable::ReplayError;
+    let t = Temp::new();
+    fs::create_dir(t.0.join("wal")).unwrap();
+    let mut config = actor_config();
+    config.queue_messages = 1;
+    let p = Partition::open(t.0.join("wal"), wal_config(), config).unwrap();
+    let batch = p.try_replay(replay_request(0)).unwrap().wait().unwrap();
+    assert_eq!(p.usage().messages, 1);
+    assert!(p.usage().bytes >= 2048);
+    assert!(matches!(
+        p.try_replay(replay_request(0)),
+        Err(ReplayError::Capacity)
+    ));
+    assert!(matches!(p.try_publish(request(0)), Err(Error::Capacity)));
+    drop(batch);
+    assert_eq!(p.usage().messages, 0);
+    let mut too_big = replay_request(0);
+    too_big.max_bytes = 8192;
+    assert!(matches!(p.try_replay(too_big), Err(ReplayError::Capacity)));
+    publish(&p, request(0)).unwrap();
+}
+#[test]
+fn replay_live_committed_corruption_poisoning_never_returns_partial_history() {
+    use rovqet_durable::ReplayError;
+    for internal in [false, true] {
+        let t = Temp::new();
+        let p = open(&t);
+        publish(&p, request(0)).unwrap();
+        let path = fs::read_dir(t.0.join("wal"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|e| e.file_name().to_string_lossy().starts_with("segment-"))
+            .unwrap()
+            .path();
+        let mut bytes = fs::read(&path).unwrap();
+        let at = rovqet_wal::HEADER_BYTES
+            + if internal {
+                rovqet_wal::RECORD_OVERHEAD + request(0).payload.len()
+            } else {
+                0
+            };
+        bytes[at + 8] ^= 1;
+        fs::write(&path, &bytes).unwrap();
+        assert!(matches!(
+            p.try_replay(replay_request(0)).unwrap().wait(),
+            Err(ReplayError::Storage(_))
+        ));
+        assert!(matches!(
+            p.try_replay(replay_request(0)).unwrap().wait(),
+            Err(ReplayError::Unavailable)
+        ));
+        assert!(matches!(publish(&p, request(1)), Err(Error::Unavailable)));
+        p.shutdown().unwrap();
+        assert!(Partition::open_existing(t.0.join("wal"), wal_config(), actor_config()).is_err());
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+}
+#[test]
+fn replay_discards_uncommitted_incomplete_tail_and_missing_history_is_never_initialized() {
+    let t = Temp::new();
+    let p = open(&t);
+    publish(&p, request(0)).unwrap();
+    p.shutdown().unwrap();
+    let mut wal = Wal::open(t.0.join("wal"), wal_config()).unwrap();
+    wal.append(rovqet_wal::Record {
+        kind: RecordKind::Message,
+        logical_offset: 2,
+        owner_epoch: 7,
+        producer_id: 11,
+        producer_epoch: 0,
+        sequence: 1,
+        message_id: 101,
+        server_timestamp: 1,
+        payload: b"uncommitted".to_vec(),
+    })
+    .unwrap();
+    drop(wal);
+    let p = Partition::open_existing(t.0.join("wal"), wal_config(), actor_config()).unwrap();
+    let batch = p.try_replay(replay_request(0)).unwrap().wait().unwrap();
+    assert_eq!(batch.messages.len(), 1);
+    assert_eq!(batch.next.sequence, 2);
+    drop(batch);
+    p.shutdown().unwrap();
+    // Disposable loss fixture: move history aside; no broker reset/delete operation exists.
+    fs::rename(t.0.join("wal"), t.0.join("lost-wal")).unwrap();
+    assert!(Partition::open_existing(t.0.join("wal"), wal_config(), actor_config()).is_err());
+    fs::create_dir(t.0.join("wal")).unwrap();
+    assert!(Partition::open_existing(t.0.join("wal"), wal_config(), actor_config()).is_err());
+    assert_eq!(fs::read_dir(t.0.join("wal")).unwrap().count(), 0);
+    fs::rename(t.0.join("wal"), t.0.join("empty")).unwrap();
+    fs::rename(t.0.join("lost-wal"), t.0.join("wal")).unwrap();
+    let mut wrong = wal_config();
+    wrong.incarnation += 1;
+    assert!(Partition::open_existing(t.0.join("wal"), wrong, actor_config()).is_err());
+}
+
+#[test]
+fn fresh_disposable_incarnation_never_accepts_an_old_replay_reference() {
+    use rovqet_durable::ReplayError;
+    let t = Temp::new();
+    let p = open(&t);
+    publish(&p, request(0)).unwrap();
+    p.shutdown().unwrap();
+    // Explicit test authorization: independent disposable directory and fresh incarnation.
+    let fresh = t.0.join("independent-new-incarnation");
+    fs::create_dir(&fresh).unwrap();
+    let mut wal = wal_config();
+    wal.incarnation = 43;
+    let p = Partition::open(fresh, wal, actor_config()).unwrap();
+    assert!(matches!(
+        p.try_replay(replay_request(0)).unwrap().wait(),
+        Err(ReplayError::IncarnationMismatch)
+    ));
+    let mut r = request(0);
+    r.producer_id = 99;
+    publish(&p, r).unwrap();
+    let mut r = replay_request(0);
+    r.from.log_incarnation = 43;
+    let batch = p.try_replay(r).unwrap().wait().unwrap();
+    assert_eq!(batch.messages[0].offset.log_incarnation, 43);
+    assert_eq!(batch.messages[0].offset.sequence, 0);
+    assert!(
+        std::mem::size_of::<rovqet_durable::ReplayMessage>()
+            <= rovqet_durable::REPLAY_MESSAGE_BYTES
+    );
+    assert!(
+        std::mem::size_of::<rovqet_durable::ReplayBatch>() <= rovqet_durable::REPLAY_BATCH_BYTES
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn asynchronous_replay_wait_yields_and_completes_after_concurrent_commit() {
+    let t = Temp::new();
+    let p = open(&t);
+    let mut r = replay_request(0);
+    r.wait = std::time::Duration::from_secs(30);
+    let read = p.try_replay(r).unwrap();
+    let publication = p.try_publish(request(0)).unwrap();
+    assert_eq!(publication.wait_async().await.unwrap(), outcome(0));
+    let batch = read.wait_async().await.unwrap();
+    assert_eq!(batch.messages.len(), 1);
+    drop(batch);
+    // Blocking shutdown is dispatched away from this single runtime worker.
+    tokio::task::spawn_blocking(move || p.shutdown().unwrap())
+        .await
+        .unwrap();
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn replay_queued_during_unsynced_append_cannot_expose_it_and_cancellation_releases_budget() {
+    use rovqet_durable::{TestControl, TestStage};
+    use std::time::{Duration, Instant};
+    let t = Temp::new();
+    fs::create_dir(t.0.join("wal")).unwrap();
+    let controls = t.0.join("controls");
+    fs::create_dir(&controls).unwrap();
+    let p = Partition::open_with_test_control(
+        t.0.join("wal"),
+        wal_config(),
+        actor_config(),
+        TestControl {
+            directory: controls.clone(),
+            stage: Some(TestStage::AfterAppendBeforeSync),
+            sequence: 0,
+            wal_fault: None,
+        },
+    )
+    .unwrap();
+    let publication = p.try_publish(request(0)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !controls.join("reached-after-append-before-sync").exists() {
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    let read = p.try_replay(replay_request(0)).unwrap();
+    let cancelled = p.try_replay(replay_request(0)).unwrap();
+    drop(cancelled);
+    std::thread::scope(|scope| {
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        let reader = scope.spawn(move || {
+            send.send(read.wait()).unwrap();
+        });
+        assert!(matches!(
+            receive.recv_timeout(Duration::from_millis(20)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        fs::write(
+            controls.join("release-after-append-before-sync"),
+            b"release",
+        )
+        .unwrap();
+        assert_eq!(publication.wait().unwrap(), outcome(0));
+        let batch = receive
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch.messages.len(), 1);
+        assert_eq!(batch.messages[0].payload, request(0).payload);
+        drop(batch);
+        reader.join().unwrap();
+    });
+    // Later command completion fences cancellation cleanup as well as the successful read.
+    drop(p.try_replay(replay_request(2)).unwrap().wait().unwrap());
+    assert_eq!(p.usage().messages, 0);
+    p.shutdown().unwrap();
 }

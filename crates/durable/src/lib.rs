@@ -20,6 +20,12 @@ use std::{
 use tokio::sync::oneshot;
 
 const OUTCOME_BYTES: usize = 30;
+mod replay;
+use replay::ReplayCommand;
+pub use replay::{
+    MAX_REPLAY_BYTES, MAX_REPLAY_MESSAGES, MAX_REPLAY_WAIT, PendingReplay, REPLAY_BATCH_BYTES,
+    REPLAY_MESSAGE_BYTES, ReplayBatch, ReplayError, ReplayMessage, ReplayRequest,
+};
 
 struct WorkerOptions {
     clock: Arc<dyn Clock>,
@@ -89,6 +95,7 @@ pub enum Error {
     Corruption(&'static str),
     OutcomeUnknown,
     OutcomeUnavailable,
+    HistoryUnavailable,
     Unavailable,
     WorkerStart(std::io::Error),
 }
@@ -122,11 +129,15 @@ impl PendingPublish {
         self.reply.await.unwrap_or(Err(Error::OutcomeUnknown))
     }
 }
-struct Command {
+struct PublishCommand {
     request: PublishRequest,
     reply: oneshot::Sender<Result<PublishOutcome>>,
     deadline: Option<Instant>,
     _reservation: Reservation,
+}
+enum Command {
+    Publish(PublishCommand),
+    Replay(ReplayCommand),
 }
 /// One caller-owned handle; shared references may submit concurrently. No socket or Q0 dependencies.
 pub struct Partition {
@@ -137,13 +148,27 @@ pub struct Partition {
     max_record_bytes: usize,
 }
 impl Partition {
-    /// Blocking recovery and worker initialization. The WAL directory must already exist.
+    /// Explicit new-log initialization or recovery. The directory must already exist.
+    /// The caller allocates a fresh incarnation for new storage; this is never a reset API.
+    /// Resume a known incarnation with `open_existing` to fail closed on lost history.
     pub fn open(
         path: impl AsRef<Path>,
         wal_config: WalConfig,
         config: PartitionConfig,
     ) -> Result<Self> {
         Self::open_inner(path, wal_config, config, WorkerOptions::default())
+    }
+    /// Open already initialized history. Missing storage is unavailable, never recreated.
+    /// Use this entry point whenever an existing incarnation is being resumed.
+    pub fn open_existing(
+        path: impl AsRef<Path>,
+        wal_config: WalConfig,
+        config: PartitionConfig,
+    ) -> Result<Self> {
+        if !path.as_ref().join("MANIFEST").is_file() {
+            return Err(Error::HistoryUnavailable);
+        }
+        Self::open(path, wal_config, config)
     }
     /// Test-only deterministic storage barriers, unavailable in normal builds.
     #[cfg(feature = "fault-injection")]
@@ -219,10 +244,30 @@ impl Partition {
                         if ready_tx.send(Ok(())).is_err() {
                             return;
                         }
-                        while let Ok(command) = rx.recv() {
-                            let result = state.publish_before(command.request, command.deadline);
-                            drop(command._reservation);
-                            let _ = command.reply.send(result);
+                        let mut reads = Vec::new();
+                        loop {
+                            // Waiting reads never occupy the storage owner while idle. A short
+                            // bounded poll also releases cancelled response reservations promptly.
+                            let command = if reads.is_empty() {
+                                rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+                            } else {
+                                rx.recv_timeout(Duration::from_millis(10))
+                            };
+                            match command {
+                                Ok(Command::Publish(command)) => {
+                                    let result =
+                                        state.publish_before(command.request, command.deadline);
+                                    drop(command._reservation);
+                                    let _ = command.reply.send(result);
+                                }
+                                Ok(Command::Replay(command)) => reads.push(command),
+                                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                                    state.complete_replays(&mut reads, true);
+                                    break;
+                                }
+                            }
+                            state.complete_replays(&mut reads, false);
                         }
                     }
                 }
@@ -286,12 +331,12 @@ impl Partition {
             .ok_or(Error::Capacity)?;
         let reservation = Budget::reserve(&[self.budget.clone()], charge).ok_or(Error::Capacity)?;
         let (reply, rx) = oneshot::channel();
-        let command = Command {
+        let command = Command::Publish(PublishCommand {
             request,
             reply,
             deadline,
             _reservation: reservation,
-        };
+        });
         match self
             .sender
             .as_ref()
@@ -441,27 +486,11 @@ impl State {
             }
             let message = &records[0];
             let outcome = &records[1];
-            if message.kind != RecordKind::Message
-                || outcome.kind != RecordKind::ProducerOutcome
-                || outcome.payload.len() != OUTCOME_BYTES
-                || &outcome.payload[..4] != b"RQPO"
-                || outcome.payload[4..6] != [0, 1]
-            {
-                return Err(Error::Corruption("publication outcome format"));
-            }
-            let principal = u128::from_be_bytes(outcome.payload[6..22].try_into().unwrap());
-            let offset = u64::from_be_bytes(outcome.payload[22..30].try_into().unwrap());
-            if offset != message.logical_offset
-                || outcome.logical_offset != message.logical_offset + 1
-                || message.owner_epoch != outcome.owner_epoch
-                || message.producer_id != outcome.producer_id
-                || message.producer_epoch != outcome.producer_epoch
-                || message.sequence != outcome.sequence
-                || message.message_id != outcome.message_id
-                || message.server_timestamp != outcome.server_timestamp
-            {
+            if !replay::valid_pair(message, outcome) {
                 return Err(Error::Corruption("publication outcome binding"));
             }
+            let principal = u128::from_be_bytes(outcome.payload[6..22].try_into().unwrap());
+            let offset = message.logical_offset;
             if message.owner_epoch > self.config.ownership_epoch {
                 return Err(Error::StaleOwner);
             }
