@@ -159,3 +159,11 @@ Generate canonical vectors from a *reference encoder* and hand-checked decoder f
 
 
 B-02's implemented single-partition development route requires existing fields 19 (partition_id), 20 (log_incarnation) and 27 (ownership_epoch) on Q1 PUBLISH in addition to the generic row above. This fixes the direct-route profile without new numeric assignments. The Q1 response uses outcome 2 only after the actor barrier and includes the complete configured partition identity. General codec vectors remain unchanged; Q2 and consumer operations remain unsupported by the development server.
+
+B-03 preserves every numeric assignment and the v1 storage encoding. The direct Q1
+route validates optional field 41 against payload bytes on every attempt. Its effective
+routing/priority is fixed; TTL is an admission deadline. Unsupported group/lease/
+disposition publication attributes are rejected. Expired producer outcomes use existing
+OUTCOME_UNKNOWN (13), never an invented success or a fresh insertion. The configured
+24-hour-default window and independent producer/outcome quotas are advertised by the
+operator-facing startup diagnostic and CLI; major 1 has no route-policy discovery field.

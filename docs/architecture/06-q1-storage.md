@@ -114,3 +114,57 @@ TTL is 1–30000 ms and starts at bounded admission. Fresh work expiring before 
 Only an actor `CommittedLocal` result produces PUB_ACK `(qos=1, outcome=2, tenant_id, topic_id, partition_id, incarnation, message_offset)` with the original request ID. Storage write/sync uncertainty returns OUTCOME_UNKNOWN; subsequent unhealthy requests return STORAGE_UNAVAILABLE. A disconnected or timed-out SDK closes its uncertain stream and requires an explicit retry with identical producer token/message/payload. No automatic sequence change or Q0 downgrade occurs.
 
 The server locks the existing directory before opening WAL, synchronizes its parent/directory, and completes recovery before processing sessions. Corrupt or mismatched history fails startup; no automatic reset or deletion of committed history is performed. Network workers do not open files, synchronize storage or perform blocking actor waits. Shutdown stops admission/sessions and drains the bounded accepted queue on a blocking worker. Listener failures also drain and join sessions before the composition root regains exclusive storage ownership. If the final drain exceeds five seconds, the server exits unsuccessfully with unresolved outcomes; restart recovery is required. Fault-test controls are compiled only with the explicit `fault-injection` feature; normal builds reject their environment variables.
+
+## B-03 canonical retry and timed outcome retention
+
+The authenticated principal and configured manifest scope `(tenant, topic, partition, Q1,
+incarnation)` are authoritative. Within that scope the token is `(principal, producer ID,
+epoch, sequence)`; request IDs only correlate replies. Canonical content is the exact
+message ID and payload bytes (no collision-prone hash). Optional wire SHA-256 must match
+the actual payload independently on every request, including retries. A conflicting
+principal/tenant/topic claim is denied before admission. Wrong partition, class,
+incarnation or ownership epoch is rejected before append. This single direct route has
+fixed effective storage priority; partition-key and priority hints do not change its
+routing or durable attributes. TTL remains B-02's admission deadline, not a persisted
+message expiration attribute. Group/lease/disposition attributes are unsupported rather
+than accepted as silently discarded durable attributes. These prototype restrictions
+must be revisited before implementing general persisted message TTL/priority policies.
+
+`--q1-dedup-window-ms` defaults to **86400000 (24 hours)**; a smaller value explicitly
+selects a reduced research contract. The effective window and both quotas are advertised
+in the server's startup diagnostic and `--help`; the wire registry is unchanged. The
+Rust SDK documents this operator-advertised contract. There is no wire discovery of
+route policy in major 1. `--q1-max-producers` and `--q1-max-outcomes` each default to
+100000. Actor configuration exposes the same separate limits. Fixed-size map entries,
+the existing bounded WAL index and queued payload budgets bound memory; no unexpired
+outcome is evicted to admit work. Exhaustion returns RESOURCE_EXHAUSTED before append,
+while known identical retries remain resolvable.
+
+The existing paired-record `server_timestamp` is a conservative **logical millisecond
+clock**, not an authoritative UTC creation time. The binary record/outcome layout and
+version are unchanged. It starts at 1 in an empty log; recovery resumes the greatest
+persisted timestamp. Running monotonic elapsed time advances it; durability IO, process
+downtime, unavailable clock samples and backward intervals do not count. The timestamp
+assigned to the pair marks the window's entry; excluding barrier IO ensures at least the
+full configured duration following commit. An outcome expires when logical age is
+**greater than or equal to** the configured window. Expiration is checked on actor
+operations and during streaming recovery. Consequently real retention may be longer,
+including after restart; no wall-clock adjustment can shorten the promise. Zero legacy
+timestamps represent unavailable evidence and never expire. Nonzero decreasing durable
+timestamps fail recovery conservatively. Legacy v1 Unix-millisecond timestamps remain
+readable as the initial logical epoch. No client timestamp is trusted.
+
+Recovery scans every committed pair and rebuilds producer epoch/next-sequence watermarks
+independently of retained outcomes. Later durable timestamps prove which prior outcomes
+can expire without loading an unbounded history. Time elapsed since the last persisted
+sample is intentionally forgotten on restart; an expired outcome can conservatively
+become available again. A smaller quota or larger window may make recovery fail closed
+rather than violate retention. Expired same-epoch sequences return actor
+`OutcomeUnavailable` (wire OUTCOME_UNKNOWN); they can never reinsert a message because
+high-water marks are not removed. Older epochs remain PRODUCER_FENCED. A newer epoch
+starts at sequence zero and fences only after its first successful durable commit.
+
+`timed_dedup` tests inject time without sleeping, verify exact expiration, conservative
+restart/rollback/unavailable evidence, separate quotas, recovered high-water/fencing,
+and 512 concurrent retries with one durable pair. Existing model, actor fault and
+independent TCP ACK-journal/SIGKILL fixtures continue to verify stable original offsets.

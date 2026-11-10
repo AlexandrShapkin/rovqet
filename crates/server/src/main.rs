@@ -72,8 +72,16 @@ impl Options {
                     }
                     result.metrics_interval = Some(Duration::from_millis(ms));
                 }
-                "--q1-data-dir" | "--q1-topic" | "--q1-tenant-id" | "--q1-topic-id"
-                | "--q1-partition-id" | "--q1-incarnation" | "--q1-owner-epoch" => {
+                "--q1-data-dir"
+                | "--q1-topic"
+                | "--q1-tenant-id"
+                | "--q1-topic-id"
+                | "--q1-partition-id"
+                | "--q1-incarnation"
+                | "--q1-owner-epoch"
+                | "--q1-dedup-window-ms"
+                | "--q1-max-producers"
+                | "--q1-max-outcomes" => {
                     q1_values.insert(pair[0].clone(), pair[1].clone());
                 }
                 _ => return Err(invalid("unknown option; see --help")),
@@ -195,6 +203,7 @@ async fn main() -> io::Result<()> {
             "  Q1 opt-in (all required): --q1-data-dir EXISTING_DIR --q1-topic NAME\n",
             "    --q1-tenant-id 1 --q1-topic-id ID --q1-partition-id ID\n",
             "    --q1-incarnation U128 --q1-owner-epoch U64\n",
+            "    [--q1-dedup-window-ms 86400000 --q1-max-producers 100000 --q1-max-outcomes 100000]\n",
             "Development only: plaintext, static dev identity, loopback required.\n",
             "Q0 topics: demo, telemetry. Default connection limit: 1024.\n",
             "Higher limits (ceiling 20000) require an explicit user-space envelope budget\n",
@@ -218,8 +227,14 @@ async fn main() -> io::Result<()> {
     };
     if let Some(q1) = &options.q1 {
         eprintln!(
-            "Q1 recovered: topic={} partition={:?} incarnation={} owner_epoch={}",
-            q1.topic, q1.partition, q1.incarnation, q1.owner_epoch
+            "Q1 recovered: topic={} partition={:?} incarnation={} owner_epoch={} dedup_window_ms={} max_producers={} max_outcomes={}",
+            q1.topic,
+            q1.partition,
+            q1.incarnation,
+            q1.owner_epoch,
+            q1.dedup_window.as_millis(),
+            q1.max_producers,
+            q1.max_outcomes
         );
     }
     eprintln!(

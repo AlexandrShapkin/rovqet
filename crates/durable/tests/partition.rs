@@ -111,6 +111,8 @@ fn actor_config() -> PartitionConfig {
         queue_messages: 8,
         queue_bytes: 8192,
         max_outcomes: 64,
+        max_producers: 100_000,
+        dedup_window: std::time::Duration::from_secs(86400),
     }
 }
 fn request(sequence: u64) -> PublishRequest {

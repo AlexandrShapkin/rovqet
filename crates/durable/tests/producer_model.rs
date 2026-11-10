@@ -59,6 +59,8 @@ impl Harness {
             queue_messages: 4,
             queue_bytes: 4096,
             max_outcomes,
+            max_producers: 100_000,
+            dedup_window: std::time::Duration::from_secs(86400),
         };
         let actor = Partition::open(&directory.0, wal.clone(), config.clone()).unwrap();
         Self {

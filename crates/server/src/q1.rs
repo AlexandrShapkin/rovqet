@@ -24,6 +24,9 @@ pub struct Options {
     pub partition: PartitionRef,
     pub incarnation: u128,
     pub owner_epoch: u64,
+    pub dedup_window: Duration,
+    pub max_producers: usize,
+    pub max_outcomes: usize,
 }
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
@@ -64,8 +67,31 @@ impl Options {
                 .parse()
                 .map_err(|_| invalid("invalid Q1 incarnation"))?,
             owner_epoch: number("--q1-owner-epoch")?,
+            dedup_window: Duration::from_millis(
+                values
+                    .get("--q1-dedup-window-ms")
+                    .map(|v| v.parse())
+                    .transpose()
+                    .map_err(|_| invalid("invalid dedup window"))?
+                    .unwrap_or(86_400_000),
+            ),
+            max_producers: values
+                .get("--q1-max-producers")
+                .map(|v| v.parse())
+                .transpose()
+                .map_err(|_| invalid("invalid producer limit"))?
+                .unwrap_or(100_000),
+            max_outcomes: values
+                .get("--q1-max-outcomes")
+                .map(|v| v.parse())
+                .transpose()
+                .map_err(|_| invalid("invalid outcome limit"))?
+                .unwrap_or(100_000),
         };
-        if result.incarnation == 0
+        if result.dedup_window.is_zero()
+            || result.max_producers == 0
+            || result.max_outcomes == 0
+            || result.incarnation == 0
             || result.partition.tenant_id != 1
             || result.partition.topic_id <= 2
             || result.owner_epoch == 0
@@ -115,7 +141,9 @@ impl Route {
             ownership_epoch: options.owner_epoch,
             queue_messages: 64,
             queue_bytes: 4 * 1024 * 1024,
-            max_outcomes: 100_000,
+            max_outcomes: options.max_outcomes,
+            max_producers: options.max_producers,
+            dedup_window: options.dedup_window,
         };
         #[cfg(feature = "fault-injection")]
         let partition = if let Some(control) = test_control()? {
@@ -178,6 +206,28 @@ impl Route {
         if producer_id == 0 {
             return Err(ErrorCode::BadFrame);
         }
+        // The direct route has fixed effective partition/priority. Key and priority hints
+        // have no durable effect. TTL is an admission deadline, not persisted message TTL.
+        // Reject unsupported durable attributes rather than silently dropping their meaning.
+        for id in [
+            f::GROUP_ID,
+            f::GROUP_GENERATION,
+            f::LEASE_ID,
+            f::OFFSET,
+            f::SOURCE_LOG_INCAR,
+            f::DISPOSITION_ID,
+            f::ACK_DEADLINE_MS,
+        ] {
+            if frame.field(id).is_some() {
+                return Err(ErrorCode::UnsupportedCapability);
+            }
+        }
+        if let Some(digest) = frame.field(f::PAYLOAD_DIGEST_SHA256) {
+            use sha2::{Digest, Sha256};
+            if digest != Sha256::digest(&frame.payload).as_slice() {
+                return Err(ErrorCode::SequenceConflict);
+            }
+        }
         let request_id = frame.request_id;
         let sequence = number::<8>(&frame, f::PRODUCER_SEQUENCE)? as u64;
         let request = PublishRequest {
@@ -237,6 +287,7 @@ fn map_error(error: DurableError) -> ErrorCode {
         DurableError::ProducerFenced => ErrorCode::ProducerFenced,
         DurableError::SequenceGap => ErrorCode::SequenceGap,
         DurableError::SequenceConflict => ErrorCode::SequenceConflict,
+        DurableError::OutcomeUnavailable => ErrorCode::OutcomeUnknown,
         DurableError::Capacity => ErrorCode::ResourceExhausted,
         DurableError::Expired => ErrorCode::ExpiredBeforeDelivery,
         DurableError::Unavailable | DurableError::InvalidConfig | DurableError::WorkerStart(_) => {
@@ -402,6 +453,112 @@ mod tests {
             invalid.insert(key.into(), value.into());
             assert!(Options::parse(&invalid).is_err(), "{key}={value}");
         }
+    }
+    #[tokio::test]
+    async fn canonical_route_checks_claims_digest_and_unsupported_attributes() {
+        let path =
+            std::env::temp_dir().join(format!("rovqet-route-canonical-{}", std::process::id()));
+        std::fs::create_dir(&path).unwrap();
+        let mut options = Options::parse(&values()).unwrap().unwrap();
+        options.directory = path.clone();
+        let route = Route::open(options).unwrap();
+        let mut frame = Frame::new(FrameType::Publish, 1);
+        frame.fields = vec![
+            Field::required(f::TOPIC_NAME, b"durable"),
+            Field::required(f::QOS, [1]),
+            Field::required(f::PARTITION_ID, 0u32.to_be_bytes()),
+            Field::required(f::LOG_INCAR, 42u128.to_be_bytes()),
+            Field::required(f::OWNERSHIP_EPOCH, 7u64.to_be_bytes()),
+            Field::required(f::TTL_MS, 30000u32.to_be_bytes()),
+            Field::required(f::PRODUCER_ID, 11u128.to_be_bytes()),
+            Field::required(f::PRODUCER_EPOCH, 0u64.to_be_bytes()),
+            Field::required(f::PRODUCER_SEQUENCE, 0u64.to_be_bytes()),
+            Field::required(f::MESSAGE_ID, 100u128.to_be_bytes()),
+        ];
+        frame.payload = b"event".to_vec();
+        assert!(matches!(
+            route.publish(2, frame.clone()),
+            Err(ErrorCode::PermissionDenied)
+        ));
+        for (id, value, error) in [
+            (
+                f::PRINCIPAL_ID,
+                2u64.to_be_bytes().to_vec(),
+                ErrorCode::PermissionDenied,
+            ),
+            (
+                f::TENANT_ID,
+                2u64.to_be_bytes().to_vec(),
+                ErrorCode::PermissionDenied,
+            ),
+            (
+                f::TOPIC_ID,
+                4u64.to_be_bytes().to_vec(),
+                ErrorCode::PermissionDenied,
+            ),
+            (
+                f::GROUP_ID,
+                1u64.to_be_bytes().to_vec(),
+                ErrorCode::UnsupportedCapability,
+            ),
+            (
+                f::PAYLOAD_DIGEST_SHA256,
+                vec![0; 32],
+                ErrorCode::SequenceConflict,
+            ),
+        ] {
+            let mut changed = frame.clone();
+            changed.fields.push(Field::optional(id, value));
+            assert!(matches!(route.publish(1, changed), Err(e) if e == error));
+        }
+        async fn settle(reply: SessionReply) -> Frame {
+            match reply {
+                SessionReply::Deferred(pending) => pending.await.unwrap().unwrap(),
+                _ => panic!("expected deferred durable result"),
+            }
+        }
+        let original = settle(route.publish(1, frame.clone()).unwrap()).await;
+        // Request correlation, route hints and admission TTL are not durable identity.
+        frame.request_id = 999;
+        frame.fields.retain(|v| v.id != f::TTL_MS);
+        frame
+            .fields
+            .push(Field::required(f::TTL_MS, 2000u32.to_be_bytes()));
+        frame.fields.push(Field::optional(
+            f::PARTITION_KEY,
+            b"ignored-direct-route-hint",
+        ));
+        frame.fields.push(Field::optional(f::PRIORITY, [0]));
+        use sha2::{Digest, Sha256};
+        frame.fields.push(Field::optional(
+            f::PAYLOAD_DIGEST_SHA256,
+            Sha256::digest(&frame.payload).to_vec(),
+        ));
+        let retry = settle(route.publish(1, frame.clone()).unwrap()).await;
+        assert_eq!(original.field(f::OFFSET), retry.field(f::OFFSET));
+        assert_eq!(retry.request_id, 999);
+        frame.payload.push(1); // even with the same request ID, digest must be checked again
+        assert!(matches!(
+            route.publish(1, frame),
+            Err(ErrorCode::SequenceConflict)
+        ));
+        route.shutdown().unwrap();
+        let wal = rovqet_wal::Wal::open(
+            &path,
+            rovqet_wal::Config {
+                partition: PartitionRef {
+                    tenant_id: 1,
+                    topic_id: 3,
+                    partition_id: 0,
+                },
+                incarnation: 42,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(wal.committed_position().unwrap().sequence, 1);
+        drop(wal);
+        std::fs::remove_dir_all(path).unwrap();
     }
     #[test]
     fn admitted_storage_failures_are_uncertain_but_unavailable_is_explicit() {

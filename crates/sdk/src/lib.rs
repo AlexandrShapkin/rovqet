@@ -90,7 +90,10 @@ impl Default for PublishOptions {
 }
 /// Explicit Q1 identity. Keep these values and the original payload for an unresolved retry.
 /// Reconnecting never changes this caller-owned producer token or retries automatically.
-/// This API does not promise a time-bounded producer deduplication window.
+/// The server advertises its configured window at startup (default 24h). Downtime and
+/// uncertain clock intervals extend retention. After expiration the original outcome may
+/// be unavailable (OUTCOME_UNKNOWN); retained sequence high-water marks prevent reinsertion.
+/// TTL is an admission deadline; direct-route key/priority hints have no durable effect.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Q1PublishOptions {
     pub producer_id: u128,

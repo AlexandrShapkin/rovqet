@@ -817,6 +817,7 @@ dependencies = [
  "rovqet-router",
  "rovqet-transport",
  "rovqet-wal",
+ "sha2",
  "tokio",
 ]
 

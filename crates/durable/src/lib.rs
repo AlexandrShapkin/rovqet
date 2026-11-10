@@ -15,18 +15,38 @@ use std::{
         mpsc::{self, SyncSender, TrySendError},
     },
     thread::{self, JoinHandle},
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 use tokio::sync::oneshot;
 
 const OUTCOME_BYTES: usize = 30;
 
-#[derive(Default)]
 struct WorkerOptions {
+    clock: Arc<dyn Clock>,
     #[cfg(feature = "fault-injection")]
     control: Option<TestControl>,
 }
 
+/// Monotonic milliseconds in an arbitrary process-local epoch. None means unavailable evidence.
+/// Regressions and unavailable samples freeze expiration; they never shorten the window.
+pub trait Clock: Send + Sync {
+    fn now_millis(&self) -> Option<u64>;
+}
+struct MonotonicClock(Instant);
+impl Clock for MonotonicClock {
+    fn now_millis(&self) -> Option<u64> {
+        u64::try_from(self.0.elapsed().as_millis()).ok()
+    }
+}
+impl Default for WorkerOptions {
+    fn default() -> Self {
+        Self {
+            clock: Arc::new(MonotonicClock(Instant::now())),
+            #[cfg(feature = "fault-injection")]
+            control: None,
+        }
+    }
+}
 #[cfg(feature = "fault-injection")]
 mod test_control;
 #[cfg(feature = "fault-injection")]
@@ -38,6 +58,9 @@ pub struct PartitionConfig {
     pub queue_messages: usize,
     pub queue_bytes: usize,
     pub max_outcomes: usize,
+    pub max_producers: usize,
+    /// Minimum retained logical time; downtime and uncertain clock intervals do not count.
+    pub dedup_window: Duration,
 }
 #[derive(Debug, Clone)]
 pub struct PublishRequest {
@@ -65,6 +88,7 @@ pub enum Error {
     Storage(rovqet_wal::Error),
     Corruption(&'static str),
     OutcomeUnknown,
+    OutcomeUnavailable,
     Unavailable,
     WorkerStart(std::io::Error),
 }
@@ -135,6 +159,24 @@ impl Partition {
             config,
             WorkerOptions {
                 control: Some(control),
+                ..WorkerOptions::default()
+            },
+        )
+    }
+    /// Controlled time source for deterministic qualification; no client timestamp is trusted.
+    pub fn open_with_clock(
+        path: impl AsRef<Path>,
+        wal_config: WalConfig,
+        config: PartitionConfig,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self> {
+        Self::open_inner(
+            path,
+            wal_config,
+            config,
+            WorkerOptions {
+                clock,
+                ..WorkerOptions::default()
             },
         )
     }
@@ -148,6 +190,9 @@ impl Partition {
             || config.queue_messages == 0
             || config.queue_bytes == 0
             || config.max_outcomes == 0
+            || config.max_producers == 0
+            || config.dedup_window.as_millis() == 0
+            || config.dedup_window.as_millis() > u64::MAX as u128
             || wal_config.max_record_bytes < RECORD_OVERHEAD + OUTCOME_BYTES
         {
             return Err(Error::InvalidConfig);
@@ -161,7 +206,7 @@ impl Partition {
         let worker = thread::Builder::new()
             .name("rovqet-q1-partition".into())
             .spawn(move || {
-                let state = State::open(&path, wal_config, actor_config);
+                let state = State::open_clock(&path, wal_config, actor_config, _options.clock);
                 match state {
                     Err(e) => {
                         let _ = ready_tx.send(Err(e));
@@ -291,7 +336,10 @@ struct State {
     wal: Wal,
     wal_config: WalConfig,
     config: PartitionConfig,
-    outcomes: HashMap<Token, u64>,
+    outcomes: HashMap<Token, (u64, u64)>,
+    clock: Arc<dyn Clock>,
+    clock_sample: Option<u64>,
+    logical_time: u64,
     producers: HashMap<(u128, u128), (u64, u64)>,
     next: u64,
     unhealthy: bool,
@@ -299,13 +347,25 @@ struct State {
     control: Option<TestControl>,
 }
 impl State {
+    #[cfg(test)]
     fn open(path: &Path, wal_config: WalConfig, config: PartitionConfig) -> Result<Self> {
+        Self::open_clock(path, wal_config, config, WorkerOptions::default().clock)
+    }
+    fn open_clock(
+        path: &Path,
+        wal_config: WalConfig,
+        config: PartitionConfig,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self> {
         let wal = Wal::open(path, wal_config.clone()).map_err(Error::Storage)?;
         let mut s = Self {
             wal,
             wal_config,
             config,
             outcomes: HashMap::new(),
+            clock_sample: clock.now_millis(),
+            clock,
+            logical_time: 1,
             producers: HashMap::new(),
             next: 0,
             unhealthy: false,
@@ -325,6 +385,27 @@ impl State {
             self.unhealthy = true;
         }
         result
+    }
+    fn expire(&mut self) {
+        let now = self.logical_time;
+        let window = self.config.dedup_window.as_millis() as u64;
+        // Zero is legacy/unavailable timestamp evidence: never expire it speculatively.
+        self.outcomes
+            .retain(|_, &mut (_, stamp)| stamp == 0 || now.saturating_sub(stamp) < window);
+    }
+    fn advance_clock(&mut self) {
+        let sample = self.clock.now_millis();
+        if let (Some(previous), Some(now)) = (self.clock_sample, sample) {
+            if let Some(elapsed) = now.checked_sub(previous) {
+                self.logical_time = self.logical_time.saturating_add(elapsed);
+            }
+        }
+        // Keep a future anchor across rollback; unavailable intervals are discarded.
+        self.clock_sample = match (self.clock_sample, sample) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (_, other) => other,
+        };
+        self.expire();
     }
     fn recover(&mut self) -> Result<()> {
         let count = self
@@ -392,10 +473,24 @@ impl State {
             };
             self.validate_token(token)
                 .map_err(|_| Error::Corruption("producer history"))?;
+            if message.server_timestamp != 0 && message.server_timestamp < self.logical_time {
+                return Err(Error::Corruption("nonmonotonic producer timestamp"));
+            }
+            self.logical_time = self.logical_time.max(message.server_timestamp);
+            self.expire();
+            if !self.producers.contains_key(&(principal, token.producer))
+                && self.producers.len() >= self.config.max_producers
+            {
+                return Err(Error::Capacity);
+            }
             if self.outcomes.len() >= self.config.max_outcomes {
                 return Err(Error::Capacity);
             }
-            if self.outcomes.insert(token, offset).is_some() {
+            if self
+                .outcomes
+                .insert(token, (offset, message.server_timestamp))
+                .is_some()
+            {
                 return Err(Error::Corruption("duplicate outcome"));
             }
             self.producers.insert(
@@ -434,7 +529,7 @@ impl State {
                 } else if t.sequence == next {
                     Ok(())
                 } else if t.sequence < next {
-                    Err(Error::SequenceConflict)
+                    Err(Error::OutcomeUnavailable)
                 } else {
                     Err(Error::SequenceGap)
                 }
@@ -475,7 +570,8 @@ impl State {
         {
             return Err(Error::ProducerFenced);
         }
-        if let Some(&offset) = self.outcomes.get(&token) {
+        self.advance_clock();
+        if let Some(&(offset, _)) = self.outcomes.get(&token) {
             let old = self
                 .wal
                 .read(
@@ -505,7 +601,11 @@ impl State {
             return Err(Error::Expired);
         }
         self.validate_token(token)?;
-        if self.outcomes.len() >= self.config.max_outcomes
+        if (!self
+            .producers
+            .contains_key(&(token.principal, token.producer))
+            && self.producers.len() >= self.config.max_producers)
+            || self.outcomes.len() >= self.config.max_outcomes
             || self
                 .next
                 .checked_add(2)
@@ -529,11 +629,7 @@ impl State {
             return Err(Error::Expired);
         }
         let offset = self.next;
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-            .min(u64::MAX as u128) as u64;
+        let timestamp = self.logical_time;
         let message = Record {
             kind: RecordKind::Message,
             logical_offset: offset,
@@ -575,7 +671,12 @@ impl State {
             return Err(e);
         }
         self.next += 2;
-        self.outcomes.insert(token, offset);
+        // Durability IO is excluded from logical elapsed time, conservatively extending retention.
+        self.clock_sample = match (self.clock_sample, self.clock.now_millis()) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (_, other) => other,
+        };
+        self.outcomes.insert(token, (offset, timestamp));
         self.producers.insert(
             (token.principal, token.producer),
             (token.epoch, token.sequence + 1),
@@ -618,6 +719,8 @@ mod tests {
             queue_messages: 2,
             queue_bytes: 4096,
             max_outcomes: 32,
+            max_producers: 32,
+            dedup_window: Duration::from_secs(86400),
         };
         (w, p)
     }
