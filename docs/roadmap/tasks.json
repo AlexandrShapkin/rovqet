@@ -442,16 +442,21 @@
         "B-01",
         "A-05"
       ],
-      "status": "IN_PROGRESS",
+      "status": "DONE",
       "architecture": "06",
       "proof": "Crash before/after fsync no false COMMITTED_LOCAL",
       "paths": [
-        "crates/durable/"
+        "crates/durable/",
+        "crates/server/",
+        "crates/transport/",
+        "crates/sdk/",
+        "scripts/q1_smoke.py",
+        "scripts/test_q1_faults.py",
+        "README.md"
       ],
       "evidence": {
-        "commit": "851218eaf9a46c98e4d0e2fc0713903ad9490cca",
-        "ci_run": "https://github.com/AlexandrShapkin/rovqet/actions/runs/42764211411",
-        "verification": "Local PASS: 16 durable tests (5 unit +11 integration), 31 WAL tests and131 workspace tests; format/check/docs/Q0 independent-process smoke pass on2026-11-10.",
+        "commit": "96dc0fe3b89d92cd8a8787faf4dbd80ecb5da5dd",
+        "verification": "PASS on2026-11-10: all requested local checks, default-build Q0/Q1 process smokes, actor feature tests and17 deterministic TCP/process fault tests.",
         "test_command": [
           "cargo fmt --all -- --check",
           "CARGO_HOME=/tmp/rovqet-cargo cargo check --workspace --locked",
@@ -461,11 +466,20 @@
           "python3 scripts/check_docs.py",
           "CARGO_HOME=/tmp/rovqet-cargo cargo build -p rovqet-server -p rovqet-sdk --examples --bins --locked",
           "python3 scripts/q0_smoke.py",
+          "python3 scripts/q1_smoke.py --check-hooks-disabled",
+          "CARGO_HOME=/tmp/rovqet-cargo cargo test -p rovqet-durable --features fault-injection --locked",
+          "CARGO_HOME=/tmp/rovqet-cargo cargo build -p rovqet-server --features fault-injection --locked",
+          "python3 scripts/test_q1_faults.py",
           "git diff --check"
         ],
-        "observed_result": "Real dedicated-thread Q1 partition actor admits bounded count/retained-allocation bytes, persists MESSAGE+versioned scoped producer outcome through one WAL barrier before CommittedLocal, and reconstructs exact retry results on restart. Actual SIGKILL after parent records a committed outcome in an independent fsynced journal recovers unchanged message/outcome with no duplicate append. Append/partial-write/sync/manifest faults return no success and make actor unavailable until recovery. Waiter cancellation retains accepted work; shutdown/drop drains and joins. Wrong class/partition/owner, gap/conflict/fenced producer, capacity and malformed committed pairs fail explicitly.",
-        "limitations": "Not DONE: no session/server Q1 routing or wire PUB_ACK; TTL/ACL/authenticated-principal validation and coordinated authority remain caller prerequisites. Blocking open/wait/drop/shutdown require execution outside async network workers. No production timed dedup window, retention, consumer ACK/cursor or Q2 integration is claimed. SIGKILL is not physical power-loss validation.",
-        "next_unblocked": "Finish B-02: integrate session routing and asynchronous reply adapter for an explicitly configured Q1 partition; test process termination before write/fsync/ACK and lost PUB_ACK against independent received-ACK journal. Keep Q0 independent and reject unsupported Q1 until integration is complete."
+        "observed_result": "31 WAL tests;18 default durable tests;140 workspace tests;19 fault-enabled actor tests;17 TCP/process fault tests. Q1 smoke independently journaled4 received COMMITTED_LOCAL results outside WAL, recovered all4 after clean restart and SIGKILL with stable original offsets and no duplicate insertion. Format/check/docs and Q0 independent publisher/two-subscriber smoke pass.",
+        "wire_contract": "Existing frame IDs/fields/golden vectors unchanged. Explicit configured Q1 route validates AUTH principal1/tenant1, topic/partition/QoS, incarnation, owner and TTL; bounded actor admission and async oneshot reply. Only paired message+recoverable outcome and successful WAL/manifest/directory barrier yield correlated COMMITTED_LOCAL. Explicit-token SDK validates partition/incarnation/outcome and reports ambiguity as OutcomeUnknown; never autochanges sequence or downgrades Q1.",
+        "failure_findings": "Marker barriers prove process termination before append, after append/before fsync, after durable sync/before PUB_ACK, and after externally journaled ACK. Lost ACK/disconnect/timeout retries settle original identity. All7 append/sync/manifest failures refuse durable success then unhealthy storage rejects. Committed corruption/missing storage/identity mismatch and concurrent writer lock refuse startup without resetting history. Queued TTL expiry consumes no offset; single-Tokio-worker Q0 continues while Q1 waits before fsync. Shutdown drains accepted pending writes; lost reply remains unknown. Default build rejects fault-control environment before WAL initialization.",
+        "limitations": "Development-only plaintext loopback/static dev identity and one explicitly configured Q1-only partition; no production TLS/ACL/ownership service. No advertised timed dedup window (B-03), FETCH/replay (B-04), durable consumer ACK/cursor, retention or Q2. Exclusive local advisory lock and functioning filesystem barriers required. SIGKILL is process-crash recovery, not physical power-loss certification. Five-second final drain timeout exits unsuccessfully with unresolved outcomes requiring recovery.",
+        "next_unblocked": [
+          "B-03",
+          "B-04"
+        ]
       }
     },
     {
