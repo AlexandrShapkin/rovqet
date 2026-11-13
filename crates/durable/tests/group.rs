@@ -634,3 +634,38 @@ fn cancelled_group_wait_releases_its_reservation_and_keeps_publication_alive() {
     assert_eq!(batch.deliveries.len(), 1);
     assert_eq!(batch.deliveries[0].payload, b"event-0");
 }
+
+#[test]
+fn committed_ack_lookup_stays_resolvable_after_a_generation_fence() {
+    let t = Temp::new();
+    let p = open(&t, GroupConfig::default());
+    publish(&p, 0);
+    let batch = fetch(&p, 0, 1);
+    let token = batch.deliveries[0].clone();
+    ack(&p, &token).unwrap();
+    // A replacement consumer durably fences generation 1.
+    let replaced = fetch(&p, 0, 1);
+    assert_eq!(replaced.generation, 2);
+    let after_fence = p.committed_records();
+    // Replaying the original token is a read-only saved-outcome lookup even though its
+    // generation and lease are no longer current; it must not append another ACK.
+    assert!(ack(&p, &token).is_ok());
+    assert_eq!(p.committed_records(), after_fence);
+    // The fenced generation still cannot mutate a *new* unacknowledged record.
+    publish(&p, 1);
+    let current = fetch(&p, 2, 1);
+    let stale = rovqet_durable::AckRequest {
+        partition: partition_id(),
+        group_id: 9,
+        generation: 1,
+        lease_id: current.deliveries[0].lease_id,
+        ownership_epoch: 7,
+        offset: current.deliveries[0].offset,
+        attempt: current.deliveries[0].attempt,
+        principal: 1,
+    };
+    assert!(matches!(
+        p.try_ack(stale).unwrap().wait(),
+        Err(GroupError::StaleGeneration)
+    ));
+}
