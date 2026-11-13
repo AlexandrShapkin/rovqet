@@ -669,7 +669,16 @@
           "B-06",
           "B-07"
         ],
-        "next_note": "B-07 is the next correctness gate (external acknowledged set versus recovered WAL under repeated SIGKILL); B-06 remains the terminal-disposition (NACK/retry/quarantine/DLQ) work package."
+        "next_note": "B-07 is the next correctness gate (external acknowledged set versus recovered WAL under repeated SIGKILL); B-06 remains the terminal-disposition (NACK/retry/quarantine/DLQ) work package.",
+        "followup": {
+          "commit": "83b66e5ddd88018ef01487077a98e8bbb20f111f",
+          "verification": "PASS: a previously committed ACK token remains resolvable as a saved read-only outcome after a generation fence, appending no new durable record; the same fenced generation still cannot acknowledge a different unacknowledged record.",
+          "test_command": [
+            "cargo fmt --all -- --check",
+            "cargo test -p rovqet-durable --test group --locked"
+          ],
+          "observed_result": "15 durable group actor tests pass (50 default durable tests, 189 workspace tests when the full suite is run)."
+        }
       }
     },
     {
