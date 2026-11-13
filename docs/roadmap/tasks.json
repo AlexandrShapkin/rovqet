@@ -874,13 +874,45 @@
         "C-01",
         "B-04"
       ],
-      "status": "TODO",
+      "status": "IN_PROGRESS",
       "architecture": "09",
-      "proof": "3-voter ownership, no stale commit, Q1 migration tests",
+      "proof": "Ownership fencing at the durable commit boundary is verified; the metadata Raft group and staged Q1 migration are still open",
       "paths": [
-        "crates/control/"
+        "crates/durable/src/authority.rs",
+        "crates/durable/tests/fencing.rs",
+        "crates/server/src/cluster.rs",
+        "scripts/test_cluster_routing.py",
+        "docs/architecture/09-cluster-control.md",
+        "docs/architecture/07-q2-consensus.md"
       ],
-      "evidence": null
+      "evidence": {
+        "commit": "d90f7fdbbc7c68cb2ce8fd9878339db6a4488c6f",
+        "verification": "PARTIAL: the durable ownership fencing protocol is implemented and verified, including across two real broker processes. The metadata Raft group, committed-metadata ownership transitions and the staged Q1 migration are not implemented, so C-02 is IN_PROGRESS.",
+        "test_command": [
+          "cargo fmt --all -- --check",
+          "cargo check --workspace --locked",
+          "cargo test --workspace --locked",
+          "python3 scripts/check_docs.py",
+          "cargo build -p rovqet-server -p rovqet-sdk -p rovqet-control --examples --bins --locked",
+          "python3 scripts/q0_smoke.py",
+          "python3 scripts/q1_smoke.py --check-hooks-disabled",
+          "python3 scripts/test_q1_replay.py",
+          "python3 scripts/test_cluster_routing.py",
+          "cargo build -p rovqet-server --features fault-injection --locked",
+          "python3 scripts/test_q1_consumer.py",
+          "python3 scripts/test_q1_terminal.py",
+          "python3 scripts/test_q1_durability.py",
+          "git diff --check"
+        ],
+        "observed_result": "All executed checks pass: workspace tests (including four new fencing tests), the three-process-aware cluster routing fixtures, and the unchanged Q0/Q1 replay, consumer, terminal/DLQ and B-07 durability suites.",
+        "fencing_implemented": "The durable partition owns the fencing state, not only the routing layer. Partition::set_authority installs Authority {owner, epoch, lease} from committed control-plane metadata; the command is ordered with durable mutations in the actor. Publication, deduplicated retry, consumer FETCH, ACK, NACK and terminal disposition (quarantine and DLQ) all check the authority before starting and fail closed with a stale-epoch error when the local node is not the committed owner. The lease is bounded and counted from local installation, so an expired lease fails closed and a restart never extends it. An older epoch can never replace a newer authority. A mutation whose lease expires during its barrier is reported as an uncertain outcome, never a false COMMITTED_LOCAL. Standalone partitions (no installed authority) keep the previous single-node behaviour.",
+        "fencing_evidence": "Actor tests prove: standalone partitions are unfenced; a foreign owner is fenced for publish, fetch, ack and nack; an expired lease fails closed; a newer authority fences the previous owner and an older epoch cannot replace it. Two real broker processes prove: a publication to the non-owner is forwarded once to the owner, the owner performs the durable commit and returns its own offset, the producer token retry returns the same offset without a second record, and an expired ownership lease stops the old owner from committing while its committed history stays readable.",
+        "raft_library_decision": "openraft 0.9.26 selected deliberately (the architecture references 0.9.x; 0.10 changes the storage and network contracts). Its v2 storage API is recorded in docs/architecture/07-q2-consensus.md: RaftLogStorage with a LogFlushed completion callback, LogReader, vote and committed-index persistence; RaftStateMachine with a snapshot builder; RaftNetwork with vote, append entries and install snapshot; RaftNetworkFactory. Library types stay inside a dedicated metadata adapter; the public control-plane model does not depend on OpenRaft internals, and the Raft log index is unrelated to Q1 application offsets.",
+        "remaining_work": "Exact next steps: (1) add crates/metadata-raft implementing the openraft 0.9.26 type config, a disk-backed RaftLogStorage with fsynced appends and persisted votes/committed index, a metadata state machine applying committed placement/epoch/lease commands, snapshot save/restore and a TCP RaftNetwork over the C-01 peer transport; (2) run a static three-voter group with real election, leader replacement, snapshot propagation, quorum-loss rejection and restart recovery; (3) drive the data plane from committed snapshots only and install ownership authority from committed transitions; (4) implement the staged Q1 migration PREPARE -> CATCH_UP -> FENCE_OLD -> ACTIVATE_NEW -> CLEANUP over RPC kinds 7/8/9 with bounded checksummed chunks, idempotent resume, DLQ/terminal proof handling and explicit rejection of unsafe activation; (5) extend the independent oracle for metadata revisions, epochs, leases, migration ids/stages and duplicate/missing chunk detection; (6) execute the asymmetric-partition and crash-window matrix listed in the assignment.",
+        "limitations": "The authority source is still the C-01 static development fixture, not a Raft-committed snapshot. Only local lease-expiry fencing is proven: a partitioned old owner may still commit until its lease expires, so a replacement owner must wait for confirmed revocation or lease expiry before it activates. No ownership handover, no Q1 migration, no DLQ-transfer safety proof and no permanent-loss handling exist yet. Q2 data replication and majority acknowledgment remain C-03.",
+        "next_unblocked": [],
+        "next_note": "C-02 stays IN_PROGRESS until the metadata Raft group, committed ownership transitions and the staged Q1 migration are implemented and verified. C-03 must not start before C-02 is DONE."
+      }
     },
     {
       "id": "C-03",
