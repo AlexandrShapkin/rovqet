@@ -1,0 +1,4 @@
+{"at": "terminal-pending-after-append-before-sync", "event": "fault", "kind": "process_kill", "run": "quarantine-before-fsync", "schema": "rovqet-q1-oracle-v1", "seq": 0, "time_mono_ns": 77013927208077}
+{"attempt": 1, "event": "delivery", "generation": 2, "group": 9, "offset": 0, "run": "quarantine-before-fsync", "schema": "rovqet-q1-oracle-v1", "seq": 1, "time_mono_ns": 77013949395609}
+{"event": "generation_observed", "generation": 2, "group": 9, "run": "quarantine-before-fsync", "schema": "rovqet-q1-oracle-v1", "seq": 2, "time_mono_ns": 77013950462099}
+{"counts": {"acknowledged": 0, "application_offsets": 1, "cursor": 0, "redelivered": 1, "uncertain_committed": 0}, "event": "conclusion", "fault": "terminal-pending-after-append-before-sync", "reason": null, "run": "quarantine-before-fsync", "schema": "rovqet-q1-oracle-v1", "seq": 3, "time_mono_ns": 77013951614983, "verdict": "PASS"}
