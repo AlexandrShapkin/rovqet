@@ -704,13 +704,64 @@
         "B-05",
         "R0-02"
       ],
-      "status": "TODO",
+      "status": "DONE",
       "architecture": "14",
-      "proof": "Acknowledged set equals recovered intact-disk log",
+      "proof": "Externally acknowledged publication and consumer-ACK sets exactly reconciled with recovered Q1 history after repeated process crashes",
       "paths": [
-        "crates/testkit/"
+        "scripts/q1_oracle.py",
+        "scripts/test_q1_oracle.py",
+        "scripts/test_q1_durability.py",
+        "scripts/q1_smoke.py",
+        "scripts/test_q1_consumer.py",
+        "crates/wal/examples/fsync_profile.rs",
+        "crates/sdk/examples/q1_measure.rs",
+        "docs/architecture/14-verification.md"
       ],
-      "evidence": null
+      "evidence": {
+        "commit": "5c4f92d57f06ca07d3f2cadbc98736a4546521ea",
+        "verification": "PASS: independent parent-owned fsynced journals reconciled exact publication identities/digests/incarnations/offsets and consumer ACK/cursor state against post-recovery reads through external TCP SDK clients after deliberate process termination.",
+        "test_command": [
+          "cargo fmt --all -- --check",
+          "cargo check --workspace --locked",
+          "cargo test -p rovqet-protocol --locked",
+          "cargo test -p rovqet-wal --locked",
+          "cargo test -p rovqet-durable --locked",
+          "cargo test -p rovqet-testkit --locked",
+          "cargo test --workspace --locked",
+          "cargo test -p rovqet-durable --features fault-injection --locked",
+          "python3 scripts/check_docs.py",
+          "python3 scripts/test_q1_oracle.py",
+          "cargo build -p rovqet-sdk --examples --locked",
+          "cargo build -p rovqet-wal --examples --locked",
+          "python3 scripts/q0_smoke.py",
+          "python3 scripts/q1_smoke.py --check-hooks-disabled",
+          "python3 scripts/test_q1_replay.py",
+          "cargo build -p rovqet-server --features fault-injection --locked",
+          "python3 scripts/test_q1_consumer.py",
+          "python3 scripts/test_q1_faults.py",
+          "python3 scripts/test_q1_durability.py",
+          "git diff --check"
+        ],
+        "observed_result": "190 workspace tests, 22 protocol, 31 WAL, 50 default durable, 52 fault-enabled durable, 16 testkit, 12 server, 19 SDK and 13 transport tests pass. 20 oracle self-corruption tests, 8 standalone replay, 6 durable-consumer, 20 TCP/process-fault and 9 B-07 campaign tests pass; Q0/Q1 process smokes and documentation pass.",
+        "crash_matrix": "26 oracle campaigns, all PASS, including 22 direct process terminations/fault injections: 6 publication kills (before append, after append/before sync, after sync/before reply; seeds 42/43), 8 consumer kills (same barriers plus cursor-checkpoint append/sync; seeds 44/45), 1 generation-claim kill before fence sync and 7 WAL fault points (append, partial-append, segment-sync, manifest-write/sync/rename, directory-sync) across a forced 512-byte segment rotation. Additional campaigns cover sparse out-of-order ACKs, generation replacement, corrupt/missing storage, Q0 isolation and measurements.",
+        "publication_reconciliation": "Every externally received COMMITTED_LOCAL was recovered with the same message ID, SHA-256 payload digest, incarnation and offset. Before-append/before-sync crashes recovered 3/3 acknowledged records with one uncertain attempt absent; after-sync crash recovered 4/4 records with one explicitly uncertain, unacknowledged publication. Repeated committed tokens returned their original offsets; conflicting content was SequenceConflict; a new epoch starting at sequence 0 superseded an old epoch which was then ProducerFenced.",
+        "consumer_reconciliation": "ACK before append/before sync stayed non-durable: the record was redelivered and the cursor remained at the incomplete offset. ACK after sync and ACK whose checkpoint append was killed before sync recovered cursor 4, did not redeliver the acknowledged record, and classified one lost-reply offset as uncertain committed progress. Sparse ACK of offset 2 left cursor 0 after restart and redelivered offsets 0 and 4; closing the gap advanced to end. No cursor crossed an unattempted or unacknowledged application record. Duplicate committed tokens resolved read-only after fencing; stale generations could not mutate; repeated restarts preserved identities and offsets.",
+        "oracle_reliability": "Journals are append-only JSONL with per-record fsync outside broker storage and contiguous sequence numbers. PASS, FAIL, INVALID and NOT_RUN are distinct. 20 fixtures deliberately corrupt evidence (missing acknowledged record, changed digest, duplicate publication, wrong offset/incarnation, missing ACK state, cursor gap, stale-generation commit, truncated line, missing conclusion, sequence gap, unexplained recovered record) and all are rejected.",
+        "defect": "Fixed a real sparse-offset codec defect: B-05 made application offsets sparse but major-1 validation still required even READ_RECORD/READ_END offsets, so replay after interleaved ACK/checkpoint records returned RESOURCE_EXHAUSTED. The codec now accepts in-range sparse positions; golden vectors are unchanged; regression tests added in crates/protocol/tests/read_replay.rs and the consumer crash matrix. Evidence and reproduction: benchmarks/evidence/q1-durability-5c4f92d/DEFECT.md.",
+        "measurements": "Exploratory single-host n=200 debug-build observations: end-to-end COMMITTED_LOCAL p50 790us / p99 1.28ms; ACK_COMMITTED p50 720us / p99 1.15ms; direct WAL fsync p50 66us / p99 125us; append+fsync p50 148us / p99 249us; broker peak RSS 5804KiB; recovery readiness median 4.1ms (range 3.8-9.3ms); 200 recovered records. Q1 queue, producer/outcome, group/lease and sparse-set occupancy are UNAVAILABLE (no Q1 metric endpoint). p99.9 with n=200 is unstable. Not an SLO or power-loss claim.",
+        "artifacts": [
+          "benchmarks/evidence/q1-durability-5c4f92d/REPORT.md",
+          "benchmarks/evidence/q1-durability-5c4f92d/matrix.json",
+          "benchmarks/evidence/q1-durability-5c4f92d/measurements.json",
+          "benchmarks/evidence/q1-durability-5c4f92d/source-index.json",
+          "benchmarks/evidence/q1-durability-5c4f92d/journals/"
+        ],
+        "limitations": "SIGKILL on an intact ext4 filesystem is process-crash recovery, not physical power-loss or torn-write certification. One host, one Q1 partition, debug builds, no soak or cross-machine clocks. Single-consumer generation model only; no rebalance, NACK/retry schedule, DLQ/quarantine or SEEK (B-06 remains TODO). At-least-once delivery is verified; exactly-once application execution is not claimed. Small exploratory samples and UNAVAILABLE Q1 internal occupancy are reported honestly.",
+        "next_unblocked": [
+          "B-06"
+        ],
+        "next_note": "B-06 (Q1 terminal disposition: NACK/retry/quarantine/DLQ) is the next implementation package; C-05 depends on it."
+      }
     },
     {
       "id": "C-01",
