@@ -27,6 +27,75 @@ fn invalid(message: impl Into<String>) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidInput, message.into())
 }
 
+/// Starts the metadata voter and publishes its committed snapshots into the store.
+///
+/// Only committed and applied metadata is installed: the store stays empty until the group
+/// commits its first snapshot, so the data plane fails closed while no authority exists.
+async fn start_metadata_raft(
+    options: &MetadataRaftOptions,
+    store: &Arc<MetadataStore>,
+) -> std::io::Result<Arc<rovqet_metadata_raft::MetadataNode>> {
+    if !options.listen.ip().is_loopback() {
+        return Err(invalid("metadata raft listener must be loopback"));
+    }
+    let node =
+        rovqet_metadata_raft::MetadataNode::start(rovqet_metadata_raft::MetadataNodeConfig {
+            id: options.node_id,
+            cluster_id: options.cluster_id,
+            listen: options.listen,
+            peers: options.peers.clone(),
+            data_directory: options.data_directory.clone(),
+            bootstrap: options.bootstrap,
+            election_timeout_ms: 300,
+            heartbeat_interval_ms: 80,
+            max_payload_entries: 64,
+            snapshot_logs_since_last: 8,
+        })
+        .await
+        .map_err(std::io::Error::other)?;
+    let node = Arc::new(node);
+
+    let mut updates = node.committed_updates();
+    let store = store.clone();
+    let publisher = node.clone();
+    tokio::spawn(async move {
+        loop {
+            if let Some(snapshot) = publisher.committed_snapshot() {
+                match store.install(snapshot) {
+                    Ok(_) => {}
+                    // An older snapshot must never replace a newer committed one.
+                    Err(rovqet_control::metadata::MetadataError::RevisionRegression) => {}
+                    Err(error) => {
+                        // Fail closed: an unusable snapshot stops the publication instead of
+                        // installing something that was never committed.
+                        eprintln!("committed metadata rejected: {error:?}");
+                        return;
+                    }
+                }
+            }
+            if updates.changed().await.is_err() {
+                return;
+            }
+        }
+    });
+    Ok(node)
+}
+
+/// Raft-backed metadata authority: the committed metadata of the metadata group.
+#[derive(Debug, Clone)]
+pub struct MetadataRaftOptions {
+    pub cluster_id: u128,
+    pub node_id: u64,
+    /// Loopback address of the metadata peer protocol of this node.
+    pub listen: SocketAddr,
+    /// The metadata voters of the group, including this node.
+    pub peers: Vec<(u64, SocketAddr)>,
+    /// Durable directory of this metadata voter.
+    pub data_directory: PathBuf,
+    /// Only the designated bootstrap node initializes the membership.
+    pub bootstrap: bool,
+}
+
 /// Explicit cluster configuration of one node.
 #[derive(Debug, Clone)]
 pub struct ClusterOptions {
@@ -37,6 +106,8 @@ pub struct ClusterOptions {
     pub peers: Vec<(u64, SocketAddr)>,
     /// Static metadata authority fixture. Not a Raft-committed snapshot.
     pub metadata: Option<PathBuf>,
+    /// Raft-committed metadata authority. Mutually exclusive with the static fixture.
+    pub metadata_raft: Option<MetadataRaftOptions>,
 }
 
 pub struct Cluster {
@@ -45,10 +116,23 @@ pub struct Cluster {
     pub transport: Arc<PeerTransport>,
     pub node: NodeId,
     pub started: Instant,
+    /// The metadata voter of this node, when Raft mode is active.
+    pub raft: Option<Arc<rovqet_metadata_raft::MetadataNode>>,
+}
+
+/// Rejects a configuration in which a static fixture could override committed metadata.
+pub fn validate(options: &ClusterOptions) -> std::io::Result<()> {
+    if options.metadata_raft.is_some() && options.metadata.is_some() {
+        return Err(invalid(
+            "a static metadata fixture must not override committed Raft metadata",
+        ));
+    }
+    Ok(())
 }
 
 impl Cluster {
-    pub fn new(options: &ClusterOptions) -> std::io::Result<Self> {
+    pub async fn new(options: &ClusterOptions) -> std::io::Result<Self> {
+        validate(options)?;
         let cluster = ClusterId::new(options.cluster_id).ok_or_else(|| invalid("cluster id"))?;
         let node = NodeId::new(options.node_id).ok_or_else(|| invalid("node id"))?;
         let mut peers = Vec::with_capacity(options.peers.len());
@@ -75,13 +159,30 @@ impl Cluster {
                 .map_err(|error| invalid(format!("cluster metadata rejected: {error}")))?;
         }
         let transport = Arc::new(PeerTransport::new(&trust, TransportLimits::default()));
+        let raft = match &options.metadata_raft {
+            Some(raft_options) => Some(start_metadata_raft(raft_options, &store).await?),
+            None => None,
+        };
         Ok(Self {
             trust,
             store,
             transport,
             node,
             started: Instant::now(),
+            raft,
         })
+    }
+
+    /// The metadata voter of this node, when Raft mode is active.
+    pub fn raft_node(&self) -> Option<&rovqet_metadata_raft::MetadataNode> {
+        self.raft.as_deref()
+    }
+
+    /// The committed metadata revision known to this node, when Raft mode is active.
+    pub fn committed_metadata_revision(&self) -> Option<u64> {
+        self.raft
+            .as_ref()
+            .and_then(|node| node.applied_state().revision.into())
     }
 
     pub fn revision(&self) -> u64 {
@@ -364,4 +465,154 @@ pub fn publish_ack(
 /// Default relative timeout budget for one forwarded request.
 pub fn forward_budget() -> rovqet_control::TimeoutBudget {
     rovqet_control::TimeoutBudget::new(5_000).expect("bounded budget")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rovqet_metadata_raft::types::MetadataCommand;
+    use std::time::Duration;
+
+    fn free_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("port");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        port
+    }
+
+    fn directory(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "rovqet-server-raft-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&path).expect("directory");
+        path
+    }
+
+    fn raft_options(port: u16, path: PathBuf) -> MetadataRaftOptions {
+        MetadataRaftOptions {
+            cluster_id: 5150,
+            node_id: 1,
+            listen: format!("127.0.0.1:{port}").parse().expect("addr"),
+            peers: vec![(1, format!("127.0.0.1:{port}").parse().expect("addr"))],
+            data_directory: path,
+            bootstrap: true,
+        }
+    }
+
+    #[test]
+    fn a_static_fixture_must_not_override_committed_raft_metadata() {
+        let mut options = ClusterOptions {
+            cluster_id: 5150,
+            node_id: 1,
+            listen: "127.0.0.1:0".parse().expect("addr"),
+            peers: Vec::new(),
+            metadata: Some(PathBuf::from("/tmp/does-not-matter.json")),
+            metadata_raft: Some(raft_options(free_port(), directory("conflict"))),
+        };
+        let rejected = validate(&options);
+        assert!(
+            rejected.is_err(),
+            "a static fixture must not override committed Raft metadata"
+        );
+        options.metadata = None;
+        assert!(
+            validate(&options).is_ok(),
+            "Raft mode alone must be accepted"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_committed_metadata_becomes_the_ownership_authority() {
+        let port = free_port();
+        let path = directory("authority");
+        let options = ClusterOptions {
+            cluster_id: 5150,
+            node_id: 1,
+            listen: "127.0.0.1:0".parse().expect("addr"),
+            peers: Vec::new(),
+            metadata: None,
+            metadata_raft: Some(raft_options(port, path.clone())),
+        };
+        let cluster = Cluster::new(&options).await.expect("cluster");
+        let node = cluster.raft_node().expect("the metadata voter");
+
+        // No committed metadata yet: the data plane has no authority at all.
+        assert!(
+            cluster.store.current().is_none(),
+            "the store must stay empty until the first committed snapshot"
+        );
+        assert!(
+            cluster
+                .authority_for(&PartitionRef {
+                    tenant_id: 1,
+                    topic_id: 3,
+                    partition_id: 0,
+                })
+                .is_none()
+        );
+
+        node.propose(MetadataCommand::SetNode {
+            node: 1,
+            address: "127.0.0.1:1".into(),
+        })
+        .await
+        .expect("committed node");
+        node.propose(MetadataCommand::SetPlacement {
+            tenant_id: 1,
+            topic_id: 3,
+            partition_id: 0,
+            owner: 1,
+            ownership_epoch: 7,
+            lease_valid_for_ms: 60_000,
+        })
+        .await
+        .expect("committed placement");
+
+        // The committed snapshot reaches the data plane. Every committed revision is
+        // published, so the store advances to the placement revision.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while cluster
+            .store
+            .current()
+            .map(|snapshot| snapshot.revision.get())
+            != Some(2)
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let snapshot = cluster
+            .store
+            .current()
+            .expect("the committed snapshot must be installed");
+        assert_eq!(snapshot.revision.get(), 2);
+
+        let partition = PartitionRef {
+            tenant_id: 1,
+            topic_id: 3,
+            partition_id: 0,
+        };
+        let authority = cluster
+            .authority_for(&partition)
+            .expect("the committed placement must become the authority");
+        assert_eq!(authority.owner, 1);
+        assert_eq!(
+            authority.epoch, 7,
+            "the committed ownership epoch must be used"
+        );
+        assert_eq!(authority.lease, Duration::from_millis(60_000));
+
+        // An expired lease fails closed.
+        let placement = snapshot
+            .partitions
+            .iter()
+            .find(|placement| placement.partition == partition)
+            .expect("placement");
+        assert!(!cluster.store.authority_expired(placement));
+        let _ = std::fs::remove_dir_all(path);
+    }
 }

@@ -1,0 +1,19 @@
+[package]
+name = "rovqet-metadata-raft"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+rovqet-control = { path = "../control" }
+rovqet-core = { path = "../core" }
+openraft = { version = "=0.9.26", features = ["serde", "storage-v2"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "fs", "io-std"] }
+
+[dev-dependencies]
+tempfile = "3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

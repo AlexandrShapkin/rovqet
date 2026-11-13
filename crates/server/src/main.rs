@@ -51,8 +51,18 @@ impl Options {
         let mut cluster_listen: Option<SocketAddr> = None;
         let mut cluster_metadata: Option<PathBuf> = None;
         let mut cluster_peers: Vec<(u64, SocketAddr)> = Vec::new();
+        let mut metadata_raft = false;
+        let mut metadata_raft_dir: Option<PathBuf> = None;
+        let mut metadata_raft_listen: Option<SocketAddr> = None;
+        let mut metadata_raft_peers: Vec<(u64, SocketAddr)> = Vec::new();
+        let mut metadata_raft_bootstrap = false;
         for pair in args.chunks(2) {
-            if pair.len() != 2 || !seen.insert(pair[0].as_str()) {
+            if pair.len() != 2 {
+                return Err(invalid("expected unique --option value pairs; see --help"));
+            }
+            // A peer list may be given more than once; every other option is unique.
+            let repeatable = matches!(pair[0].as_str(), "--cluster-peer" | "--metadata-raft-peer");
+            if !repeatable && !seen.insert(pair[0].as_str()) {
                 return Err(invalid("expected unique --option value pairs; see --help"));
             }
             match pair[0].as_str() {
@@ -95,6 +105,42 @@ impl Options {
                     )
                 }
                 "--cluster-metadata" => cluster_metadata = Some(PathBuf::from(&pair[1])),
+                "--metadata-raft" => {
+                    metadata_raft = match pair[1].as_str() {
+                        "true" => true,
+                        "false" => false,
+                        _ => return Err(invalid("--metadata-raft must be true or false")),
+                    }
+                }
+                "--metadata-raft-dir" => metadata_raft_dir = Some(PathBuf::from(&pair[1])),
+                "--metadata-raft-listen" => {
+                    metadata_raft_listen = Some(
+                        pair[1]
+                            .parse()
+                            .map_err(|_| invalid("invalid metadata raft listen address"))?,
+                    )
+                }
+                "--metadata-raft-bootstrap" => {
+                    metadata_raft_bootstrap = match pair[1].as_str() {
+                        "true" => true,
+                        "false" => false,
+                        _ => {
+                            return Err(invalid("--metadata-raft-bootstrap must be true or false"));
+                        }
+                    }
+                }
+                "--metadata-raft-peer" => {
+                    let (id, address) = pair[1]
+                        .split_once('=')
+                        .ok_or_else(|| invalid("metadata raft peer must be node=host:port"))?;
+                    metadata_raft_peers.push((
+                        id.parse()
+                            .map_err(|_| invalid("invalid metadata raft peer node id"))?,
+                        address
+                            .parse()
+                            .map_err(|_| invalid("invalid metadata raft peer address"))?,
+                    ));
+                }
                 "--cluster-peer" => {
                     let (id, address) = pair[1]
                         .split_once('=')
@@ -157,18 +203,56 @@ impl Options {
             )));
         }
         result.q1 = q1::Options::parse(&q1_values)?;
+        let metadata_raft_requested = metadata_raft
+            || metadata_raft_dir.is_some()
+            || metadata_raft_listen.is_some()
+            || !metadata_raft_peers.is_empty()
+            || metadata_raft_bootstrap;
+        if metadata_raft_requested && !metadata_raft {
+            return Err(invalid(
+                "metadata raft options require --metadata-raft true",
+            ));
+        }
         match (cluster_id, node_id) {
             (Some(cluster_id), Some(node_id)) => {
                 let listen = cluster_listen.unwrap_or_else(|| "127.0.0.1:0".parse().unwrap());
                 if !listen.ip().is_loopback() {
                     return Err(invalid("cluster listener must be loopback"));
                 }
+                let metadata_raft_options = if metadata_raft {
+                    if cluster_metadata.is_some() {
+                        // A static fixture must never override committed Raft metadata.
+                        return Err(invalid(
+                            "a static metadata fixture must not override committed Raft metadata",
+                        ));
+                    }
+                    let directory = metadata_raft_dir.ok_or_else(|| {
+                        invalid("metadata raft mode requires --metadata-raft-dir")
+                    })?;
+                    let raft_listen = metadata_raft_listen.ok_or_else(|| {
+                        invalid("metadata raft mode requires --metadata-raft-listen")
+                    })?;
+                    if !raft_listen.ip().is_loopback() {
+                        return Err(invalid("metadata raft listener must be loopback"));
+                    }
+                    Some(cluster::MetadataRaftOptions {
+                        cluster_id,
+                        node_id,
+                        listen: raft_listen,
+                        peers: metadata_raft_peers.clone(),
+                        data_directory: directory,
+                        bootstrap: metadata_raft_bootstrap,
+                    })
+                } else {
+                    None
+                };
                 result.cluster = Some(cluster::ClusterOptions {
                     cluster_id,
                     node_id,
                     listen,
                     peers: cluster_peers,
                     metadata: cluster_metadata,
+                    metadata_raft: metadata_raft_options,
                 });
             }
             (None, None) => {
@@ -177,6 +261,11 @@ impl Options {
                     || cluster_metadata.is_some()
                 {
                     return Err(invalid("cluster mode requires --cluster-id and --node-id"));
+                }
+                if metadata_raft_requested {
+                    return Err(invalid(
+                        "metadata raft mode requires --cluster-id and --node-id",
+                    ));
                 }
             }
             _ => {
@@ -303,7 +392,7 @@ async fn main() -> io::Result<()> {
     // partition can be fenced by the committed ownership authority.
     let cluster = match &options.cluster {
         Some(cluster_options) => {
-            let cluster = Arc::new(cluster::Cluster::new(cluster_options)?);
+            let cluster = Arc::new(cluster::Cluster::new(cluster_options).await?);
             eprintln!(
                 "cluster mode: node={} cluster={} peers={} metadata_revision={}",
                 cluster.node,
@@ -337,6 +426,23 @@ async fn main() -> io::Result<()> {
             let authority = cluster.authority_for(&q1.partition);
             if let Some(route) = &route {
                 route.install_authority(authority);
+                // In Raft mode the authority follows the committed metadata: it is installed
+                // again whenever the committed revision changes. Nothing mints an epoch, extends
+                // a lease or activates a replacement owner.
+                if let Some(node) = cluster.raft_node() {
+                    let cluster = cluster.clone();
+                    let route = route.clone();
+                    let partition = q1.partition;
+                    let mut updates = node.committed_updates();
+                    tokio::spawn(async move {
+                        loop {
+                            if updates.changed().await.is_err() {
+                                return;
+                            }
+                            route.install_authority(cluster.authority_for(&partition));
+                        }
+                    });
+                }
             }
             if authority.is_some() {
                 eprintln!(

@@ -14,6 +14,7 @@ rovqet-q0 = { path = "../q0" }
 rovqet-router = { path = "../router" }
 rovqet-core = { path = "../core" }
 rovqet-control = { path = "../control" }
+rovqet-metadata-raft = { path = "../metadata-raft" }
 rovqet-protocol = { path = "../protocol" }
 rovqet-transport = { path = "../transport" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }

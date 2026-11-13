@@ -83,14 +83,23 @@ Raft-committed snapshot. A process restart starts without any installed authorit
 restart can never extend ownership authorization. Authority is time-bounded from local
 installation and expires fail-closed.
 
+In Raft mode the source is the committed metadata of the metadata group instead: the broker
+joins the group, installs every committed and applied snapshot into the metadata store and
+re-installs the ownership authority whenever the committed revision changes. The store stays
+empty until the first snapshot is committed, so the data plane fails closed while the group
+has no committed metadata. A static fixture and Raft mode are mutually exclusive: a fixture
+must never override committed Raft metadata, and a broker that is configured with both
+refuses to start. The authority is always taken verbatim from the committed snapshot: no
+epoch is minted, no lease is extended and no replacement owner is activated by an election.
+
 Routing reads exactly one snapshot, validates the partition and epoch and then either serves
 locally, forwards once to the configured owner or returns a typed stale/expired/no-metadata
 error. A routed request is never routed again, which bounds redirect loops. A proxy never
 substitutes the producer token, never mints an epoch and never reports COMMITTED_LOCAL
 without the owner's own durable barrier.
 
-Metadata consensus, membership management, ownership handover, WAL migration, Q2 replication
-and majority acknowledgment remain C-02/C-03 work.
+Metadata consensus and membership management are implemented in C-02; ownership handover, WAL
+migration, Q2 replication and majority acknowledgment remain C-02/C-03 work.
 
 ## C-02 ownership fencing protocol (implemented part)
 
@@ -113,6 +122,8 @@ partition with an installed authority is a fenced owner:
 Safety model: a replacement owner may only activate after the previous owner has been
 observed to stop accepting mutations (confirmed revocation) or after its lease has expired.
 Until one of those conditions holds, the target stays inactive; availability is never
-traded for single-owner safety. The metadata Raft group (C-02 remaining work) provides the
+traded for single-owner safety. The metadata Raft group (implemented in C-02) provides the
 committed transition that starts this protocol; the C-01 static fixture is only a
-development authority source.
+development authority source. A Raft election alone still proves no revocation: the old
+owner keeps its authority until its lease validity interval ends, so a committed placement
+revision does not by itself activate a replacement owner.

@@ -76,22 +76,46 @@ Aggregation reduces per-partition timers/elections/fsync; a hot partition may wo
 
 Tests use an external oracle and independently persisted test node data directories. A three-process single-host smoke test is useful development feedback but not a claim about independent physical failure domains.
 
-## C-02 metadata consensus library decision (not yet integrated)
+## C-02 metadata consensus: library decision and implemented contract
 
 C-02 implements **metadata** consensus only; Q2 data shards stay C-03 work. The architecture
 references OpenRaft 0.9.x, so the selected line is **openraft 0.9.26** (the newest 0.9
-release). The newer 0.10 line changes the storage and network contracts and is therefore not
-used. The chosen version's API assumptions are:
+release), pinned exactly (`openraft = "=0.9.26"`, features `serde` and `storage-v2`). The
+newer 0.10 line changes the storage and network contracts and is therefore not used. The
+library types stay inside the dedicated `crates/metadata-raft` adapter; the public
+control-plane model (`MetadataSnapshot`, placements, epochs) does not depend on OpenRaft
+internals, and Raft log indexes remain unrelated to Q1 application offsets: the metadata log
+and the Q1 WAL are separate durability domains.
 
-- storage uses the `v2` traits: `RaftLogStorage` (append with a `LogFlushed` completion
-  callback, truncate, purge, vote persistence, committed-index persistence and a
-  `RaftLogReader`), `RaftStateMachine` with a snapshot builder, `RaftNetwork` (vote,
-  append entries, install snapshot) and `RaftNetworkFactory`;
-- entries carry application data with an explicit response type, so library types stay
-  inside a dedicated metadata adapter and the public control-plane model
-  (`MetadataSnapshot`, placements, epochs) does not depend on OpenRaft internals;
-- Raft log indexes are unrelated to Q1 application offsets: the metadata log and the Q1 WAL
-  remain separate durability domains.
+The verified contract of that release, as implemented:
 
-The adapter, its disk-backed log storage and the three-voter group are the remaining C-02
-work; the fencing protocol that depends on committed metadata is implemented and tested.
+- **Log indexes are zero based and there is no sentinel entry.** The first entry of a fresh
+  group has index 0, and `prev_log_id = None` means "replicate from the very beginning"
+  (`None.next_index() == 0`). A default `LogId` must never be fabricated.
+- **The persisted log is keyed by `entry.log_id.index`.** A second numbering scheme (a
+  storage-internal sequence counter) silently shifts entries and trips the library's own
+  follower assertion (`first entry index == prev_log_id.next_index()`).
+- **Readers must observe later appends.** `RaftLogReader` instances are held across appends
+  and must return a non-empty result for a non-empty range, so the reader shares the live
+  index map instead of a copy taken when the reader was created.
+- **`truncate(log_id)` drops `log_id` itself and everything after it; `purge(log_id)` drops
+  everything up to and including it.** Neither may leave a hole, and the last purged log id
+  is persisted, because `get_log_state` must report that id when no entry remains.
+- **The state machine returns exactly one result per applied entry**, including blank and
+  membership entries; the library asserts the count.
+- **The durable completion callback fires only after the data is durable.** A failed flush is
+  an uncertain write: the storage is poisoned and fails closed instead of serving a log it
+  cannot vouch for. A corrupted, truncated or discontinuous log fails closed on open and is
+  never reset.
+- **Snapshots are durable and validated.** A snapshot is published as an image plus its
+  metadata, atomically replaced; an interrupted publication leaves the previous snapshot
+  intact, and a snapshot that does not validate is never served or installed. The received
+  image is read from the start of the cursor.
+- **Inter-node RPCs** are length-prefixed, CRC32C-checked JSON frames over loopback TCP,
+  carrying only the library's own vote, append-entries and snapshot messages. No second
+  consensus or election algorithm exists in the adapter.
+
+The remaining C-02 work is the staged Q1 migration (`PREPARE -> CATCH_UP -> FENCE_OLD ->
+ACTIVATE_NEW -> CLEANUP`); the fencing protocol that depends on committed metadata is
+implemented and tested, and committed metadata now reaches the data plane as the only source
+of ownership authority in Raft mode.
