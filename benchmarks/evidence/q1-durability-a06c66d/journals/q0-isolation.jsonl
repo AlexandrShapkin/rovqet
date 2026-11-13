@@ -1,2 +1,0 @@
-{"event": "q0_isolation", "output": "test_q0_publishes_while_q1_waits_for_storage_barrier (__main__.Q1ProcessFaults.test_q0_publishes_while_q1_waits_for_storage_barrier) ... ok\n\n----------------------------------------------------------------------\nRan 1 test in 0.029s\n\nOK\n", "returncode": 0, "run": "q0-isolation", "schema": "rovqet-q1-oracle-v1", "seq": 0, "time_mono_ns": 66418846426954}
-{"counts": {"fixtures": 1}, "event": "conclusion", "reason": null, "run": "q0-isolation", "schema": "rovqet-q1-oracle-v1", "seq": 1, "time_mono_ns": 66418909243188, "verdict": "PASS"}

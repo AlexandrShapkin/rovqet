@@ -832,7 +832,7 @@
         "docs/architecture/09-cluster-control.md"
       ],
       "evidence": {
-        "commit": "PENDING",
+        "commit": "d933e86d627f03047bc6226391e12069d2376e8f",
         "verification": "PASS: two locally running brokers with distinct node IDs, cluster identity, peer ports, metadata fixtures and data directories exchange typed inter-node RPCs over real loopback TCP; a publication sent to the non-owner is forwarded exactly once and committed by the owner, returning the owner's own durable offset.",
         "test_command": [
           "cargo fmt --all -- --check",

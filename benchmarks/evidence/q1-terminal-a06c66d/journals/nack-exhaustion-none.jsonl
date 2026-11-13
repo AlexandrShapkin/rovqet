@@ -1,6 +1,0 @@
-{"attempt": 1, "event": "delivery", "generation": 1, "group": 9, "message_id": 100, "offset": 0, "phase": "first", "run": "nack-exhaustion-none", "schema": "rovqet-q1-oracle-v1", "seq": 0, "time_mono_ns": 66415853599647}
-{"attempt": 1, "event": "nack_request", "offset": 0, "run": "nack-exhaustion-none", "schema": "rovqet-q1-oracle-v1", "seq": 1, "time_mono_ns": 66415854840103}
-{"attempt": 2, "event": "delivery", "generation": 1, "group": 9, "message_id": 100, "offset": 0, "phase": "redelivery", "run": "nack-exhaustion-none", "schema": "rovqet-q1-oracle-v1", "seq": 2, "time_mono_ns": 66415963667493}
-{"attempt": 2, "event": "nack_request", "offset": 0, "run": "nack-exhaustion-none", "schema": "rovqet-q1-oracle-v1", "seq": 3, "time_mono_ns": 66415967642947}
-{"event": "generation_observed", "generation": 1, "group": 9, "run": "nack-exhaustion-none", "schema": "rovqet-q1-oracle-v1", "seq": 4, "time_mono_ns": 66415968746304}
-{"counts": {"acknowledged": 0, "application_offsets": 1, "cursor": 0, "redelivered": 0, "uncertain_committed": 0}, "event": "conclusion", "reason": null, "run": "nack-exhaustion-none", "schema": "rovqet-q1-oracle-v1", "seq": 5, "time_mono_ns": 66415991323300, "verdict": "PASS"}
