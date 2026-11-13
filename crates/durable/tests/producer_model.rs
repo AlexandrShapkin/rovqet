@@ -56,6 +56,7 @@ impl Harness {
         let config = PartitionConfig {
             partition,
             ownership_epoch: 3,
+            node_id: 0,
             queue_messages: 4,
             queue_bytes: 4096,
             max_outcomes,

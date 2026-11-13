@@ -31,6 +31,8 @@ pub struct DlqOptions {
 pub struct Options {
     pub directory: PathBuf,
     pub topic: String,
+    /// Local node identity used for ownership fencing; zero means standalone mode.
+    pub node_id: u64,
     pub partition: PartitionRef,
     pub incarnation: u128,
     pub owner_epoch: u64,
@@ -73,6 +75,7 @@ impl Options {
         let mut result = Self {
             directory: PathBuf::from(get("--q1-data-dir")?),
             topic,
+            node_id: 0,
             partition: PartitionRef {
                 tenant_id: number("--q1-tenant-id")?,
                 topic_id: number("--q1-topic-id")?,
@@ -371,6 +374,7 @@ impl Route {
         let config = PartitionConfig {
             partition: options.partition,
             ownership_epoch: options.owner_epoch,
+            node_id: options.node_id,
             queue_messages: 64,
             queue_bytes: 4 * 1024 * 1024,
             max_outcomes: options.max_outcomes,
@@ -392,6 +396,7 @@ impl Route {
                 let dlq_config = PartitionConfig {
                     partition: dlq_options.partition,
                     ownership_epoch: dlq_options.owner_epoch,
+                    node_id: options.node_id,
                     queue_messages: 64,
                     queue_bytes: 4 * 1024 * 1024,
                     max_outcomes: dlq_options.max_outcomes,
@@ -468,6 +473,11 @@ impl Route {
             dlq,
             _lock: lock,
         })
+    }
+    /// Installs the committed ownership authority of this partition. Fenced partitions
+    /// refuse durable mutations until a newer authority is installed.
+    pub fn install_authority(&self, authority: Option<rovqet_durable::Authority>) {
+        let _ = self.partition.set_authority(authority);
     }
     pub fn shutdown(self) -> io::Result<()> {
         let Route { partition, dlq, .. } = self;
@@ -1178,6 +1188,8 @@ fn map_error(error: DurableError) -> ErrorCode {
         DurableError::Capacity => ErrorCode::ResourceExhausted,
         DurableError::Expired => ErrorCode::ExpiredBeforeDelivery,
         DurableError::DlqUnavailable => ErrorCode::DlqUnavailable,
+        DurableError::Fenced => ErrorCode::StaleEpoch,
+        DurableError::FenceExpired => ErrorCode::StaleEpoch,
         DurableError::Unavailable | DurableError::InvalidConfig | DurableError::WorkerStart(_) => {
             ErrorCode::StorageUnavailable
         }
@@ -1676,6 +1688,7 @@ mod tests {
             let config = PartitionConfig {
                 partition: options.partition,
                 ownership_epoch: 7,
+                node_id: 0,
                 queue_messages: 64,
                 queue_bytes: 4 * 1024 * 1024,
                 max_outcomes: 1000,
@@ -1693,6 +1706,7 @@ mod tests {
                 let dlq_config = PartitionConfig {
                     partition: dlq_options.partition,
                     ownership_epoch: dlq_options.owner_epoch,
+                    node_id: options.node_id,
                     queue_messages: 64,
                     queue_bytes: 4 * 1024 * 1024,
                     max_outcomes: dlq_options.max_outcomes,

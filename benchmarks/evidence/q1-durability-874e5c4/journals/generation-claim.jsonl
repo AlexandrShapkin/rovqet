@@ -1,0 +1,4 @@
+{"at": "generation-claim", "event": "fault", "kind": "process_kill", "run": "generation-claim", "schema": "rovqet-q1-oracle-v1", "seq": 0, "time_mono_ns": 70060560910732}
+{"event": "generation_observed", "generation": 1, "group": 9, "run": "generation-claim", "schema": "rovqet-q1-oracle-v1", "seq": 1, "time_mono_ns": 70060574781442}
+{"digest": "e263531ee27ce15f9704057737dbb09d8ed334ce0826c0b44182451e39e9a9a5", "event": "recovered_record", "incarnation": 42, "message_id": 1000, "offset": 0, "run": "generation-claim", "schema": "rovqet-q1-oracle-v1", "seq": 2, "time_mono_ns": 70060582367412}
+{"counts": {"generation": 1, "records": 1}, "event": "conclusion", "reason": null, "run": "generation-claim", "schema": "rovqet-q1-oracle-v1", "seq": 3, "time_mono_ns": 70060587099772, "verdict": "PASS"}

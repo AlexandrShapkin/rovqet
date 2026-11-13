@@ -1,0 +1,2 @@
+{"event": "stale_generation_attempt", "generation": 1, "outcome": "rejected", "run": "stale-generation", "schema": "rovqet-q1-oracle-v1", "seq": 0, "time_mono_ns": 70059244951856}
+{"counts": {"stale_extensions": 0}, "event": "conclusion", "reason": null, "run": "stale-generation", "schema": "rovqet-q1-oracle-v1", "seq": 1, "time_mono_ns": 70059246229967, "verdict": "PASS"}

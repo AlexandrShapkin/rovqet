@@ -66,6 +66,7 @@ fn config(partition: PartitionRef, group: rovqet_durable::GroupConfig) -> Partit
     PartitionConfig {
         partition,
         ownership_epoch: 7,
+        node_id: 0,
         queue_messages: 64,
         queue_bytes: 4 * 1024 * 1024,
         max_outcomes: 512,

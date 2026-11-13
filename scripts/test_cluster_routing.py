@@ -31,7 +31,7 @@ def free_port() -> int:
         return sock.getsockname()[1]
 
 
-def snapshot_file(path: Path, owner: int) -> None:
+def snapshot_file(path: Path, owner: int, lease_ms: int = 600_000) -> None:
     path.write_text(json.dumps({
         "cluster_id": CLUSTER,
         "revision": 1,
@@ -51,7 +51,7 @@ def snapshot_file(path: Path, owner: int) -> None:
             "partition_id": 0,
             "owner": owner,
             "ownership_epoch": 9,
-            "lease_valid_for_ms": 600_000,
+            "lease_valid_for_ms": lease_ms,
             "desired_replicas": 1,
             "shard_id": 0,
             "required_policy_revision": 1,
@@ -63,13 +63,13 @@ class Node:
     """One broker process in cluster mode."""
 
     def __init__(self, directory: Path, node_id: int, peer: int, peer_port: int,
-                 owner: int, peer_port_self: int):
+                 owner: int, peer_port_self: int, lease_ms: int = 600_000):
         self.directory = directory
         self.node_id = node_id
         self.data = directory / f"wal{node_id}"
         self.data.mkdir(parents=True, exist_ok=True)
         self.metadata = directory / f"metadata{node_id}.json"
-        snapshot_file(self.metadata, owner)
+        snapshot_file(self.metadata, owner, lease_ms)
         self.client_port = free_port()
         self.cluster_port = peer_port_self
         self.process = subprocess.Popen(
@@ -91,14 +91,14 @@ class Node:
             ],
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         self.lines: list[str] = []
-        self._read()
+        import threading
+        self._reader = threading.Thread(target=self._read, daemon=True)
+        self._reader.start()
 
     def _read(self) -> None:
         assert self.process.stderr is not None
         for line in self.process.stderr:
             self.lines.append(line.rstrip())
-            if "listening on" in line:
-                return
 
     def wait_ready(self, seconds: int = 20) -> None:
         deadline = time.monotonic() + seconds
@@ -164,6 +164,32 @@ class ClusterRouting(unittest.TestCase):
         self.assertEqual(retry.returncode, 0, (retry.stdout, retry.stderr))
         self.assertIn("COMMITTED_LOCAL 42 0", retry.stdout, retry.stdout)
         self.assertEqual(len(self.owner.read_history()), 1)
+
+    def test_an_expired_ownership_lease_fences_the_old_owner(self):
+        """A stale owner must stop committing once its ownership lease expires."""
+        temporary = tempfile.TemporaryDirectory(prefix="rovqet-lease-")
+        directory = Path(temporary.name)
+        port_a = free_port()
+        port_b = free_port()
+        owner = Node(directory, 1, 2, port_b, 1, port_a, lease_ms=400)
+        peer = Node(directory, 2, 1, port_a, 1, port_b, lease_ms=400)
+        try:
+            owner.wait_ready()
+            peer.wait_ready()
+            # While the lease is valid the owner may still commit.
+            committed = owner.publish(0)
+            self.assertEqual(committed.returncode, 0, (committed.stdout, committed.stderr))
+            self.assertIn("COMMITTED_LOCAL", committed.stdout)
+            time.sleep(0.6)
+            # After expiry the same node is fenced: no further durable commit is possible.
+            expired = owner.publish(1)
+            self.assertNotEqual(expired.returncode, 0)
+            self.assertIn("StaleEpoch", expired.stdout + expired.stderr)
+            self.assertEqual(len(owner.read_history()), 1)
+        finally:
+            owner.stop()
+            peer.stop()
+            temporary.cleanup()
 
     def test_inter_node_health_and_ownership_inspection(self):
         probe = subprocess.run(

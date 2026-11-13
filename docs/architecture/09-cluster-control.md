@@ -91,3 +91,28 @@ without the owner's own durable barrier.
 
 Metadata consensus, membership management, ownership handover, WAL migration, Q2 replication
 and majority acknowledgment remain C-02/C-03 work.
+
+## C-02 ownership fencing protocol (implemented part)
+
+The durable Q1 partition owns the fencing state, not only the routing layer. A partition in
+standalone mode (no installed authority) keeps the previous single-node behaviour. A
+partition with an installed authority is a fenced owner:
+
+- `Authority { owner, epoch, lease }` is installed from committed control-plane metadata by
+  `Partition::set_authority`. The command is ordered with durable mutations in the actor.
+- Every durable mutation checks the authority before it starts: publication, deduplicated
+  retry, consumer FETCH, consumer ACK, consumer NACK and terminal disposition (quarantine and
+  DLQ) all fail closed with a stale-epoch error when this node is not the committed owner.
+- The ownership lease is bounded and counted from local installation. An expired lease fails
+  closed; a restart never extends it.
+- An older epoch can never replace a newer authority, so a stale snapshot cannot un-fence a
+  fenced owner.
+- A mutation whose lease expires while its durability barrier runs is reported as an
+  uncertain outcome, never as a definite failure or a false `COMMITTED_LOCAL`.
+
+Safety model: a replacement owner may only activate after the previous owner has been
+observed to stop accepting mutations (confirmed revocation) or after its lease has expired.
+Until one of those conditions holds, the target stays inactive; availability is never
+traded for single-owner safety. The metadata Raft group (C-02 remaining work) provides the
+committed transition that starts this protocol; the C-01 static fixture is only a
+development authority source.

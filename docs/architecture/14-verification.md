@@ -120,3 +120,22 @@ append/sync windows. Recovery must produce exactly one DLQ record, complete the 
 terminal only after its own barrier, and retain the original publication in every case.
 Actor tests additionally cover bounded retry/terminal state, corrupt terminal metadata,
 unavailable DLQ, sparse terminal closure and real destination readability and idempotence.
+
+## C-02 fencing verification (executed part)
+
+`crates/durable/tests/fencing.rs` and `scripts/test_cluster_routing.py` verify the ownership
+fencing protocol at the durable commit boundary:
+
+- a standalone partition is not fenced and keeps its previous behaviour;
+- a partition whose committed authority names another node refuses publications, consumer
+  deliveries, acknowledgements and NACKs;
+- an expired ownership lease fails closed instead of committing;
+- a newer authority fences the previous owner, and an older epoch can never replace it;
+- across two real broker processes a publication to the non-owner is forwarded to the
+  owner, the owner performs the durable commit and returns its own offset, and the same
+  token retry returns the same offset without a second record;
+- across two real broker processes an expired ownership lease stops the old owner from
+  committing further records while its committed history stays readable.
+
+The metadata Raft group, committed-metadata driven ownership transitions and the staged Q1
+migration are not yet verified and C-02 therefore stays IN_PROGRESS.

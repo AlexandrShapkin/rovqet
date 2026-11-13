@@ -462,6 +462,24 @@ impl Partition {
     }
 }
 impl State {
+    /// Installs the committed ownership authority. Standalone partitions keep no authority.
+    /// An older epoch never replaces a newer one: committed metadata is monotonic.
+    pub(super) fn set_authority(&mut self, authority: Option<Authority>) {
+        if let (Some(current), Some(next)) = (self.fence.authority(), authority) {
+            if next.epoch < current.epoch {
+                return;
+            }
+        }
+        self.fence.install(authority, Instant::now());
+    }
+    /// Validates a durable mutation against the installed ownership authority.
+    pub(super) fn check_authority(&self) -> std::result::Result<(), Error> {
+        match self.fence.check(self.config.node_id, None, Instant::now()) {
+            Ok(()) => Ok(()),
+            Err(FenceError::ExpiredLease) => Err(Error::FenceExpired),
+            Err(_) => Err(Error::Fenced),
+        }
+    }
     fn next_lease_id(group: &mut GroupState) -> u128 {
         let id = group.next_lease;
         group.next_lease = group.next_lease.wrapping_add(1).max(1);
@@ -843,6 +861,9 @@ impl State {
         if r.generation == 0 {
             self.claim_generation(r.group_id)?;
         }
+        // Fencing: a partition that is not the committed owner serves no consumer deliveries.
+        self.check_authority()
+            .map_err(|_| GroupError::StaleGeneration)?;
         self.advance_clock();
         // Retry exhaustion and expired attempts can require a durable terminal transition
         // before selection. Gather candidates, then release the group borrow for IO.
@@ -1025,6 +1046,9 @@ impl State {
         if self.unhealthy {
             return Err(GroupError::Unavailable);
         }
+        // Fencing: consumer acknowledgements are fenced exactly like publications.
+        self.check_authority()
+            .map_err(|_| GroupError::StaleGeneration)?;
         if r.ownership_epoch != self.config.ownership_epoch {
             return Err(GroupError::StaleGeneration);
         }
@@ -1232,6 +1256,9 @@ impl State {
         if self.unhealthy {
             return Err(GroupError::Unavailable);
         }
+        // Fencing: retries and terminal transitions are fenced too.
+        self.check_authority()
+            .map_err(|_| GroupError::StaleGeneration)?;
         if r.ownership_epoch != self.config.ownership_epoch {
             return Err(GroupError::StaleGeneration);
         }
@@ -1341,6 +1368,9 @@ impl State {
         offset: u64,
         reason: u8,
     ) -> std::result::Result<NackOutcome, GroupError> {
+        // Fencing: a terminal disposition is a durable mutation as well.
+        self.check_authority()
+            .map_err(|_| GroupError::StaleGeneration)?;
         let kind = match self.config.group.terminal_policy {
             TerminalPolicy::None => return Err(GroupError::InvalidRequest),
             TerminalPolicy::Quarantine => TerminalKind::Quarantine,

@@ -265,6 +265,13 @@ in this prototype.
 python3 scripts/test_cluster_routing.py   # two local brokers, real forwarded publication
 ```
 
+In cluster mode the durable partition is fenced by the committed ownership authority: a node
+that is not the committed owner refuses publications, consumer deliveries, acknowledgements
+and terminal dispositions, an expired ownership lease fails closed, and an older epoch can
+never replace a newer one. A replacement owner may only activate after the previous owner
+stopped accepting mutations or its lease expired, so single-owner safety is never traded for
+availability.
+
 The durability campaign journals externally acknowledged publications and consumer ACKs in a
 parent-owned, fsynced file, kills the broker at deterministic barriers, restarts on the same
 storage and reconciles exact identities, sparse cursor state, generation fencing and WAL

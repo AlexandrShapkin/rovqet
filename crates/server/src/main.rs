@@ -189,6 +189,14 @@ impl Options {
     }
 }
 
+fn cluster_options_listen(options: &Options) -> std::net::SocketAddr {
+    options
+        .cluster
+        .as_ref()
+        .map(|cluster| cluster.listen)
+        .unwrap_or_else(|| "127.0.0.1:0".parse().unwrap())
+}
+
 fn development_broker(max_sessions: usize) -> Arc<Broker> {
     let topics = ["demo", "telemetry"]
         .into_iter()
@@ -291,7 +299,28 @@ async fn main() -> io::Result<()> {
     let options = Arc::new(Options::parse(&args)?);
     q1::validate_test_environment()?;
     let listener = tokio::net::TcpListener::bind(options.listen).await?;
-    let route = if let Some(q1) = options.q1.clone() {
+    // Cluster mode knows the local node identity before the durable route is opened, so the
+    // partition can be fenced by the committed ownership authority.
+    let cluster = match &options.cluster {
+        Some(cluster_options) => {
+            let cluster = Arc::new(cluster::Cluster::new(cluster_options)?);
+            eprintln!(
+                "cluster mode: node={} cluster={} peers={} metadata_revision={}",
+                cluster.node,
+                cluster.trust.cluster,
+                cluster_options.peers.len(),
+                cluster.revision()
+            );
+            Some(cluster)
+        }
+        None => None,
+    };
+    let mut q1_options = options.q1.clone();
+    if let (Some(cluster), Some(q1)) = (&cluster, &mut q1_options) {
+        // The durable partition learns its own node identity so that it can be fenced.
+        q1.node_id = cluster.node.get();
+    }
+    let route = if let Some(q1) = q1_options {
         Some(Arc::new(
             tokio::task::spawn_blocking(move || q1::Route::open(q1))
                 .await
@@ -300,6 +329,40 @@ async fn main() -> io::Result<()> {
     } else {
         None
     };
+    let mut cluster_stop = None;
+    if let Some(cluster) = &cluster {
+        if let Some(q1) = &options.q1 {
+            // Fencing: the local partition only accepts durable mutations while the
+            // committed metadata names this node as owner with a valid lease.
+            let authority = cluster.authority_for(&q1.partition);
+            if let Some(route) = &route {
+                route.install_authority(authority);
+            }
+            if authority.is_some() {
+                eprintln!(
+                    "Q1 authority: epoch={} owner={} lease_ms={}",
+                    authority.map(|value| value.epoch).unwrap_or(0),
+                    authority.map(|value| value.owner).unwrap_or(0),
+                    authority.map(|value| value.lease.as_millis()).unwrap_or(0)
+                );
+            }
+        }
+        let listener = tokio::net::TcpListener::bind(cluster_options_listen(&options)).await?;
+        let address = listener.local_addr()?;
+        if !address.ip().is_loopback() {
+            return Err(invalid("cluster listener must be loopback"));
+        }
+        let peer_server = rovqet_control::transport::PeerServer::new(
+            listener,
+            cluster.trust.clone(),
+            Arc::new(cluster::ClusterHandler::new(cluster.clone(), route.clone())),
+            Default::default(),
+        )
+        .map_err(|error| invalid(format!("cluster peer listener: {error}")))?;
+        let (stop, stop_rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(peer_server.serve(stop_rx));
+        cluster_stop = Some(stop);
+    }
     if let Some(q1) = &options.q1 {
         eprintln!(
             "Q1 recovered: topic={} partition={:?} incarnation={} owner_epoch={} dedup_window_ms={} max_producers={} max_outcomes={}",
@@ -337,34 +400,6 @@ async fn main() -> io::Result<()> {
             }}
         })
     });
-    let (cluster, cluster_stop) = match &options.cluster {
-        Some(cluster_options) => {
-            let cluster = Arc::new(cluster::Cluster::new(cluster_options)?);
-            let listener = tokio::net::TcpListener::bind(cluster_options.listen).await?;
-            let address = listener.local_addr()?;
-            if !address.ip().is_loopback() {
-                return Err(invalid("cluster listener must be loopback"));
-            }
-            eprintln!(
-                "cluster mode: node={} cluster={} peers={} metadata_revision={}",
-                cluster.node,
-                cluster.trust.cluster,
-                cluster_options.peers.len(),
-                cluster.revision()
-            );
-            let peer_server = rovqet_control::transport::PeerServer::new(
-                listener,
-                cluster.trust.clone(),
-                Arc::new(cluster::ClusterHandler::new(cluster.clone(), route.clone())),
-                Default::default(),
-            )
-            .map_err(|error| invalid(format!("cluster peer listener: {error}")))?;
-            let (stop, stop_rx) = tokio::sync::watch::channel(false);
-            tokio::spawn(peer_server.serve(stop_rx));
-            (Some(cluster), Some(stop))
-        }
-        None => (None, None),
-    };
     let handler = Arc::new(match cluster.clone() {
         Some(cluster) => q1::Dispatch::with_cluster(broker.clone(), route.clone(), cluster),
         None => q1::Dispatch::new(broker.clone(), route.clone()),

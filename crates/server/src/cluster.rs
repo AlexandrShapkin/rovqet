@@ -91,6 +91,17 @@ impl Cluster {
             .unwrap_or(0)
     }
 
+    /// The committed ownership authority of one partition, if the snapshot places it.
+    pub fn authority_for(&self, partition: &PartitionRef) -> Option<rovqet_durable::Authority> {
+        let snapshot = self.store.current()?;
+        let placement = snapshot.owner_of(partition)?;
+        rovqet_durable::Authority::new(
+            placement.owner.get(),
+            placement.ownership_epoch.get(),
+            Duration::from_millis(placement.lease.valid_for_ms),
+        )
+    }
+
     /// Owner-aware routing decision for one partition.
     pub fn route(&self, partition: &PartitionRef, already_forwarded: bool) -> RouteDecision {
         decide(&self.store, &self.trust, partition, None, already_forwarded)

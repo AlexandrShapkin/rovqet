@@ -58,6 +58,7 @@ fn config(group: GroupConfig) -> PartitionConfig {
     PartitionConfig {
         partition: partition_id(),
         ownership_epoch: 7,
+        node_id: 0,
         queue_messages: 32,
         queue_bytes: 4 * 1024 * 1024,
         max_outcomes: 256,

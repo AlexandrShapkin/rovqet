@@ -94,6 +94,12 @@ publication to the owner. Consensus, membership, handover and Q2 remain C-02/C-0
 
 **C-02 — Metadata group and ownership** (depends C-01,B-04). Integrate external Raft for metadata; static 3 voters, topic/policy and placement snapshot, epoch+lease, staged Q1 transfer. Proof: stale owner fenced, no split brain under asymmetric partition.
 
+Partially implemented: durable Q1 ownership fencing at the real commit boundary (owner, epoch
+and bounded lease, applied to publication, FETCH, ACK, NACK and terminal disposition) is
+implemented and verified, including across two real broker processes. The openraft 0.9.26
+metadata group, committed-metadata ownership transitions and the staged Q1 transfer remain
+open, so C-02 stays IN_PROGRESS.
+
 **C-03 — Q2 Raft storage adapter** (depends B-01,C-02). Integrate pinned OpenRaft, durable log/term/vote and deterministic snapshot/apply. Keep library confined to consensus crate. Proof: 3-node library smoke, snapshot install, committed prefix invariant.
 
 **C-04 — Q2 publish and dedup** (depends C-03,B-03). Immutable Q2 partition class; deterministic producer outcomes/offsets from committed state machine; quorum-only COMMITTED_QUORUM. Proof: leader crash before and after majority, retry same offset, NO_QUORUM when 1/3.

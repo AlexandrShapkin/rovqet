@@ -44,6 +44,7 @@ impl Fixture {
         let config = PartitionConfig {
             partition: wal.partition,
             ownership_epoch: 1,
+            node_id: 0,
             queue_messages: 32,
             queue_bytes: 65536,
             max_outcomes: outcomes,

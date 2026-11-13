@@ -108,6 +108,7 @@ fn actor_config() -> PartitionConfig {
     PartitionConfig {
         partition: partition_id(),
         ownership_epoch: 7,
+        node_id: 0,
         queue_messages: 8,
         queue_bytes: 8192,
         max_outcomes: 64,

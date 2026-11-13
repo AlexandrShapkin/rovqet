@@ -75,3 +75,23 @@ Aggregation reduces per-partition timers/elections/fsync; a hot partition may wo
 7. Q1 log loss has no influence on any Q2 committed prefix.
 
 Tests use an external oracle and independently persisted test node data directories. A three-process single-host smoke test is useful development feedback but not a claim about independent physical failure domains.
+
+## C-02 metadata consensus library decision (not yet integrated)
+
+C-02 implements **metadata** consensus only; Q2 data shards stay C-03 work. The architecture
+references OpenRaft 0.9.x, so the selected line is **openraft 0.9.26** (the newest 0.9
+release). The newer 0.10 line changes the storage and network contracts and is therefore not
+used. The chosen version's API assumptions are:
+
+- storage uses the `v2` traits: `RaftLogStorage` (append with a `LogFlushed` completion
+  callback, truncate, purge, vote persistence, committed-index persistence and a
+  `RaftLogReader`), `RaftStateMachine` with a snapshot builder, `RaftNetwork` (vote,
+  append entries, install snapshot) and `RaftNetworkFactory`;
+- entries carry application data with an explicit response type, so library types stay
+  inside a dedicated metadata adapter and the public control-plane model
+  (`MetadataSnapshot`, placements, epochs) does not depend on OpenRaft internals;
+- Raft log indexes are unrelated to Q1 application offsets: the metadata log and the Q1 WAL
+  remain separate durability domains.
+
+The adapter, its disk-backed log storage and the three-voter group are the remaining C-02
+work; the fencing protocol that depends on committed metadata is implemented and tested.

@@ -20,6 +20,8 @@ use std::{
 use tokio::sync::oneshot;
 
 const OUTCOME_BYTES: usize = 30;
+mod authority;
+pub use authority::{Authority, Fence, FenceError};
 mod group;
 mod terminal;
 use group::{AckCommand, GroupFetchCommand, GroupState, MessageMeta};
@@ -75,6 +77,9 @@ pub use test_control::{TestControl, TestStage};
 pub struct PartitionConfig {
     pub partition: PartitionRef,
     pub ownership_epoch: u64,
+    /// Local node identity used for ownership fencing. Zero means standalone mode: no
+    /// control-plane authority is installed and durable mutations are not fenced.
+    pub node_id: u64,
     pub queue_messages: usize,
     pub queue_bytes: usize,
     pub max_outcomes: usize,
@@ -112,6 +117,10 @@ pub enum Error {
     OutcomeUnavailable,
     HistoryUnavailable,
     DlqUnavailable,
+    /// The local node is not the committed owner, or the epoch is stale.
+    Fenced,
+    /// The ownership lease expired; durable work fails closed.
+    FenceExpired,
     Unavailable,
     WorkerStart(std::io::Error),
 }
@@ -157,6 +166,7 @@ enum Command {
     GroupFetch(GroupFetchCommand),
     Ack(AckCommand),
     Nack(terminal::NackCommand),
+    SetAuthority(Option<Authority>),
 }
 /// One caller-owned handle; shared references may submit concurrently. No socket or Q0 dependencies.
 pub struct Partition {
@@ -381,6 +391,9 @@ impl Partition {
                                     drop(command._reservation);
                                     let _ = command.reply.send(result);
                                 }
+                                Ok(Command::SetAuthority(authority)) => {
+                                    state.set_authority(authority);
+                                }
                                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                                     state.complete_replays(&mut reads, true);
@@ -482,6 +495,22 @@ impl Partition {
     pub fn incarnation(&self) -> u128 {
         self.incarnation
     }
+    /// Installs (or clears) the committed ownership authority of this partition. The
+    /// command is ordered with durable mutations in the actor, so a mutation accepted
+    /// before the transition may still commit, and every later mutation is fenced.
+    pub fn set_authority(&self, authority: Option<Authority>) -> Result<()> {
+        let command = Command::SetAuthority(authority);
+        match self
+            .sender
+            .as_ref()
+            .ok_or(Error::Unavailable)?
+            .try_send(command)
+        {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(Error::Capacity),
+            Err(TrySendError::Disconnected(_)) => Err(Error::Unavailable),
+        }
+    }
     /// Number of durably committed WAL records (diagnostics; never a delivery cursor).
     pub fn committed_records(&self) -> u64 {
         self.committed.load(std::sync::atomic::Ordering::Acquire)
@@ -526,6 +555,7 @@ struct State {
     messages: Vec<MessageMeta>,
     message_index: HashMap<u64, u128>,
     groups: HashMap<u64, GroupState>,
+    fence: Fence,
     dlq: Option<Arc<dyn DlqPublisher>>,
     pending_terminal: HashMap<(u64, u64), terminal::PendingTerminal>,
     recovered_dlq_commits: Vec<(u128, u128, u64, u128)>,
@@ -569,6 +599,7 @@ impl State {
             messages: Vec::new(),
             message_index: HashMap::new(),
             groups: HashMap::new(),
+            fence: Fence::standalone(),
             dlq,
             pending_terminal: HashMap::new(),
             recovered_dlq_commits: Vec::new(),
@@ -789,6 +820,8 @@ impl State {
         if r.ownership_epoch != self.config.ownership_epoch {
             return Err(Error::StaleOwner);
         }
+        // Fencing: only the committed owner may start a durable mutation.
+        self.check_authority()?;
         let token = Token {
             principal: r.principal,
             producer: r.producer_id,
@@ -902,6 +935,15 @@ impl State {
             self.unhealthy = true;
             return Err(e);
         }
+        // The lease may have expired while the barrier ran. The record is durable, so the
+        // outcome is uncertain rather than a definite failure; the producer token resolves it.
+        if self
+            .fence
+            .check(self.config.node_id, None, Instant::now())
+            .is_err()
+        {
+            return Err(Error::OutcomeUnknown);
+        }
         self.next += 2;
         // Durability IO is excluded from logical elapsed time, conservatively extending retention.
         self.clock_sample = match (self.clock_sample, self.clock.now_millis()) {
@@ -951,6 +993,7 @@ mod tests {
         let p = PartitionConfig {
             partition: w.partition,
             ownership_epoch: 7,
+            node_id: 0,
             queue_messages: 2,
             queue_bytes: 4096,
             max_outcomes: 32,
