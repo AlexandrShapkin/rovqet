@@ -619,13 +619,58 @@
         "B-03",
         "B-04"
       ],
-      "status": "TODO",
+      "status": "DONE",
       "architecture": "08",
-      "proof": "Sparse ACK, stale generation and cursor recovery tests",
+      "proof": "Sparse ACK, stale generation, ACK crash windows and durable cursor recovery proven with external consumers",
       "paths": [
-        "crates/durable/"
+        "crates/durable/src/group.rs",
+        "crates/durable/tests/group.rs",
+        "crates/server/src/q1.rs",
+        "crates/sdk/src/group.rs",
+        "crates/sdk/examples/consume_q1.rs",
+        "crates/protocol/tests/fetch_end.rs",
+        "scripts/test_q1_consumer.py",
+        "docs/architecture/"
       ],
-      "evidence": null
+      "evidence": {
+        "commit": "68642a18bc685ef6bf0f3020e6198fdec732130f",
+        "implementation_commits": [
+          "4c23d26",
+          "a4260bb"
+        ],
+        "verification": "PASS: one durable Q1 consumer group with volatile leased delivery, durable CONSUMER_ACK/CURSOR_CHECKPOINT records, generation fencing and contiguous sparse cursor recovery, exercised by real external SDK consumer processes over TCP.",
+        "test_command": [
+          "cargo fmt --all -- --check",
+          "cargo check --workspace --locked",
+          "cargo test -p rovqet-protocol --locked",
+          "cargo test -p rovqet-wal --locked",
+          "cargo test -p rovqet-durable --locked",
+          "cargo test --workspace --locked",
+          "python3 scripts/check_docs.py",
+          "cargo build -p rovqet-server -p rovqet-sdk --examples --bins --locked",
+          "python3 scripts/q0_smoke.py",
+          "python3 scripts/q1_smoke.py --check-hooks-disabled",
+          "python3 scripts/test_q1_replay.py",
+          "cargo test -p rovqet-durable --features fault-injection --locked",
+          "cargo build -p rovqet-server --features fault-injection --locked",
+          "python3 scripts/test_q1_consumer.py",
+          "python3 scripts/test_q1_faults.py",
+          "git diff --check"
+        ],
+        "observed_result": "188 workspace tests pass:19 protocol WAL-independent frames plus2 new FETCH_END vectors (21 protocol),31 WAL,49 default durable (14 group actor),12 server,19 SDK,13 transport.51 fault-enabled durable tests.8 standalone replay,6 durable-consumer and20 TCP/process fault fixtures pass. Q0/Q1 process smokes, documentation and formatting pass.",
+        "wire_contract": "Existing FETCH(17)/MESSAGE(12)/CONSUMER_ACK(13)/CONSUMER_ACK_RESULT(14) and all field IDs preserved. Additive terminal FETCH_END=26 (has_more field50 reused) after zero or more MESSAGE frames. FETCH with absent/zero group_generation claims and durably fences a generation; nonzero must match or STALE_GENERATION(18). MESSAGE carries the full token including ownership_epoch and delivery_attempt; ACK validates every token field and returns ACK_COMMITTED only after the sync. CONSUMER_NACK/EXTEND_LEASE remain UNSUPPORTED_CAPABILITY. Golden B-04 and original big-endian vectors unchanged; new fetch-v1 vector is byte-exact.",
+        "wal_compatibility": "v1 record/segment/manifest layouts unchanged. Reuses reserved kinds CONSUMER_ACK=3 (RQCA v1 payload: group,generation,owner epoch,lease,offset,attempt,principal,message) and CURSOR_CHECKPOINT=5 (RQCP v1: group,generation,cursor,ascending sparse offsets). Recovery is kind-aware: MESSAGE must be immediately followed by its PRODUCER_OUTCOME; orphan outcomes, malformed ACK/checkpoint payloads, ACKs for unknown messages, checkpoints ahead of their append and decreasing generations fail closed. Existing publication-only storage recovers without migration. Application offsets stay stable but become sparse; standalone replay skips metadata records and returns the next unread WAL position as continuation.",
+        "cursor_semantics": "ACK of C alone, then B, must not advance the cursor past A; ACK of A advances through the previously acknowledged B/C. The sparse set is bounded (4096 default) and the gap-closing cursor offset is always accepted. Checkpoints embed the cursor and full sparse set, so compaction cannot erase acknowledged gaps. Restart reconstructs gaps and the contiguous prefix; unacknowledged records are redelivered with a fresh lease. Only application MESSAGE offsets participate; producer outcomes/ACKs/checkpoints never create cursor gaps and next offsets are never derived by incrementing.",
+        "crash_recovery": "Process fixtures kill the broker at BeforeAppend, AfterAppendBeforeSync and AfterSyncBeforeReply of a CONSUMER_ACK. Before append and before sync redeliver the record and never report ACK_COMMITTED; after sync the cursor is recovered at the end and the acknowledged record is not redelivered. A parent-owned JSON journal records delivery token, message identity, payload hash, generation, lease and received ACK_COMMITTED. SIGKILL after an externally observed ACK preserves the cursor. Clean shutdown with an outstanding lease keeps the committed ACK and redelivers only the unacknowledged record.",
+        "sdk_semantics": "Client::fetch_q1_group validates every MESSAGE scope/group/generation/lease/attempt, strictly increasing offsets and count/byte bounds before accepting mandatory FETCH_END. Client::ack_q1_group never mints or retries tokens and returns ACK_COMMITTED only after validated correlation and identity. Transport loss/timeout before the terminal frame returns Incomplete and closes the stream; a partial batch is never success. Duplicate tokens resolve to the saved committed result. GroupOptions generation None claims/replaces; Some continues and surfaces StaleGeneration.",
+        "resource_and_authority": "AUTH principal1 plus configured tenant/topic/partition/incarnation authorize group fetch and ACK. Actor admission reserves WAL scratch, batch bytes and retained responses against the partition budget before IO; 14 actor tests cover claim, ordered/sparse ACKs, duplicate lookup, fencing, expiry, invalid identity, corruption, concurrent identical ACKs, admission and cancellation. Bounds: 8 groups, 256 leases, 4096 sparse entries, 4MiB leased bytes, 30s lease, checkpoint every 64 ACKs. Lease grants are volatile; group generation, ACK and cursor are durable.",
+        "limitations": "Single-node local Q1 only; one active mutation generation per group but no competing-worker rebalance, NACK, retry schedule, DLQ/quarantine, SEEK or cursor export. Lease tokens and delivery attempts are process-scoped and reset after restart. The authenticated principal/tenant model is the existing trusted loopback static identity, not production TLS/ACL. CHECKPOINT compaction retains the sparse set but not old ACK-record history. An irrecoverably lost Q1 history still requires explicit authorized reinitialization with a fresh incarnation; recovery never resets progress. No physical power-loss certification and no exactly-once application-processing claim.",
+        "next_unblocked": [
+          "B-06",
+          "B-07"
+        ],
+        "next_note": "B-07 is the next correctness gate (external acknowledged set versus recovered WAL under repeated SIGKILL); B-06 remains the terminal-disposition (NACK/retry/quarantine/DLQ) work package."
+      }
     },
     {
       "id": "B-06",
