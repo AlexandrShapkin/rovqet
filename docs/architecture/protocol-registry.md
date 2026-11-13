@@ -52,6 +52,7 @@ Decoder order: confirm magic/version → parse bounded varint lengths without al
 | 24 | READ_RECORD | committed application bytes; no lease |
 | 25 | READ_END | none; terminal continuation/status |
 | 26 | FETCH_END | none; terminal group batch continuation |
+| 27 | CONSUMER_NACK_RESULT | none; retry/terminal outcome for a NACK |
 
 ## Field IDs, encoding and scope
 
@@ -187,6 +188,7 @@ New frames **23 READ_FETCH**, **24 READ_RECORD**, **25 READ_END** use the existi
 major-1 envelope, canonical varints and BE TLVs, flags zero (no optional CRC in this
 profile). IDs 1–22 and fields 1–48, including FETCH/MESSAGE group requirements, stay
 unchanged. New singular fields: **49 read_status:u8**, **50 has_more:u8 (0/1)**.
+B-06 adds **51 nack_outcome:u8**.
 Older peers reject unknown frames/critical fields; new peers map unknown frame types to
 UNSUPPORTED_CAPABILITY. This opt-in exchange never substitutes for group delivery.
 
@@ -277,3 +279,30 @@ consumes WAL positions but not application offsets, so READ_FETCH continuation m
 metadata records and the next application offset is not always an arithmetic step. Both
 read and group batches report the server-computed continuation; clients must not derive it
 by incrementing an offset.
+
+## B-06 NACK, retry and terminal disposition (major 1, additive)
+
+CONSUMER_NACK (15) keeps its frozen fields; `close_reason:u16` (45) carries a consumer
+reason byte and `delivery_attempt:u32` (37) is required. The broker validates the full
+delivery token exactly as for CONSUMER_ACK. A NACK never acknowledges successful processing
+and never closes the source record; it either schedules a bounded retry or starts a durable
+terminal disposition.
+
+CONSUMER_NACK_RESULT (27) is the additive response. It requires tenant/topic/partition,
+incarnation, group, generation, offset, delivery attempt and `nack_outcome`:
+1 RETRY_SCHEDULED (with `retry_after_ms`), 2 RETRY_EXHAUSTED (source remains incomplete),
+3 TERMINAL_COMMITTED (with `disposition_id`), 4 TERMINAL_PENDING, 5 ALREADY_CLOSED for a
+read-only saved terminal outcome. ACK_COMMITTED is never reused for NACK acceptance.
+Repeated NACKs of the same attempt are idempotent.
+
+Retry backoff is bounded (initial delay, exponential doubling, maximum delay, maximum
+attempts). Retry exhaustion alone never closes an offset. A configured terminal policy
+(QUARANTINE or DLQ), max attempts, and retry bounds are admission configuration, not wire
+authority: a consumer cannot send an arbitrary terminal marker.
+
+Terminal disposition is a two-record durability protocol: a durable PENDING record, then a
+durable COMMITTED record. For DLQ the mandatory order is PENDING, DLQ Q1 publication,
+verified destination commit, COMMITTED source record, cursor closure. The DLQ is a separate
+explicitly configured local Q1 partition whose messages remain readable through READ_FETCH
+with the DLQ topic, partition and incarnation. The original payload and message identity are
+framed into the DLQ payload; the disposition ID is stable and makes publication idempotent.

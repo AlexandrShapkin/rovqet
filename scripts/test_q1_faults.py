@@ -436,12 +436,16 @@ class Q1ProcessFaults(unittest.TestCase):
             response, correlation, fields = read_frame(connection)
             self.assertEqual((response, correlation), (20, 11))
             self.assertEqual(int.from_bytes(fields[28], "big"), 26)
-            # NACK and lease extension belong to later work packages.
-            for request, kind in enumerate([15, 16], 12):
-                connection.sendall(frame(kind, request, ack))
-                response, correlation, fields = read_frame(connection)
-                self.assertEqual((response, correlation), (20, request))
-                self.assertEqual(int.from_bytes(fields[28], "big"), 3)
+            # A forged NACK token is typed and cannot fabricate terminal closure.
+            connection.sendall(frame(15, 12, ack))
+            response, correlation, fields = read_frame(connection)
+            self.assertEqual((response, correlation), (20, 12))
+            self.assertIn(int.from_bytes(fields[28], "big"), (19, 26))
+            # Lease extension remains explicitly unsupported.
+            connection.sendall(frame(16, 13, ack))
+            response, correlation, fields = read_frame(connection)
+            self.assertEqual((response, correlation), (20, 13))
+            self.assertEqual(int.from_bytes(fields[28], "big"), 3)
         self.assertEqual(manifest_record_count(broker.wal), 2)
         broker.stop()
 

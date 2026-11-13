@@ -38,7 +38,7 @@ class Broker:
     """A broker subprocess with bounded readiness/exit waits and complete cleanup."""
     def __init__(self, directory: Path, *, stage=None, fault=None, incarnation=42,
                  configure=True, data_directory=None, checkpoint_after=None,
-                 segment_bytes=None, record_bytes=None, sequence=0):
+                 segment_bytes=None, record_bytes=None, sequence=0, extra=()):
         self.directory = directory
         self.wal = Path(data_directory) if data_directory else directory / "wal"
         self.controls = directory / "controls"
@@ -74,6 +74,7 @@ class Broker:
                         "--q1-owner-epoch", "7"]
             if initialize_new_log:
                 command += ["--q1-initialize-new-log", "true"]
+            command += [str(value) for value in extra]
         self.process = subprocess.Popen(command, env=env, stdout=subprocess.DEVNULL,
                                         stderr=subprocess.PIPE, text=True)
         self.reader = threading.Thread(target=self._read, daemon=True)

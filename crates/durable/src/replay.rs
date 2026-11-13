@@ -285,7 +285,10 @@ impl State {
                 match record.kind {
                     RecordKind::ProducerOutcome
                     | RecordKind::ConsumerAck
-                    | RecordKind::CursorCheckpoint => {
+                    | RecordKind::CursorCheckpoint
+                    | RecordKind::Retry
+                    | RecordKind::TerminalDisposition
+                    | RecordKind::Tombstone => {
                         // Durable metadata (including a publication outcome reached by a
                         // continuation) is not an application message.
                         cursor += 1;

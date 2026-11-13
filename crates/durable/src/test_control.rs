@@ -14,6 +14,16 @@ pub enum TestStage {
     AfterSyncBeforeReply,
     /// Crash after a cursor-checkpoint record was appended but before it was synced.
     CheckpointAfterAppendBeforeSync,
+    /// Crash after a terminal PENDING record append, before its sync.
+    TerminalPendingAfterAppendBeforeSync,
+    /// Crash after a terminal PENDING record was synced, before DLQ publication.
+    TerminalPendingAfterSync,
+    /// Crash after the DLQ message committed, before the source terminal record.
+    DlqAfterPublishBeforeTerminal,
+    /// Crash after the committed terminal record append, before its sync.
+    TerminalCommitAfterAppendBeforeSync,
+    /// Crash after the committed terminal record sync, before the reply.
+    TerminalCommitAfterSyncBeforeReply,
 }
 impl TestStage {
     pub fn as_str(self) -> &'static str {
@@ -22,6 +32,13 @@ impl TestStage {
             Self::AfterAppendBeforeSync => "after-append-before-sync",
             Self::AfterSyncBeforeReply => "after-sync-before-reply",
             Self::CheckpointAfterAppendBeforeSync => "checkpoint-after-append-before-sync",
+            Self::TerminalPendingAfterAppendBeforeSync => {
+                "terminal-pending-after-append-before-sync"
+            }
+            Self::TerminalPendingAfterSync => "terminal-pending-after-sync",
+            Self::DlqAfterPublishBeforeTerminal => "dlq-after-publish-before-terminal",
+            Self::TerminalCommitAfterAppendBeforeSync => "terminal-commit-after-append-before-sync",
+            Self::TerminalCommitAfterSyncBeforeReply => "terminal-commit-after-sync-before-reply",
         }
     }
 }

@@ -21,11 +21,16 @@ use tokio::sync::oneshot;
 
 const OUTCOME_BYTES: usize = 30;
 mod group;
+mod terminal;
 use group::{AckCommand, GroupFetchCommand, GroupState, MessageMeta};
 pub use group::{
     AckRequest, AckResult, GROUP_BATCH_BYTES, GROUP_MESSAGE_BYTES, GroupConfig, GroupDelivery,
     GroupError, GroupFetchBatch, GroupFetchRequest, GroupStop, MAX_GROUP_BYTES, MAX_GROUP_MESSAGES,
     MAX_GROUP_WAIT, PendingAck, PendingGroupFetch,
+};
+pub use terminal::{
+    DlqError, DlqMetadata, DlqPublisher, DlqRecord, NackOutcome, NackRequest, PendingNack,
+    REASON_CONSUMER_NACK, REASON_RETRY_EXHAUSTED, TerminalPolicy, dlq_payload, parse_dlq_payload,
 };
 mod replay;
 use replay::ReplayCommand;
@@ -36,6 +41,7 @@ pub use replay::{
 
 struct WorkerOptions {
     clock: Arc<dyn Clock>,
+    dlq: Option<Arc<dyn DlqPublisher>>,
     #[cfg(feature = "fault-injection")]
     control: Option<TestControl>,
 }
@@ -55,6 +61,7 @@ impl Default for WorkerOptions {
     fn default() -> Self {
         Self {
             clock: Arc::new(MonotonicClock(Instant::now())),
+            dlq: None,
             #[cfg(feature = "fault-injection")]
             control: None,
         }
@@ -104,6 +111,7 @@ pub enum Error {
     OutcomeUnknown,
     OutcomeUnavailable,
     HistoryUnavailable,
+    DlqUnavailable,
     Unavailable,
     WorkerStart(std::io::Error),
 }
@@ -148,6 +156,7 @@ enum Command {
     Replay(ReplayCommand),
     GroupFetch(GroupFetchCommand),
     Ack(AckCommand),
+    Nack(terminal::NackCommand),
 }
 /// One caller-owned handle; shared references may submit concurrently. No socket or Q0 dependencies.
 pub struct Partition {
@@ -156,6 +165,7 @@ pub struct Partition {
     budget: Arc<Budget>,
     committed: Arc<std::sync::atomic::AtomicU64>,
     config: PartitionConfig,
+    incarnation: u128,
     max_record_bytes: usize,
 }
 impl Partition {
@@ -216,6 +226,81 @@ impl Partition {
             },
         )
     }
+    /// Open with a Q1 DLQ destination. Required only when the terminal policy is DLQ or the
+    /// log already contains pending DLQ terminal records.
+    pub fn open_with_dlq(
+        path: impl AsRef<Path>,
+        wal_config: WalConfig,
+        config: PartitionConfig,
+        dlq: Arc<dyn DlqPublisher>,
+    ) -> Result<Self> {
+        Self::open_inner(
+            path,
+            wal_config,
+            config,
+            WorkerOptions {
+                dlq: Some(dlq),
+                ..WorkerOptions::default()
+            },
+        )
+    }
+    pub fn open_existing_with_dlq(
+        path: impl AsRef<Path>,
+        wal_config: WalConfig,
+        config: PartitionConfig,
+        dlq: Arc<dyn DlqPublisher>,
+    ) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        if !path.join("MANIFEST").is_file() {
+            return Err(Error::HistoryUnavailable);
+        }
+        Self::open_inner(
+            path,
+            wal_config,
+            config,
+            WorkerOptions {
+                dlq: Some(dlq),
+                ..WorkerOptions::default()
+            },
+        )
+    }
+    #[cfg(feature = "fault-injection")]
+    pub fn open_with_test_control_and_dlq(
+        path: impl AsRef<Path>,
+        wal_config: WalConfig,
+        config: PartitionConfig,
+        control: TestControl,
+        dlq: Arc<dyn DlqPublisher>,
+    ) -> Result<Self> {
+        Self::open_inner(
+            path,
+            wal_config,
+            config,
+            WorkerOptions {
+                dlq: Some(dlq),
+                control: Some(control),
+                ..WorkerOptions::default()
+            },
+        )
+    }
+    pub fn open_with_dlq_and_clock(
+        path: impl AsRef<Path>,
+        wal_config: WalConfig,
+        config: PartitionConfig,
+        dlq: Arc<dyn DlqPublisher>,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self> {
+        Self::open_inner(
+            path,
+            wal_config,
+            config,
+            WorkerOptions {
+                clock,
+                dlq: Some(dlq),
+                ..WorkerOptions::default()
+            },
+        )
+    }
     fn open_inner(
         path: impl AsRef<Path>,
         wal_config: WalConfig,
@@ -235,6 +320,7 @@ impl Partition {
         }
         let path = path.as_ref().to_path_buf();
         let max_record_bytes = wal_config.max_record_bytes;
+        let incarnation = wal_config.incarnation;
         let budget = Budget::new(config.queue_messages, config.queue_bytes);
         let committed = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let committed_worker = committed.clone();
@@ -250,6 +336,7 @@ impl Partition {
                     actor_config,
                     _options.clock,
                     committed_worker,
+                    _options.dlq,
                 );
                 match state {
                     Err(e) => {
@@ -268,7 +355,9 @@ impl Partition {
                         loop {
                             // Waiting reads never occupy the storage owner while idle. A short
                             // bounded poll also releases cancelled response reservations promptly.
-                            let command = if reads.is_empty() && group_waits.is_empty() {
+                            let command = if !state.pending_terminal.is_empty() {
+                                rx.recv_timeout(Duration::from_millis(50))
+                            } else if reads.is_empty() && group_waits.is_empty() {
                                 rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected)
                             } else {
                                 rx.recv_timeout(Duration::from_millis(10))
@@ -287,6 +376,11 @@ impl Partition {
                                     drop(command._reservation);
                                     let _ = command.reply.send(result);
                                 }
+                                Ok(Command::Nack(command)) => {
+                                    let result = state.nack(command.request);
+                                    drop(command._reservation);
+                                    let _ = command.reply.send(result);
+                                }
                                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                                     state.complete_replays(&mut reads, true);
@@ -296,6 +390,7 @@ impl Partition {
                             }
                             state.complete_replays(&mut reads, false);
                             state.complete_group_fetches(&mut group_waits, false);
+                            state.resume_pending_terminal();
                         }
                     }
                 }
@@ -308,6 +403,7 @@ impl Partition {
                 budget,
                 committed,
                 config,
+                incarnation,
                 max_record_bytes,
             }),
             Ok(Err(e)) => {
@@ -380,6 +476,12 @@ impl Partition {
     pub fn usage(&self) -> Usage {
         self.budget.usage()
     }
+    pub fn partition_ref(&self) -> PartitionRef {
+        self.config.partition
+    }
+    pub fn incarnation(&self) -> u128 {
+        self.incarnation
+    }
     /// Number of durably committed WAL records (diagnostics; never a delivery cursor).
     pub fn committed_records(&self) -> u64 {
         self.committed.load(std::sync::atomic::Ordering::Acquire)
@@ -424,6 +526,10 @@ struct State {
     messages: Vec<MessageMeta>,
     message_index: HashMap<u64, u128>,
     groups: HashMap<u64, GroupState>,
+    dlq: Option<Arc<dyn DlqPublisher>>,
+    pending_terminal: HashMap<(u64, u64), terminal::PendingTerminal>,
+    recovered_dlq_commits: Vec<(u128, u128, u64, u128)>,
+    last_terminal_attempt: Option<Instant>,
     committed: Arc<std::sync::atomic::AtomicU64>,
     next: u64,
     unhealthy: bool,
@@ -439,6 +545,7 @@ impl State {
             config,
             WorkerOptions::default().clock,
             Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            None,
         )
     }
     fn open_clock(
@@ -447,6 +554,7 @@ impl State {
         config: PartitionConfig,
         clock: Arc<dyn Clock>,
         committed: Arc<std::sync::atomic::AtomicU64>,
+        dlq: Option<Arc<dyn DlqPublisher>>,
     ) -> Result<Self> {
         let wal = Wal::open(path, wal_config.clone()).map_err(Error::Storage)?;
         let mut s = Self {
@@ -461,6 +569,10 @@ impl State {
             messages: Vec::new(),
             message_index: HashMap::new(),
             groups: HashMap::new(),
+            dlq,
+            pending_terminal: HashMap::new(),
+            recovered_dlq_commits: Vec::new(),
+            last_terminal_attempt: None,
             committed,
             next: 0,
             unhealthy: false,
@@ -577,6 +689,7 @@ impl State {
         self.committed
             .store(count, std::sync::atomic::Ordering::Release);
         self.finalize_cursors();
+        self.reconcile_recovered_terminal()?;
         Ok(())
     }
     /// Rebuilds producer/dedup state for one committed MESSAGE/PRODUCER_OUTCOME pair.
@@ -915,6 +1028,7 @@ mod tests {
             budget: budget.clone(),
             committed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             config: p,
+            incarnation: 42,
             max_record_bytes: 1024,
         };
         let waiter = partition.try_publish(request(0)).unwrap();
@@ -943,6 +1057,7 @@ mod tests {
             budget: Budget::new(2, 256),
             committed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             config,
+            incarnation: 42,
             max_record_bytes: 1024,
         };
         let mut r = request(0);

@@ -198,6 +198,115 @@ class ConsumerOracle(unittest.TestCase):
         self.assertEqual(result["verdict"], oracle.NOT_RUN)
 
 
+class TerminalOracle(unittest.TestCase):
+    def terminal(self, *, kind="dlq", **overrides):
+        record = {
+            "event": "terminal_committed",
+            "group": 9,
+            "kind": kind,
+            "offset": 0,
+            "disposition_id": 77,
+            "original_message_id": 100,
+            "source_incarnation": 42,
+            "dlq_incarnation": 77,
+            "dlq_offset": 0,
+            "payload_digest": "aa",
+        }
+        record.update(overrides)
+        return record
+
+    def publication(self, **overrides):
+        record = {
+            "event": "dlq_publication",
+            "disposition_id": 77,
+            "incarnation": 77,
+            "offset": 0,
+        }
+        record.update(overrides)
+        return record
+
+    def source(self, offset=0, message_id=100):
+        return {"incarnation": 42, "offset": offset, "message_id": message_id,
+                "digest": "aa"}
+
+    def dlq(self, offset=0, message_id=77, digest="aa"):
+        return {"incarnation": 77, "offset": offset, "message_id": message_id,
+                "digest": digest}
+
+    def reconcile(self, records, source, dlq, cursor):
+        return oracle.reconcile_terminal(
+            concluded(records), source, dlq, cursor
+        )
+
+    def test_ordered_dlq_terminal_passes(self):
+        result = self.reconcile(
+            [self.publication(), self.terminal()],
+            [self.source()],
+            [self.dlq()],
+            8,
+        )
+        self.assertEqual(result["verdict"], oracle.PASS, result)
+
+    def test_terminal_without_dlq_publication_fails(self):
+        result = self.reconcile(
+            [self.terminal()], [self.source()], [self.dlq()], 8
+        )
+        self.assertEqual(result["verdict"], oracle.FAIL)
+
+    def test_missing_or_duplicate_dlq_destination_fails(self):
+        result = self.reconcile(
+            [self.publication(), self.terminal()], [self.source()], [], 8
+        )
+        self.assertEqual(result["verdict"], oracle.FAIL)
+        result = self.reconcile(
+            [self.publication(), self.terminal()],
+            [self.source()],
+            [self.dlq(), self.dlq(offset=4)],
+            8,
+        )
+        self.assertEqual(result["verdict"], oracle.FAIL)
+
+    def test_changed_dlq_payload_digest_fails(self):
+        result = self.reconcile(
+            [self.publication(), self.terminal(payload_digest="aa")],
+            [self.source()],
+            [self.dlq(digest="bb")],
+            8,
+        )
+        self.assertEqual(result["verdict"], oracle.FAIL)
+
+    def test_cursor_crossing_unexplained_source_fails(self):
+        result = self.reconcile(
+            [self.publication(), self.terminal(offset=2, disposition_id=78)],
+            [self.source(0), self.source(2, 101)],
+            [self.dlq(message_id=78)],
+            8,
+        )
+        self.assertEqual(result["verdict"], oracle.FAIL)
+
+    def test_terminal_for_uncommitted_source_fails(self):
+        result = self.reconcile(
+            [self.publication(), self.terminal(offset=9)],
+            [self.source()],
+            [self.dlq()],
+            8,
+        )
+        self.assertEqual(result["verdict"], oracle.FAIL)
+
+    def test_missing_conclusion_is_invalid(self):
+        result = oracle.reconcile_terminal(
+            [self.publication(), self.terminal()],
+            [self.source()],
+            [self.dlq()],
+            8,
+        )
+        self.assertEqual(result["verdict"], oracle.INVALID)
+
+    def test_no_terminal_observations_is_not_run(self):
+        result = self.reconcile([], [], [], 0)
+        self.assertEqual(result["verdict"], oracle.NOT_RUN)
+
+
 class JournalIntegrity(unittest.TestCase):
     def test_truncated_or_invalid_journal_is_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:

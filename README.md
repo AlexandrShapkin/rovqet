@@ -221,6 +221,27 @@ python3 scripts/test_q1_durability.py # B-07 oracle campaign, fault-injection bu
 python3 scripts/test_q1_oracle.py     # oracle self-corruption fixtures
 ```
 
+NACK, bounded retry, quarantine and a real Q1 dead-letter queue are available on the same
+consumer API:
+
+```sh
+# NACK the first delivery; the broker schedules a bounded retry or a terminal disposition.
+cargo run -p rovqet-sdk --example nack_q1 -- durable 1 3 0 42 9 0 8 65536 0 nack-first 1
+```
+
+Start the broker with `--q1-terminal-policy quarantine` or `--q1-terminal-policy dlq`,
+`--q1-max-attempts`, `--q1-retry-initial-ms`, `--q1-retry-max-ms`; the DLQ policy additionally
+requires `--q1-dlq-data-dir`, `--q1-dlq-topic`, `--q1-dlq-topic-id` and
+`--q1-dlq-incarnation`, creating a second explicitly configured local Q1 partition. A DLQ
+message is a normal committed Q1 record readable with `read_q1` on the DLQ topic; it carries
+the original payload and identity framed with a stable disposition ID. The source terminal
+record is appended only after the DLQ commit is verified, and repeated terminal attempts are
+idempotent. Retry exhaustion without a terminal policy leaves the source incomplete.
+
+```sh
+python3 scripts/test_q1_terminal.py   # NACK/retry/quarantine/DLQ crash ordering
+```
+
 The durability campaign journals externally acknowledged publications and consumer ACKs in a
 parent-owned, fsynced file, kills the broker at deterministic barriers, restarts on the same
 storage and reconciles exact identities, sparse cursor state, generation fencing and WAL

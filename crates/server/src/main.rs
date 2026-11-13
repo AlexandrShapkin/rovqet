@@ -82,7 +82,17 @@ impl Options {
                 | "--q1-dedup-window-ms"
                 | "--q1-max-producers"
                 | "--q1-max-outcomes"
-                | "--q1-initialize-new-log" => {
+                | "--q1-initialize-new-log"
+                | "--q1-terminal-policy"
+                | "--q1-max-attempts"
+                | "--q1-retry-initial-ms"
+                | "--q1-retry-max-ms"
+                | "--q1-dlq-data-dir"
+                | "--q1-dlq-topic"
+                | "--q1-dlq-topic-id"
+                | "--q1-dlq-partition-id"
+                | "--q1-dlq-incarnation"
+                | "--q1-dlq-owner-epoch" => {
                     q1_values.insert(pair[0].clone(), pair[1].clone());
                 }
                 _ => return Err(invalid("unknown option; see --help")),

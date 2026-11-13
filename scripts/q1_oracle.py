@@ -283,3 +283,112 @@ def check_duplicate_retry(
     if first.get("message_id") != retry.get("message_id"):
         reasons.append("retry changed the message identity")
     return _result(FAIL if reasons else PASS, reasons, {})
+
+
+def reconcile_terminal(
+    records: list[dict],
+    source_history: list[dict],
+    dlq_history: list[dict],
+    cursor: int | None,
+    *,
+    require_conclusion: bool = True,
+) -> dict:
+    """Validates NACK/terminal/DLQ ordering and durable cursor closure.
+
+    `source_history` and `dlq_history` items are
+    {incarnation, offset, message_id, digest}; `digest` for DLQ is the digest of the
+    original application payload carried by the DLQ message.
+    """
+    if require_conclusion and (not records or records[-1]["event"] != "conclusion"):
+        return _result(INVALID, ["missing conclusion"], {})
+    reasons: list[str] = []
+    terminal: list[dict] = []
+    acked: set[int] = set()
+    attempted: set[int] = set()
+    dlq_events: dict[object, dict] = {}
+    for index, record in enumerate(records):
+        event = record["event"]
+        if event == "delivery":
+            attempted.add(record["offset"])
+        elif event == "ack_committed":
+            acked.add(record["offset"])
+        elif event == "terminal_committed":
+            terminal.append(record)
+            acked.add(record["offset"])
+            if record.get("kind") == "dlq":
+                prior = [
+                    item
+                    for item in records[:index]
+                    if item["event"] == "dlq_publication"
+                    and item.get("disposition_id") == record["disposition_id"]
+                ]
+                if not prior:
+                    reasons.append(
+                        f"DLQ terminal {record['disposition_id']} has no prior DLQ publication"
+                    )
+                else:
+                    destination = prior[-1]
+                    if (
+                        destination.get("incarnation") != record.get("dlq_incarnation")
+                        or destination.get("offset") != record.get("dlq_offset")
+                    ):
+                        reasons.append(
+                            f"terminal proof does not match DLQ publication {record['disposition_id']}"
+                        )
+        elif event == "dlq_publication":
+            key = record["disposition_id"]
+            if key in dlq_events:
+                reasons.append(f"duplicate DLQ publication {key}")
+            dlq_events[key] = record
+        elif event == "ack_lookup_committed":
+            continue
+    if not terminal and not dlq_events:
+        return _result(NOT_RUN, ["no terminal observations recorded"], {})
+
+    source_offsets = {item["offset"]: item for item in source_history}
+    for item in terminal:
+        if item["offset"] not in source_offsets:
+            reasons.append(f"terminal source offset {item['offset']} is not committed history")
+        if item.get("kind") == "dlq":
+            matches = [
+                entry
+                for entry in dlq_history
+                if entry["message_id"] == item["disposition_id"]
+            ]
+            if len(matches) != 1:
+                reasons.append(
+                    f"DLQ disposition {item['disposition_id']} has {len(matches)} destination records"
+                )
+            elif (
+                matches[0]["incarnation"] != item.get("dlq_incarnation")
+                or matches[0]["offset"] != item.get("dlq_offset")
+            ):
+                reasons.append(
+                    f"DLQ identity mismatch for {item['disposition_id']}"
+                )
+            elif matches[0].get("digest") and item.get("payload_digest") and (
+                matches[0]["digest"] != item["payload_digest"]
+            ):
+                reasons.append(f"DLQ payload digest mismatch for {item['disposition_id']}")
+
+    source_by_id = {item["message_id"]: item for item in source_history}
+    for item in terminal:
+        original = source_by_id.get(item.get("original_message_id"))
+        if original is None:
+            reasons.append(f"terminal lost original source identity {item.get('original_message_id')}")
+        elif item.get("source_incarnation") != original.get("incarnation"):
+            reasons.append("terminal source incarnation mismatch")
+
+    if cursor is None:
+        reasons.append("missing recovered cursor")
+    else:
+        for offset, item in source_offsets.items():
+            if offset < cursor and offset not in acked and offset not in attempted:
+                reasons.append(f"cursor {cursor} crosses unexplained source offset {offset}")
+    counts = {
+        "terminal": len(terminal),
+        "dlq_publications": len(dlq_events),
+        "dlq_records": len(dlq_history),
+        "cursor": cursor,
+    }
+    return _result(FAIL if reasons else PASS, reasons, counts)

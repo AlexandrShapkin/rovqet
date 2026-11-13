@@ -312,6 +312,34 @@ fn validate_fields(frame: &Frame) -> Result<(), CodecError> {
             require(f::OFFSET)?;
         }
         FrameType::ConsumerAckResult => require(f::ACK_OUTCOME)?,
+        FrameType::ConsumerNackResult => {
+            topic()?;
+            require(f::QOS)?;
+            if frame.field(f::QOS) != Some(&[1][..]) {
+                return Err(CodecError::InvalidFieldValue(f::QOS));
+            }
+            for id in [
+                f::PARTITION_ID,
+                f::GROUP_ID,
+                f::GROUP_GENERATION,
+                f::LOG_INCAR,
+                f::OFFSET,
+                f::NACK_OUTCOME,
+                f::DELIVERY_ATTEMPT,
+            ] {
+                require(id)?;
+            }
+            let outcome = frame.field(f::NACK_OUTCOME).unwrap()[0];
+            if !(1..=5).contains(&outcome) {
+                return Err(CodecError::InvalidFieldValue(f::NACK_OUTCOME));
+            }
+            if outcome == 1 && frame.field(f::RETRY_AFTER_MS).is_none() {
+                return Err(CodecError::MissingField(f::RETRY_AFTER_MS));
+            }
+            if outcome >= 3 && frame.field(f::DISPOSITION_ID).is_none() {
+                return Err(CodecError::MissingField(f::DISPOSITION_ID));
+            }
+        }
         FrameType::Fetch => {
             topic()?;
             require(f::PARTITION_ID)?;

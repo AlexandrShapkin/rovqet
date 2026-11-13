@@ -56,6 +56,14 @@ pub enum AckOutcome {
         generation: u64,
     },
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NackOutcome {
+    RetryScheduled { retry_after: Duration },
+    RetryExhausted,
+    TerminalCommitted { disposition_id: u128 },
+    TerminalPending { disposition_id: u128 },
+    AlreadyClosed { disposition_id: u128 },
+}
 #[derive(Debug)]
 pub enum GroupError {
     InvalidRequest,
@@ -66,6 +74,7 @@ pub enum GroupError {
     StaleGeneration,
     LeaseExpired,
     AckNotCommitted,
+    DlqUnavailable,
     PermissionDenied,
     ResourceExhausted,
     ReplayNotAvailable,
@@ -92,6 +101,7 @@ fn map_client(error: ClientError) -> GroupError {
             Some(ErrorCode::StaleGeneration) => GroupError::StaleGeneration,
             Some(ErrorCode::LeaseExpired) => GroupError::LeaseExpired,
             Some(ErrorCode::AckNotCommitted) => GroupError::AckNotCommitted,
+            Some(ErrorCode::DlqUnavailable) => GroupError::DlqUnavailable,
             Some(ErrorCode::PermissionDenied) | Some(ErrorCode::Unauthenticated) => {
                 GroupError::PermissionDenied
             }
@@ -428,6 +438,94 @@ impl Client {
         Ok(AckOutcome::Committed {
             offset: token.offset,
             generation: token.generation,
+        })
+    }
+
+    /// NACK one leased delivery. It never acknowledges successful processing; it either
+    /// schedules a redelivery or returns an explicit terminal/retry state.
+    pub async fn nack_q1_group(
+        &mut self,
+        topic: &str,
+        token: &DeliveryToken,
+        reason: u8,
+    ) -> Result<NackOutcome, GroupError> {
+        if token.group_id == 0
+            || token.lease_id == 0
+            || token.attempt == 0
+            || token.ownership_epoch == 0
+            || token.offset.log_incarnation == 0
+        {
+            return Err(GroupError::InvalidRequest);
+        }
+        let incarnation = token.offset.log_incarnation;
+        let mut frame = self
+            .request(FrameType::ConsumerNack)
+            .map_err(|_| GroupError::InvalidRequest)?;
+        frame.fields = vec![
+            Field::required(f::TOPIC_NAME, topic.as_bytes()),
+            Field::required(f::TENANT_ID, token.partition.tenant_id.to_be_bytes()),
+            Field::required(f::TOPIC_ID, token.partition.topic_id.to_be_bytes()),
+            Field::required(f::QOS, [1]),
+            Field::required(f::PARTITION_ID, token.partition.partition_id.to_be_bytes()),
+            Field::required(f::GROUP_ID, token.group_id.to_be_bytes()),
+            Field::required(f::GROUP_GENERATION, token.generation.to_be_bytes()),
+            Field::required(f::LEASE_ID, token.lease_id.to_be_bytes()),
+            Field::required(f::OWNERSHIP_EPOCH, token.ownership_epoch.to_be_bytes()),
+            Field::required(f::LOG_INCAR, incarnation.to_be_bytes()),
+            Field::required(f::OFFSET, token.offset.sequence.to_be_bytes()),
+            Field::required(f::DELIVERY_ATTEMPT, token.attempt.to_be_bytes()),
+            Field::required(f::CLOSE_REASON, u16::from(reason.max(1)).to_be_bytes()),
+        ];
+        rovqet_protocol::encode(&frame, self.limits).map_err(|_| GroupError::InvalidRequest)?;
+        let request_id = frame.request_id;
+        let response = self
+            .exchange(frame, FrameType::ConsumerNackResult)
+            .await
+            .map_err(|error| match error {
+                ClientError::Timeout | ClientError::Closed | ClientError::Io(_) => {
+                    GroupError::Incomplete
+                }
+                other => map_client(other),
+            })?;
+        if response.request_id != request_id {
+            return Err(GroupError::InvalidResponse("nack correlation"));
+        }
+        if int_u64(&response, f::GROUP_ID)? != token.group_id
+            || int_u64(&response, f::GROUP_GENERATION)? != token.generation
+            || int_u64(&response, f::OFFSET)? != token.offset.sequence
+        {
+            return Err(GroupError::InvalidResponse("nack identity mismatch"));
+        }
+        let code = required(&response, f::NACK_OUTCOME)
+            .map_err(|_| GroupError::InvalidResponse("missing nack outcome"))?;
+        let disposition = response
+            .field(f::DISPOSITION_ID)
+            .map(|value| {
+                let bytes: [u8; 16] = value
+                    .try_into()
+                    .map_err(|_| GroupError::InvalidResponse("invalid disposition"))?;
+                Ok(u128::from_be_bytes(bytes))
+            })
+            .transpose()?
+            .unwrap_or(0);
+        Ok(match code {
+            [1] => NackOutcome::RetryScheduled {
+                retry_after: Duration::from_millis(u64::from(int_u32(
+                    &response,
+                    f::RETRY_AFTER_MS,
+                )?)),
+            },
+            [2] => NackOutcome::RetryExhausted,
+            [3] if disposition != 0 => NackOutcome::TerminalCommitted {
+                disposition_id: disposition,
+            },
+            [4] if disposition != 0 => NackOutcome::TerminalPending {
+                disposition_id: disposition,
+            },
+            [5] if disposition != 0 => NackOutcome::AlreadyClosed {
+                disposition_id: disposition,
+            },
+            _ => return Err(GroupError::InvalidResponse("invalid nack outcome")),
         })
     }
 }

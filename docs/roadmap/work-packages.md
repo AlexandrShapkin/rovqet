@@ -67,6 +67,12 @@ terminal disposition; B-07 is the crash/oracle gate.
 
 **B-06 — Q1 terminal disposition** (depends B-05). Retry/NACK, quarantine and DLQ idempotent two-step protocol using Q1; keep source incomplete if DLQ fails. Proof: crash between DLQ commit and terminal record, no cursor skip. Can follow first Q1 PoC if strict time pressure; cannot claim terminal support until tested.
 
+Implemented with CONSUMER_NACK/NACK_RESULT, bounded retry scheduling, durable PENDING/
+COMMITTED terminal records and a separate explicitly configured Q1 DLQ partition. The DLQ
+message is a real committed Q1 publication readable through READ_FETCH; the source terminal
+record is appended only after the destination commit is proven. Crash windows, idempotence,
+quarantine and cursor preservation are exercised by `scripts/test_q1_terminal.py`.
+
 **B-07 — Q1 crash/oracle gate** (depends B-05,R0-02). External acknowledged set versus recovered WAL after repeated SIGKILL at controlled barriers; memory and fsync p99. Proof: 0 acknowledged Q1 losses with intact disk and honest uncertain outcomes. SIGKILL != physical power cut.
 
 B-07 is executed by `scripts/test_q1_durability.py` with the append-only journal oracle in

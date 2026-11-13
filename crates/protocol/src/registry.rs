@@ -29,6 +29,7 @@ pub enum FrameType {
     ReadRecord = 24,
     ReadEnd = 25,
     FetchEnd = 26,
+    ConsumerNackResult = 27,
 }
 
 impl TryFrom<u64> for FrameType {
@@ -63,6 +64,7 @@ impl TryFrom<u64> for FrameType {
             24 => ReadRecord,
             25 => ReadEnd,
             26 => FetchEnd,
+            27 => ConsumerNackResult,
             _ => return Err(()),
         })
     }
@@ -189,5 +191,6 @@ pub mod field {
     pub const MAX_INFLIGHT: u64 = 48;
     pub const READ_STATUS: u64 = 49;
     pub const HAS_MORE: u64 = 50;
-    pub const LAST_KNOWN: u64 = 50;
+    pub const NACK_OUTCOME: u64 = 51;
+    pub const LAST_KNOWN: u64 = 51;
 }

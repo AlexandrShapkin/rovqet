@@ -4,6 +4,10 @@
 //! volatile delivery grants: after a restart or lease expiry an unacknowledged committed
 //! message becomes eligible for redelivery with a higher delivery attempt. One serialized
 //! actor thread owns every mutation.
+use super::terminal::{
+    self, DlqPublisher, DlqRecord, NackOutcome, NackRequest, PendingNack, PendingTerminal,
+    RetryRecord, RetryState, TerminalKind, TerminalPolicy, TerminalRecord, TerminalState,
+};
 use super::*;
 use rovqet_wal::RecordKind;
 use std::collections::{BTreeSet, HashMap};
@@ -27,6 +31,12 @@ pub struct GroupConfig {
     pub max_sparse: usize,
     pub max_lease_bytes: usize,
     pub max_attempts: u32,
+    /// Delay before the next delivery after a NACK; doubled per attempt up to `retry_max`.
+    pub retry_initial: Duration,
+    pub retry_max: Duration,
+    pub terminal_policy: TerminalPolicy,
+    pub max_terminal_pending: usize,
+    pub max_retries: usize,
     pub lease: Duration,
     pub checkpoint_after: u32,
 }
@@ -37,7 +47,12 @@ impl Default for GroupConfig {
             max_inflight: 256,
             max_sparse: 4096,
             max_lease_bytes: 4 * 1024 * 1024,
-            max_attempts: u32::MAX,
+            max_attempts: 8,
+            retry_initial: Duration::from_millis(100),
+            retry_max: Duration::from_secs(30),
+            terminal_policy: TerminalPolicy::None,
+            max_terminal_pending: 64,
+            max_retries: 4096,
             lease: Duration::from_secs(30),
             checkpoint_after: 64,
         }
@@ -77,6 +92,7 @@ pub enum GroupError {
     NotLeased,
     Capacity,
     AckNotCommitted,
+    DlqUnavailable,
     Storage(rovqet_wal::Error),
     Corruption(&'static str),
     Unavailable,
@@ -191,6 +207,9 @@ pub(super) struct GroupState {
     acked: BTreeSet<u64>,
     leases: HashMap<u128, Lease>,
     attempts: HashMap<u64, u32>,
+    retries: HashMap<u64, RetryState>,
+    pending: HashMap<u64, PendingTerminal>,
+    terminals: HashMap<u64, u128>,
     next_lease: u128,
     ack_records: u32,
 }
@@ -206,6 +225,9 @@ impl GroupState {
             acked: BTreeSet::new(),
             leases: HashMap::new(),
             attempts: HashMap::new(),
+            retries: HashMap::new(),
+            pending: HashMap::new(),
+            terminals: HashMap::new(),
             next_lease: 1,
             ack_records: 0,
         }
@@ -384,6 +406,34 @@ impl Partition {
         }
     }
     /// Acknowledges one leased delivery. Success is returned only after the ACK record is durable.
+    /// NACK one delivery. It schedules retry state or a terminal transition; it never
+    /// acknowledges successful processing or closes the source on its own.
+    pub fn try_nack(&self, request: NackRequest) -> std::result::Result<PendingNack, GroupError> {
+        if request.partition != self.config.partition {
+            return Err(GroupError::WrongPartition);
+        }
+        if request.group_id == 0 || request.lease_id == 0 {
+            return Err(GroupError::InvalidRequest);
+        }
+        let reservation =
+            Budget::reserve(&[self.budget.clone()], 512).ok_or(GroupError::Capacity)?;
+        let (reply, receiver) = oneshot::channel();
+        let command = Command::Nack(terminal::NackCommand {
+            request,
+            reply,
+            _reservation: reservation,
+        });
+        match self
+            .sender
+            .as_ref()
+            .ok_or(GroupError::Unavailable)?
+            .try_send(command)
+        {
+            Ok(()) => Ok(PendingNack { reply: receiver }),
+            Err(TrySendError::Full(_)) => Err(GroupError::Capacity),
+            Err(TrySendError::Disconnected(_)) => Err(GroupError::Unavailable),
+        }
+    }
     pub fn try_ack(&self, request: AckRequest) -> std::result::Result<PendingAck, GroupError> {
         if request.partition != self.config.partition {
             return Err(GroupError::WrongPartition);
@@ -493,9 +543,133 @@ impl State {
                 advance_cursor(&self.messages, group, watermark);
                 Ok(())
             }
-            RecordKind::TerminalDisposition | RecordKind::Tombstone => {
-                Err(Error::Corruption("unsupported committed consumer metadata"))
+            RecordKind::Retry => {
+                let retry = RetryRecord::decode(&record.payload)
+                    .map_err(|_| Error::Corruption("retry record encoding"))?;
+                if !self.message_index.contains_key(&retry.offset) {
+                    return Err(Error::Corruption("retry without message"));
+                }
+                if retry.ownership_epoch > self.config.ownership_epoch {
+                    return Err(Error::StaleOwner);
+                }
+                let cursor = self.first_application_offset();
+                let group = self
+                    .groups
+                    .entry(retry.group_id)
+                    .or_insert_with(|| GroupState::new(cursor));
+                if retry.generation > group.generation {
+                    return Err(Error::Corruption("retry generation"));
+                }
+                group.attempts.insert(
+                    retry.offset,
+                    group
+                        .attempts
+                        .get(&retry.offset)
+                        .copied()
+                        .unwrap_or(0)
+                        .max(retry.attempt),
+                );
+                if group.retries.len() >= self.config.group.max_retries
+                    && !group.retries.contains_key(&retry.offset)
+                {
+                    return Err(Error::Capacity);
+                }
+                // Monotonic wall time is unavailable across restart; an already-scheduled
+                // retry becomes immediately eligible rather than being lost or shortened
+                // into a terminal decision.
+                group.retries.insert(
+                    retry.offset,
+                    RetryState {
+                        attempt: retry.attempt,
+                        eligible_ms: self.logical_time,
+                        exhausted: retry.exhausted,
+                    },
+                );
+                Ok(())
             }
+            RecordKind::TerminalDisposition => {
+                let terminal = TerminalRecord::decode(&record.payload)
+                    .map_err(|_| Error::Corruption("terminal record encoding"))?;
+                if !self.message_index.contains_key(&terminal.source_offset) {
+                    return Err(Error::Corruption("terminal without message"));
+                }
+                if terminal.ownership_epoch > self.config.ownership_epoch {
+                    return Err(Error::StaleOwner);
+                }
+                let expected_message = self.message_index[&terminal.source_offset];
+                if expected_message != terminal.original_message_id {
+                    return Err(Error::Corruption("terminal message identity"));
+                }
+                let cursor = self.first_application_offset();
+                let group = self
+                    .groups
+                    .entry(terminal.group_id)
+                    .or_insert_with(|| GroupState::new(cursor));
+                if terminal.generation > group.generation {
+                    return Err(Error::Corruption("terminal generation"));
+                }
+                match terminal.state {
+                    TerminalState::Pending => {
+                        if terminal.dlq_incarnation != 0 || terminal.dlq_offset != 0 {
+                            return Err(Error::Corruption("pending DLQ proof"));
+                        }
+                        if group.pending.len() >= self.config.group.max_terminal_pending
+                            && !group.pending.contains_key(&terminal.source_offset)
+                        {
+                            return Err(Error::Capacity);
+                        }
+                        group.pending.insert(
+                            terminal.source_offset,
+                            PendingTerminal {
+                                kind: terminal.kind,
+                                disposition_id: terminal.disposition_id,
+                                generation: terminal.generation,
+                                ownership_epoch: terminal.ownership_epoch,
+                                attempts: terminal.attempts,
+                                original_message_id: terminal.original_message_id,
+                                reason: terminal.reason,
+                            },
+                        );
+                        self.pending_terminal.insert(
+                            (terminal.group_id, terminal.source_offset),
+                            PendingTerminal {
+                                kind: terminal.kind,
+                                disposition_id: terminal.disposition_id,
+                                generation: terminal.generation,
+                                ownership_epoch: terminal.ownership_epoch,
+                                attempts: terminal.attempts,
+                                original_message_id: terminal.original_message_id,
+                                reason: terminal.reason,
+                            },
+                        );
+                    }
+                    TerminalState::Committed => {
+                        if terminal.kind == TerminalKind::Dlq {
+                            self.recovered_dlq_commits.push((
+                                terminal.disposition_id,
+                                terminal.dlq_incarnation,
+                                terminal.dlq_offset,
+                                terminal.original_message_id,
+                            ));
+                        }
+                        group.pending.remove(&terminal.source_offset);
+                        group
+                            .terminals
+                            .insert(terminal.source_offset, terminal.disposition_id);
+                        group.retries.remove(&terminal.source_offset);
+                        group
+                            .leases
+                            .retain(|_, lease| lease.offset != terminal.source_offset);
+                        group.acked.insert(terminal.source_offset);
+                        let watermark = group.cursor;
+                        advance_cursor(&self.messages, group, watermark);
+                        self.pending_terminal
+                            .remove(&(terminal.group_id, terminal.source_offset));
+                    }
+                }
+                Ok(())
+            }
+            RecordKind::Tombstone => Err(Error::Corruption("unsupported tombstone metadata")),
             _ => Err(Error::Corruption("unexpected consumer metadata")),
         }
     }
@@ -555,6 +729,21 @@ impl State {
                 .groups
                 .get(&group_id)
                 .map(|group| group.attempts.clone())
+                .unwrap_or_default(),
+            retries: self
+                .groups
+                .get(&group_id)
+                .map(|group| group.retries.clone())
+                .unwrap_or_default(),
+            pending: self
+                .groups
+                .get(&group_id)
+                .map(|group| group.pending.clone())
+                .unwrap_or_default(),
+            terminals: self
+                .groups
+                .get(&group_id)
+                .map(|group| group.terminals.clone())
                 .unwrap_or_default(),
             next_lease: self
                 .groups
@@ -654,14 +843,38 @@ impl State {
         if r.generation == 0 {
             self.claim_generation(r.group_id)?;
         }
+        self.advance_clock();
+        // Retry exhaustion and expired attempts can require a durable terminal transition
+        // before selection. Gather candidates, then release the group borrow for IO.
+        let mut exhausted = Vec::new();
         let Some(group) = self.groups.get_mut(&r.group_id) else {
             return Err(GroupError::GroupNotFound);
         };
         if r.generation != 0 && r.generation != group.generation {
             return Err(GroupError::StaleGeneration);
         }
+        let now = Instant::now();
+        for lease in group.leases.values() {
+            if lease.deadline <= now
+                && lease.attempt >= self.config.group.max_attempts
+                && self.config.group.terminal_policy != TerminalPolicy::None
+            {
+                exhausted.push(lease.offset);
+            }
+        }
+        for (offset, retry) in &group.retries {
+            if retry.exhausted && self.config.group.terminal_policy != TerminalPolicy::None {
+                exhausted.push(*offset);
+            }
+        }
+        expire_leases(group, now);
+        for offset in exhausted {
+            self.trigger_exhausted(r.group_id, offset)?;
+        }
+        let Some(group) = self.groups.get_mut(&r.group_id) else {
+            return Err(GroupError::GroupNotFound);
+        };
         let generation = group.generation;
-        expire_leases(group, Instant::now());
         let mut response_bytes = GROUP_BATCH_BYTES;
         let mut deliveries = Vec::with_capacity(r.max_messages);
         let mut leased_bytes = group
@@ -684,6 +897,20 @@ impl State {
                 has_more = true;
                 limit.get_or_insert(GroupStop::InFlight);
                 continue;
+            }
+            if let Some(retry) = group.retries.get(&message.offset) {
+                if retry.exhausted {
+                    // Exhaustion never closes the record by itself. Without a terminal
+                    // policy the group stalls with the offset still incomplete.
+                    has_more = true;
+                    limit.get_or_insert(GroupStop::InFlight);
+                    continue;
+                }
+                if retry.eligible_ms > self.logical_time {
+                    has_more = true;
+                    limit.get_or_insert(GroupStop::InFlight);
+                    continue;
+                }
             }
             let record = self
                 .wal
@@ -739,6 +966,7 @@ impl State {
             response_bytes += required;
             leased_bytes += required;
             group.attempts.insert(message.offset, attempt);
+            group.retries.remove(&message.offset);
             let lease_id = Self::next_lease_id(group);
             let deadline = Instant::now()
                 .checked_add(self.config.group.lease)
@@ -902,5 +1130,474 @@ impl State {
             offset: r.offset,
             generation,
         })
+    }
+    fn retry_delay_ms(&self, attempt: u32) -> u64 {
+        let initial = self.config.group.retry_initial.as_millis().max(1) as u64;
+        let maximum = self
+            .config
+            .group
+            .retry_max
+            .as_millis()
+            .max(u128::from(initial)) as u64;
+        let shift = attempt.saturating_sub(1).min(31);
+        initial.saturating_mul(1u64 << shift).min(maximum)
+    }
+    fn append_retry(
+        &mut self,
+        group_id: u64,
+        offset: u64,
+        attempt: u32,
+        reason: u8,
+        exhausted: bool,
+    ) -> std::result::Result<u32, GroupError> {
+        let delay = if exhausted {
+            u32::MAX
+        } else {
+            u32::try_from(self.retry_delay_ms(attempt)).unwrap_or(u32::MAX)
+        };
+        let Some(group) = self.groups.get(&group_id) else {
+            return Err(GroupError::GroupNotFound);
+        };
+        if group.retries.len() >= self.config.group.max_retries
+            && !group.retries.contains_key(&offset)
+        {
+            return Err(GroupError::Capacity);
+        }
+        let generation = group.generation;
+        let record = Record {
+            kind: RecordKind::Retry,
+            logical_offset: self.next,
+            owner_epoch: self.config.ownership_epoch,
+            producer_id: 0,
+            producer_epoch: 0,
+            sequence: u64::from(attempt),
+            message_id: self.message_index[&offset],
+            server_timestamp: self.logical_time,
+            payload: RetryRecord {
+                group_id,
+                incarnation: self.wal_config.incarnation,
+                offset,
+                generation,
+                ownership_epoch: self.config.ownership_epoch,
+                attempt,
+                reason,
+                delay_ms: delay,
+                exhausted,
+            }
+            .encode(),
+        };
+        let record_offset = self.next;
+        let result = (|| {
+            #[cfg(feature = "fault-injection")]
+            self.test_barrier(TestStage::BeforeAppend, offset)
+                .map_err(|_| GroupError::AckNotCommitted)?;
+            self.wal.append(record)?;
+            #[cfg(feature = "fault-injection")]
+            self.test_barrier(TestStage::AfterAppendBeforeSync, offset)
+                .map_err(|_| GroupError::AckNotCommitted)?;
+            self.wal.sync()?;
+            #[cfg(feature = "fault-injection")]
+            self.test_barrier(TestStage::AfterSyncBeforeReply, offset)
+                .map_err(|_| GroupError::AckNotCommitted)?;
+            Ok::<_, GroupError>(())
+        })();
+        if result.is_err() {
+            self.unhealthy = true;
+            return Err(GroupError::AckNotCommitted);
+        }
+        self.next = record_offset.checked_add(1).ok_or(GroupError::Capacity)?;
+        self.committed
+            .store(self.next, std::sync::atomic::Ordering::Release);
+        let group = self.groups.get_mut(&group_id).unwrap();
+        group.attempts.insert(
+            offset,
+            group
+                .attempts
+                .get(&offset)
+                .copied()
+                .unwrap_or(0)
+                .max(attempt),
+        );
+        group.retries.insert(
+            offset,
+            RetryState {
+                attempt,
+                eligible_ms: self.logical_time.saturating_add(u64::from(delay)),
+                exhausted,
+            },
+        );
+        Ok(delay)
+    }
+    pub(super) fn nack(&mut self, r: NackRequest) -> std::result::Result<NackOutcome, GroupError> {
+        if self.unhealthy {
+            return Err(GroupError::Unavailable);
+        }
+        if r.ownership_epoch != self.config.ownership_epoch {
+            return Err(GroupError::StaleGeneration);
+        }
+        self.advance_clock();
+        let offset = r.offset.sequence;
+        let Some(&message_id) = self.message_index.get(&offset) else {
+            return Err(GroupError::NotLeased);
+        };
+        let Some(group) = self.groups.get(&r.group_id) else {
+            return Err(GroupError::GroupNotFound);
+        };
+        if offset < group.cursor || group.acked.contains(&offset) {
+            return Ok(NackOutcome::AlreadyClosed {
+                disposition_id: group.terminals.get(&offset).copied().unwrap_or_else(|| {
+                    terminal::disposition_id(r.group_id, self.wal_config.incarnation, offset)
+                }),
+            });
+        }
+        if r.generation != group.generation {
+            return Err(GroupError::StaleGeneration);
+        }
+        // A repeated NACK of the same attempt is idempotent: it never schedules another
+        // durable retry record or resets the backoff deadline.
+        if let Some(retry) = group.retries.get(&offset).copied() {
+            if retry.attempt == r.attempt {
+                if retry.exhausted {
+                    if self.config.group.terminal_policy == TerminalPolicy::None {
+                        return Ok(NackOutcome::RetryExhausted);
+                    }
+                    return self.begin_terminal(
+                        r.group_id,
+                        offset,
+                        terminal::REASON_RETRY_EXHAUSTED,
+                    );
+                }
+                let remaining = retry
+                    .eligible_ms
+                    .saturating_sub(self.logical_time)
+                    .min(u64::from(u32::MAX)) as u32;
+                return Ok(NackOutcome::RetryScheduled {
+                    retry_after_ms: remaining,
+                });
+            }
+        }
+        if let Some(pending) = group.pending.get(&offset).copied() {
+            return self.finish_terminal(r.group_id, offset, pending);
+        }
+        let now = Instant::now();
+        let lease = group.leases.get(&r.lease_id).cloned();
+        let generation = group.generation;
+        let Some(lease) = lease else {
+            return Err(GroupError::NotLeased);
+        };
+        if lease.deadline <= now
+            || lease.offset != offset
+            || lease.attempt != r.attempt
+            || lease.generation != generation
+            || lease.message_id != message_id
+        {
+            return Err(GroupError::NotLeased);
+        }
+        // The lease is consumed by the NACK; it never becomes a durable completion.
+        self.groups
+            .get_mut(&r.group_id)
+            .unwrap()
+            .leases
+            .remove(&r.lease_id);
+        if r.attempt >= self.config.group.max_attempts {
+            if self.config.group.terminal_policy == TerminalPolicy::None {
+                // Persist exhaustion so a restart does not silently resume delivery.
+                self.append_retry(
+                    r.group_id,
+                    offset,
+                    r.attempt,
+                    terminal::REASON_RETRY_EXHAUSTED,
+                    true,
+                )?;
+                return Ok(NackOutcome::RetryExhausted);
+            }
+            // With a terminal policy the PENDING record itself preserves the attempt count.
+            return self.begin_terminal(r.group_id, offset, terminal::REASON_RETRY_EXHAUSTED);
+        }
+        let delay = self.append_retry(r.group_id, offset, r.attempt, r.reason, false)?;
+        Ok(NackOutcome::RetryScheduled {
+            retry_after_ms: delay,
+        })
+    }
+    fn trigger_exhausted(
+        &mut self,
+        group_id: u64,
+        offset: u64,
+    ) -> std::result::Result<(), GroupError> {
+        if self.config.group.terminal_policy == TerminalPolicy::None {
+            return Ok(());
+        }
+        if let Some(group) = self.groups.get(&group_id) {
+            if offset < group.cursor || group.acked.contains(&offset) {
+                return Ok(());
+            }
+        }
+        self.begin_terminal(group_id, offset, terminal::REASON_RETRY_EXHAUSTED)?;
+        Ok(())
+    }
+    fn begin_terminal(
+        &mut self,
+        group_id: u64,
+        offset: u64,
+        reason: u8,
+    ) -> std::result::Result<NackOutcome, GroupError> {
+        let kind = match self.config.group.terminal_policy {
+            TerminalPolicy::None => return Err(GroupError::InvalidRequest),
+            TerminalPolicy::Quarantine => TerminalKind::Quarantine,
+            TerminalPolicy::Dlq => TerminalKind::Dlq,
+        };
+        let Some(group) = self.groups.get(&group_id) else {
+            return Err(GroupError::GroupNotFound);
+        };
+        if offset < group.cursor || group.acked.contains(&offset) {
+            return Ok(NackOutcome::AlreadyClosed {
+                disposition_id: group.terminals.get(&offset).copied().unwrap_or_else(|| {
+                    terminal::disposition_id(group_id, self.wal_config.incarnation, offset)
+                }),
+            });
+        }
+        if let Some(pending) = group.pending.get(&offset).copied() {
+            return self.finish_terminal(group_id, offset, pending);
+        }
+        if group.pending.len() >= self.config.group.max_terminal_pending {
+            return Err(GroupError::Capacity);
+        }
+        let generation = group.generation;
+        let attempts = group.attempts.get(&offset).copied().unwrap_or(0);
+        let original_message_id = self.message_index[&offset];
+        let disposition_id =
+            terminal::disposition_id(group_id, self.wal_config.incarnation, offset);
+        let pending = PendingTerminal {
+            kind,
+            disposition_id,
+            generation,
+            ownership_epoch: self.config.ownership_epoch,
+            attempts,
+            original_message_id,
+            reason,
+        };
+        let record = TerminalRecord {
+            state: TerminalState::Pending,
+            kind,
+            group_id,
+            generation,
+            ownership_epoch: self.config.ownership_epoch,
+            source_incarnation: self.wal_config.incarnation,
+            source_offset: offset,
+            disposition_id,
+            reason,
+            attempts,
+            original_message_id,
+            dlq_incarnation: 0,
+            dlq_offset: 0,
+        };
+        self.append_terminal_record(record, false)?;
+        let group = self.groups.get_mut(&group_id).unwrap();
+        group.pending.insert(offset, pending);
+        group.leases.retain(|_, lease| lease.offset != offset);
+        group.retries.remove(&offset);
+        self.pending_terminal.insert((group_id, offset), pending);
+        self.finish_terminal(group_id, offset, pending)
+    }
+    fn append_terminal_record(
+        &mut self,
+        terminal: TerminalRecord,
+        committed: bool,
+    ) -> std::result::Result<(), GroupError> {
+        let record = Record {
+            kind: RecordKind::TerminalDisposition,
+            logical_offset: self.next,
+            owner_epoch: terminal.ownership_epoch,
+            producer_id: 0,
+            producer_epoch: 0,
+            sequence: u64::from(terminal.attempts),
+            message_id: terminal.original_message_id,
+            server_timestamp: self.logical_time,
+            payload: terminal.encode(),
+        };
+        let offset = terminal.source_offset;
+        let record_offset = self.next;
+        let result = (|| {
+            self.wal.append(record)?;
+            #[cfg(feature = "fault-injection")]
+            if committed {
+                self.test_barrier(TestStage::TerminalCommitAfterAppendBeforeSync, offset)
+                    .map_err(|_| GroupError::AckNotCommitted)?;
+            } else {
+                self.test_barrier(TestStage::TerminalPendingAfterAppendBeforeSync, offset)
+                    .map_err(|_| GroupError::AckNotCommitted)?;
+            }
+            self.wal.sync()?;
+            #[cfg(feature = "fault-injection")]
+            if !committed {
+                self.test_barrier(TestStage::TerminalPendingAfterSync, offset)
+                    .map_err(|_| GroupError::AckNotCommitted)?;
+            } else {
+                self.test_barrier(TestStage::TerminalCommitAfterSyncBeforeReply, offset)
+                    .map_err(|_| GroupError::AckNotCommitted)?;
+            }
+            Ok::<_, GroupError>(())
+        })();
+        if result.is_err() {
+            self.unhealthy = true;
+            return Err(GroupError::AckNotCommitted);
+        }
+        self.next = record_offset.checked_add(1).ok_or(GroupError::Capacity)?;
+        self.committed
+            .store(self.next, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+    fn finish_terminal(
+        &mut self,
+        group_id: u64,
+        offset: u64,
+        pending: PendingTerminal,
+    ) -> std::result::Result<NackOutcome, GroupError> {
+        let mut dlq_incarnation = 0;
+        let mut dlq_offset = 0;
+        if pending.kind == TerminalKind::Dlq {
+            let dlq = self.dlq.clone().ok_or(GroupError::DlqUnavailable)?;
+            let records = self
+                .wal
+                .read(
+                    DurableOffset {
+                        log_incarnation: self.wal_config.incarnation,
+                        sequence: offset,
+                    },
+                    1,
+                    self.wal_config.max_record_bytes,
+                )
+                .map_err(|error| {
+                    self.unhealthy = true;
+                    GroupError::Storage(error)
+                })?;
+            if records.len() != 1
+                || records[0].kind != RecordKind::Message
+                || records[0].message_id != pending.original_message_id
+            {
+                self.unhealthy = true;
+                return Err(GroupError::Corruption("DLQ source message"));
+            }
+            let payload = records.into_iter().next().unwrap().payload;
+            let record = DlqRecord {
+                disposition_id: pending.disposition_id,
+                group_id,
+                source_partition: self.config.partition,
+                source_incarnation: self.wal_config.incarnation,
+                source_offset: offset,
+                original_message_id: pending.original_message_id,
+                reason: pending.reason,
+                attempts: pending.attempts,
+                payload: &payload,
+            };
+            let destination = dlq.publish(&record).map_err(|error| match error {
+                super::terminal::DlqError::Unavailable => GroupError::DlqUnavailable,
+                super::terminal::DlqError::Capacity => GroupError::Capacity,
+                super::terminal::DlqError::Conflict => {
+                    GroupError::Corruption("DLQ disposition conflict")
+                }
+                super::terminal::DlqError::Corruption(_) => GroupError::Corruption("DLQ payload"),
+            })?;
+            #[cfg(feature = "fault-injection")]
+            self.test_barrier(TestStage::DlqAfterPublishBeforeTerminal, offset)
+                .map_err(|_| GroupError::AckNotCommitted)?;
+            if !dlq
+                .verify(
+                    destination,
+                    pending.disposition_id,
+                    pending.original_message_id,
+                )
+                .map_err(|_| GroupError::DlqUnavailable)?
+            {
+                return Err(GroupError::Corruption("DLQ commit proof"));
+            }
+            dlq_incarnation = destination.log_incarnation;
+            dlq_offset = destination.sequence;
+        }
+        let record = TerminalRecord {
+            state: TerminalState::Committed,
+            kind: pending.kind,
+            group_id,
+            generation: pending.generation,
+            ownership_epoch: pending.ownership_epoch,
+            source_incarnation: self.wal_config.incarnation,
+            source_offset: offset,
+            disposition_id: pending.disposition_id,
+            reason: pending.reason,
+            attempts: pending.attempts,
+            original_message_id: pending.original_message_id,
+            dlq_incarnation,
+            dlq_offset,
+        };
+        self.append_terminal_record(record, true)?;
+        let group = self.groups.get_mut(&group_id).unwrap();
+        group.pending.remove(&offset);
+        group.retries.remove(&offset);
+        group.leases.retain(|_, lease| lease.offset != offset);
+        group.terminals.insert(offset, pending.disposition_id);
+        group.acked.insert(offset);
+        advance_cursor(&self.messages, group, self.next);
+        self.pending_terminal.remove(&(group_id, offset));
+        Ok(NackOutcome::TerminalCommitted {
+            disposition_id: pending.disposition_id,
+        })
+    }
+    pub(super) fn resume_pending_terminal(&mut self) {
+        if self.pending_terminal.is_empty() || self.unhealthy {
+            return;
+        }
+        let now = Instant::now();
+        if self
+            .last_terminal_attempt
+            .is_some_and(|last| now.duration_since(last) < Duration::from_millis(250))
+        {
+            return;
+        }
+        self.last_terminal_attempt = Some(now);
+        let pending: Vec<(u64, u64, PendingTerminal)> = self
+            .pending_terminal
+            .iter()
+            .map(|(&(group, offset), &intent)| (group, offset, intent))
+            .collect();
+        for (group_id, offset, intent) in pending {
+            let _ = self.finish_terminal(group_id, offset, intent);
+        }
+    }
+    pub(super) fn reconcile_recovered_terminal(&mut self) -> Result<()> {
+        let pending: Vec<(u64, u64, PendingTerminal)> = self
+            .pending_terminal
+            .iter()
+            .map(|(&(group, offset), &intent)| (group, offset, intent))
+            .collect();
+        for (group_id, offset, intent) in pending {
+            self.finish_terminal(group_id, offset, intent)
+                .map_err(|error| match error {
+                    GroupError::DlqUnavailable => Error::DlqUnavailable,
+                    GroupError::Capacity => Error::Capacity,
+                    GroupError::Corruption(reason) => Error::Corruption(reason),
+                    GroupError::Storage(_) => Error::Corruption("terminal recovery IO"),
+                    _ => Error::Corruption("terminal recovery"),
+                })?;
+        }
+        if self.recovered_dlq_commits.is_empty() {
+            return Ok(());
+        }
+        let dlq = self.dlq.clone().ok_or(Error::DlqUnavailable)?;
+        for (disposition, incarnation, offset, original) in self.recovered_dlq_commits.clone() {
+            let verified = dlq
+                .verify(
+                    DurableOffset {
+                        log_incarnation: incarnation,
+                        sequence: offset,
+                    },
+                    disposition,
+                    original,
+                )
+                .map_err(|_| Error::DlqUnavailable)?;
+            if !verified {
+                return Err(Error::Corruption("committed DLQ proof missing"));
+            }
+        }
+        Ok(())
     }
 }

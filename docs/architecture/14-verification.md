@@ -103,3 +103,20 @@ A defect found by this campaign has been fixed: B-05 made application offsets sp
 the major-1 codec still rejected odd `READ_RECORD`/`READ_END` offsets, so replay after
 interleaved consumer metadata returned `RESOURCE_EXHAUSTED`. The codec now accepts sparse
 positions; the golden vectors are unchanged and a protocol regression pinned the behavior.
+
+## B-06 retry and terminal-disposition campaign
+
+`scripts/test_q1_terminal.py` drives real external SDK consumers through NACK, bounded
+backoff, exhaustion, quarantine and a real DLQ partition. The parent journal records NACK
+requests, retry scheduling, deliveries, terminal commits, DLQ publications and recovered
+cursors. `q1_oracle.reconcile_terminal` rejects a DLQ terminal without a prior destination
+publication, a missing or duplicated DLQ record, a payload-digest mismatch, a terminal for
+an uncommitted source offset, cursor movement across an unexplained source record, and any
+incomplete journal.
+
+Deterministic barriers cover crash after the PENDING record append/before sync, after the
+PENDING sync, after the DLQ commit/before the source terminal, and the committed terminal
+append/sync windows. Recovery must produce exactly one DLQ record, complete the source
+terminal only after its own barrier, and retain the original publication in every case.
+Actor tests additionally cover bounded retry/terminal state, corrupt terminal metadata,
+unavailable DLQ, sparse terminal closure and real destination readability and idempotence.

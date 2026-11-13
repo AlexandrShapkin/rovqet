@@ -5,7 +5,9 @@
 
 pub use rovqet_core::{DurableOffset, PartitionRef, Priority, PublishOutcome, QoS};
 mod group;
-pub use group::{AckOutcome, DeliveryToken, GroupBatch, GroupError, GroupMessage, GroupOptions};
+pub use group::{
+    AckOutcome, DeliveryToken, GroupBatch, GroupError, GroupMessage, GroupOptions, NackOutcome,
+};
 mod replay;
 pub use replay::{ReadBatch, ReadError, ReadOptions, ReadRecord, ReadStatus};
 use rovqet_protocol::{ErrorCode, Field, Frame, FrameType, Limits, registry::field as f};

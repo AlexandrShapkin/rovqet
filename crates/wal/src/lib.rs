@@ -62,6 +62,9 @@ pub enum RecordKind {
     TerminalDisposition = 4,
     CursorCheckpoint = 5,
     Tombstone = 6,
+    /// B-06 durable retry metadata (attempt count, backoff reason). Additive kind; the
+    /// v1 record/segment/manifest encoding is unchanged.
+    Retry = 7,
 }
 impl RecordKind {
     fn decode(v: u8) -> Result<Self> {
@@ -72,6 +75,7 @@ impl RecordKind {
             4 => Self::TerminalDisposition,
             5 => Self::CursorCheckpoint,
             6 => Self::Tombstone,
+            7 => Self::Retry,
             _ => return Err(Error::Corruption("unknown record kind")),
         })
     }

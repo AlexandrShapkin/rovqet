@@ -94,9 +94,31 @@ one active mutation generation per group. Implementation choices:
   Periodic `CURSOR_CHECKPOINT` records embed the cursor and the sparse set, so compaction
   cannot erase acknowledged gaps.
 - `FETCH` batches terminate with the additive `FETCH_END` frame after all `MESSAGE` frames.
-  Losing the connection before `FETCH_END` yields no completed SDK batch. `CONSUMER_NACK`
-  and `EXTEND_LEASE` remain explicitly unsupported (B-06), and no timeout/NACK/disconnect
-  closes an offset. DLQ/quarantine, SEEK and rebalancing remain out of scope.
+  Losing the connection before `FETCH_END` yields no completed SDK batch. No timeout, NACK or
+  disconnect closes an offset by itself.
+
+## B-06 implemented retry and terminal disposition
+
+`CONSUMER_NACK` validates the same full token as ACK and never acknowledges processing. It
+either schedules a bounded retry (initial delay, exponential doubling, maximum delay,
+maximum attempts) or starts the configured terminal policy. Repeated NACKs of the same
+attempt are idempotent. `CONSUMER_NACK_RESULT` reports RETRY_SCHEDULED, RETRY_EXHAUSTED,
+TERMINAL_COMMITTED, TERMINAL_PENDING or ALREADY_CLOSED; ACK_COMMITTED is never reused.
+
+Retry exhaustion alone leaves the source incomplete. With policy QUARANTINE the broker
+durably appends a PENDING terminal record and then a COMMITTED quarantine record before the
+cursor may close the offset. With policy DLQ the broker durably appends PENDING, publishes
+the complete original payload to a separate explicitly configured Q1 DLQ partition with a
+stable disposition ID, verifies the destination commit, and only then appends the source
+COMMITTED record. Crash recovery reconciles a durable PENDING record: it re-verifies or
+idempotently republishes the DLQ message and completes the source transition only after its
+own barrier. A missing DLQ proof fails closed; DLQ unavailability reports DLQ_UNAVAILABLE and
+leaves the cursor unchanged.
+
+Terminal closure participates in the same sparse completed set as ACKs, so later closures
+never advance the cursor across an earlier incomplete record. Quarantine and DLQ never delete
+the original Q1 publication. `EXTEND_LEASE`, SEEK, rebalancing, Q2 and distributed terminal
+transactions remain out of scope.
 
 Limitations: a lease token is valid only for its process lifetime; redelivery attempts reset
 after restart. Group state is not replicated (Q2/Raft remains C-03/C-05), and an

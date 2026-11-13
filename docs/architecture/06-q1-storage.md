@@ -296,3 +296,30 @@ bytes, a 30 s lease and a checkpoint every 64 ACKs. Group state, WAL reads and r
 reservations are charged to the existing partition budget before IO; exhaustion is an explicit
 CAPACITY error. The single partition actor remains the only mutator, and all group durability
 barriers are ordinary Q1 segment+manifest syncs.
+
+## B-06 retry and terminal metadata; separate Q1 DLQ
+
+The v1 record/segment/manifest envelope is unchanged. B-06 adds the previously unassigned
+record kind **RETRY (7)** with an `RQRT` v1 payload (group, incarnation, source offset,
+generation, ownership epoch, attempt, reason, delay, exhausted flag), and now uses the
+reserved **TERMINAL_DISPOSITION (4)** kind with an `RQTD` v1 payload. The terminal payload
+carries state (PENDING/COMMITTED), kind (QUARANTINE/DLQ), group, generation, ownership epoch,
+source incarnation/offset, deterministic disposition ID, reason, attempts, original message
+ID, and for committed DLQ the destination incarnation/offset. Disposition IDs are derived
+from `(group, source incarnation, source offset)` and must match on recovery.
+
+Recovery applies retry records as durable attempt state (eligible immediately after restart,
+because monotonic wall time is unavailable) and terminal records as pending or closed state.
+Pending records are reconciled before the actor reports ready: quarantine appends its
+committed marker; DLQ republishes idempotently to the destination, verifies the destination
+record and only then appends the source COMMITTED marker. A committed DLQ terminal record is
+re-verified against the DLQ partition during recovery; a missing destination proof fails
+closed. Checkpoints and compaction never erase an unresolved PENDING record.
+
+The DLQ is a second explicitly configured local Q1 partition with its own directory,
+incarnation, WAL and manifest. Its messages are ordinary v1 application messages whose
+payload is an `RQDL` v1 frame preserving the original bytes and identity. A DLQ publication
+uses the deterministic disposition ID as producer/message identity, so a repeated
+disposition returns the original destination offset instead of inserting a duplicate. No
+Q0 fallback exists; unavailable DLQ storage yields DLQ_UNAVAILABLE and leaves the source
+cursor blocked.

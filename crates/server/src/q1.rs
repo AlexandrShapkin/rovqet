@@ -18,6 +18,16 @@ use std::{
 };
 
 #[derive(Debug, Clone)]
+pub struct DlqOptions {
+    pub directory: PathBuf,
+    pub topic: String,
+    pub partition: PartitionRef,
+    pub incarnation: u128,
+    pub owner_epoch: u64,
+    pub max_producers: usize,
+    pub max_outcomes: usize,
+}
+#[derive(Debug, Clone)]
 pub struct Options {
     pub directory: PathBuf,
     pub topic: String,
@@ -28,6 +38,11 @@ pub struct Options {
     pub max_producers: usize,
     pub max_outcomes: usize,
     pub initialize_new_log: bool,
+    pub terminal_policy: rovqet_durable::TerminalPolicy,
+    pub max_attempts: u32,
+    pub retry_initial: Duration,
+    pub retry_max: Duration,
+    pub dlq: Option<DlqOptions>,
 }
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
@@ -55,7 +70,7 @@ impl Options {
                 "Q1 topic must be valid and separate from Q0 demo/telemetry",
             ));
         }
-        let result = Self {
+        let mut result = Self {
             directory: PathBuf::from(get("--q1-data-dir")?),
             topic,
             partition: PartitionRef {
@@ -94,7 +109,97 @@ impl Options {
                 .transpose()
                 .map_err(|_| invalid("invalid outcome limit"))?
                 .unwrap_or(100_000),
+            terminal_policy: rovqet_durable::TerminalPolicy::None,
+            max_attempts: values
+                .get("--q1-max-attempts")
+                .map(|v| v.parse())
+                .transpose()
+                .map_err(|_| invalid("invalid max attempts"))?
+                .unwrap_or(8),
+            retry_initial: Duration::from_millis(
+                values
+                    .get("--q1-retry-initial-ms")
+                    .map(|v| v.parse())
+                    .transpose()
+                    .map_err(|_| invalid("invalid retry initial delay"))?
+                    .unwrap_or(100),
+            ),
+            retry_max: Duration::from_millis(
+                values
+                    .get("--q1-retry-max-ms")
+                    .map(|v| v.parse())
+                    .transpose()
+                    .map_err(|_| invalid("invalid retry maximum delay"))?
+                    .unwrap_or(30_000),
+            ),
+            dlq: None,
         };
+        result.terminal_policy = match values
+            .get("--q1-terminal-policy")
+            .map(String::as_str)
+            .unwrap_or("none")
+        {
+            "none" => rovqet_durable::TerminalPolicy::None,
+            "quarantine" => rovqet_durable::TerminalPolicy::Quarantine,
+            "dlq" => rovqet_durable::TerminalPolicy::Dlq,
+            _ => return Err(invalid("terminal policy must be none, quarantine or dlq")),
+        };
+        if result.max_attempts == 0
+            || result.retry_initial.is_zero()
+            || result.retry_max < result.retry_initial
+        {
+            return Err(invalid("invalid retry bounds"));
+        }
+        if let Some(directory) = values.get("--q1-dlq-data-dir") {
+            let topic = values
+                .get("--q1-dlq-topic")
+                .ok_or_else(|| invalid("Q1 DLQ requires --q1-dlq-topic"))?
+                .clone();
+            let topic_id = number("--q1-dlq-topic-id")?;
+            if !rovqet_router::valid_topic_name(&topic)
+                || matches!(topic.as_str(), "demo" | "telemetry")
+                || topic == result.topic
+                || topic_id <= 2
+                || topic_id == result.partition.topic_id
+            {
+                return Err(invalid(
+                    "Q1 DLQ needs a distinct valid topic and topic ID > 2",
+                ));
+            }
+            result.dlq = Some(DlqOptions {
+                directory: PathBuf::from(directory),
+                topic,
+                partition: PartitionRef {
+                    tenant_id: result.partition.tenant_id,
+                    topic_id,
+                    partition_id: u32::try_from(
+                        values
+                            .get("--q1-dlq-partition-id")
+                            .map(|value| value.parse::<u64>())
+                            .transpose()
+                            .map_err(|_| invalid("invalid Q1 DLQ partition ID"))?
+                            .unwrap_or(0),
+                    )
+                    .map_err(|_| invalid("invalid Q1 DLQ partition ID"))?,
+                },
+                incarnation: values
+                    .get("--q1-dlq-incarnation")
+                    .ok_or_else(|| invalid("Q1 DLQ requires --q1-dlq-incarnation"))?
+                    .parse()
+                    .map_err(|_| invalid("invalid Q1 DLQ incarnation"))?,
+                owner_epoch: values
+                    .get("--q1-dlq-owner-epoch")
+                    .map(|value| value.parse::<u64>())
+                    .transpose()
+                    .map_err(|_| invalid("invalid Q1 DLQ owner epoch"))?
+                    .unwrap_or(result.owner_epoch),
+                max_producers: 100_000,
+                max_outcomes: 100_000,
+            });
+        }
+        if result.terminal_policy == rovqet_durable::TerminalPolicy::Dlq && result.dlq.is_none() {
+            return Err(invalid("dlq terminal policy requires --q1-dlq-data-dir"));
+        }
         if result.dedup_window.is_zero()
             || result.max_producers == 0
             || result.max_outcomes == 0
@@ -111,9 +216,92 @@ impl Options {
     }
 }
 
+struct DlqRoute {
+    partition: Arc<Partition>,
+    options: DlqOptions,
+}
+impl DlqRoute {
+    fn target(&self) -> ReadTarget {
+        ReadTarget {
+            topic: self.options.topic.clone(),
+            partition: self.options.partition,
+            incarnation: self.options.incarnation,
+        }
+    }
+}
+impl rovqet_durable::DlqPublisher for DlqRoute {
+    fn publish(
+        &self,
+        record: &rovqet_durable::DlqRecord<'_>,
+    ) -> std::result::Result<rovqet_core::DurableOffset, rovqet_durable::DlqError> {
+        let payload = rovqet_durable::dlq_payload(record);
+        let request = PublishRequest {
+            partition: self.options.partition,
+            qos: QoS::Q1,
+            ownership_epoch: self.options.owner_epoch,
+            principal: 0,
+            producer_id: record.disposition_id,
+            producer_epoch: 0,
+            sequence: 0,
+            message_id: record.disposition_id,
+            payload,
+        };
+        let outcome = self
+            .partition
+            .try_publish(request)
+            .and_then(|pending| pending.wait())
+            .map_err(|error| match error {
+                DurableError::Unavailable
+                | DurableError::Storage(_)
+                | DurableError::OutcomeUnknown => rovqet_durable::DlqError::Unavailable,
+                DurableError::Capacity => rovqet_durable::DlqError::Capacity,
+                DurableError::SequenceConflict => rovqet_durable::DlqError::Conflict,
+                _ => rovqet_durable::DlqError::Unavailable,
+            })?;
+        match outcome {
+            PublishOutcome::CommittedLocal(offset) => Ok(offset),
+            _ => Err(rovqet_durable::DlqError::Unavailable),
+        }
+    }
+    fn verify(
+        &self,
+        offset: rovqet_core::DurableOffset,
+        disposition_id: u128,
+        original_message_id: u128,
+    ) -> std::result::Result<bool, rovqet_durable::DlqError> {
+        let batch = self
+            .partition
+            .try_replay(rovqet_durable::ReplayRequest {
+                partition: self.options.partition,
+                from: offset,
+                max_messages: 1,
+                max_bytes: 64 * 1024,
+                wait: Duration::ZERO,
+            })
+            .and_then(|pending| pending.wait())
+            .map_err(|_| rovqet_durable::DlqError::Unavailable)?;
+        let Some(message) = batch.messages.first() else {
+            return Ok(false);
+        };
+        if message.offset != offset || message.message_id != disposition_id {
+            return Ok(false);
+        }
+        let metadata = rovqet_durable::parse_dlq_payload(&message.payload)
+            .map_err(|_| rovqet_durable::DlqError::Corruption("DLQ payload"))?;
+        Ok(metadata.disposition_id == disposition_id
+            && metadata.original_message_id == original_message_id)
+    }
+}
+#[derive(Clone)]
+struct ReadTarget {
+    topic: String,
+    partition: PartitionRef,
+    incarnation: u128,
+}
 pub struct Route {
     partition: Partition,
     options: Options,
+    dlq: Option<Arc<DlqRoute>>,
     // Kept until the actor is drained and closed. Never unlink a lock file on crash/restart.
     _lock: File,
 }
@@ -188,21 +376,88 @@ impl Route {
             max_outcomes: options.max_outcomes,
             max_producers: options.max_producers,
             dedup_window: options.dedup_window,
-            group: group_config(),
+            group: group_config(&options),
         };
-        #[cfg(feature = "fault-injection")]
-        let partition = if let Some(control) = test_control()? {
-            Partition::open_with_test_control(&dir, wal, config, control)
-        } else if options.initialize_new_log {
-            Partition::open(&dir, wal, config)
-        } else {
-            Partition::open_existing(&dir, wal, config)
+        // The DLQ is a second explicit local Q1 partition. It is opened before the source
+        // actor so pending terminal records can be reconciled during source recovery.
+        let dlq = match options.dlq.clone() {
+            Some(dlq_options) => {
+                std::fs::create_dir_all(&dlq_options.directory)?;
+                let dlq_dir = std::fs::canonicalize(&dlq_options.directory)?;
+                let dlq_wal = rovqet_wal::Config {
+                    partition: dlq_options.partition,
+                    incarnation: dlq_options.incarnation,
+                    ..Default::default()
+                };
+                let dlq_config = PartitionConfig {
+                    partition: dlq_options.partition,
+                    ownership_epoch: dlq_options.owner_epoch,
+                    queue_messages: 64,
+                    queue_bytes: 4 * 1024 * 1024,
+                    max_outcomes: dlq_options.max_outcomes,
+                    max_producers: dlq_options.max_producers,
+                    dedup_window: options.dedup_window,
+                    group: rovqet_durable::GroupConfig::default(),
+                };
+                let partition = if dlq_dir.join("MANIFEST").is_file() {
+                    Partition::open_existing(&dlq_dir, dlq_wal, dlq_config)
+                } else {
+                    Partition::open(&dlq_dir, dlq_wal, dlq_config)
+                }
+                .map_err(|e| {
+                    io::Error::other(format!("Q1 DLQ recovery failed (history preserved): {e}"))
+                })?;
+                Some(Arc::new(DlqRoute {
+                    partition: Arc::new(partition),
+                    options: dlq_options,
+                }))
+            }
+            None => None,
         };
-        #[cfg(not(feature = "fault-injection"))]
-        let partition = if options.initialize_new_log {
-            Partition::open(&dir, wal, config)
-        } else {
-            Partition::open_existing(&dir, wal, config)
+        let partition = {
+            #[cfg(feature = "fault-injection")]
+            {
+                if let Some(control) = test_control()? {
+                    match &dlq {
+                        Some(dlq) => Partition::open_with_test_control_and_dlq(
+                            &dir,
+                            wal,
+                            config,
+                            control,
+                            dlq.clone(),
+                        ),
+                        None => Partition::open_with_test_control(&dir, wal, config, control),
+                    }
+                } else if options.initialize_new_log {
+                    match &dlq {
+                        Some(dlq) => Partition::open_with_dlq(&dir, wal, config, dlq.clone()),
+                        None => Partition::open(&dir, wal, config),
+                    }
+                } else {
+                    match &dlq {
+                        Some(dlq) => {
+                            Partition::open_existing_with_dlq(&dir, wal, config, dlq.clone())
+                        }
+                        None => Partition::open_existing(&dir, wal, config),
+                    }
+                }
+            }
+            #[cfg(not(feature = "fault-injection"))]
+            {
+                if options.initialize_new_log {
+                    match &dlq {
+                        Some(dlq) => Partition::open_with_dlq(&dir, wal, config, dlq.clone()),
+                        None => Partition::open(&dir, wal, config),
+                    }
+                } else {
+                    match &dlq {
+                        Some(dlq) => {
+                            Partition::open_existing_with_dlq(&dir, wal, config, dlq.clone())
+                        }
+                        None => Partition::open_existing(&dir, wal, config),
+                    }
+                }
+            }
         };
         let partition = partition.map_err(|e| {
             io::Error::other(format!("Q1 recovery failed (history preserved): {e}"))
@@ -210,16 +465,64 @@ impl Route {
         Ok(Self {
             partition,
             options,
+            dlq,
             _lock: lock,
         })
     }
     pub fn shutdown(self) -> io::Result<()> {
-        self.partition
+        let Route { partition, dlq, .. } = self;
+        partition
             .shutdown()
-            .map_err(|e| io::Error::other(format!("Q1 shutdown: {e}")))
+            .map_err(|e| io::Error::other(format!("Q1 shutdown: {e}")))?;
+        if let Some(dlq) = dlq {
+            if let Ok(route) = Arc::try_unwrap(dlq) {
+                if let Ok(partition) = Arc::try_unwrap(route.partition) {
+                    partition
+                        .shutdown()
+                        .map_err(|e| io::Error::other(format!("Q1 DLQ shutdown: {e}")))?;
+                }
+            }
+        }
+        Ok(())
     }
     fn read(
         &self,
+        principal: u128,
+        frame: Frame,
+        outbound: Outbound,
+    ) -> Result<SessionReply, ErrorCode> {
+        let name = frame
+            .field(f::TOPIC_NAME)
+            .and_then(|value| std::str::from_utf8(value).ok())
+            .map(str::to_string);
+        let topic_id = frame
+            .field(f::TOPIC_ID)
+            .and_then(|value| value.try_into().ok())
+            .map(u64::from_be_bytes);
+        let main_target = ReadTarget {
+            topic: self.options.topic.clone(),
+            partition: self.options.partition,
+            incarnation: self.options.incarnation,
+        };
+        let main = name.as_deref() == Some(main_target.topic.as_str())
+            || topic_id == Some(main_target.partition.topic_id);
+        if main {
+            return self.read_target(&main_target, &self.partition, principal, frame, outbound);
+        }
+        if let Some(dlq) = &self.dlq {
+            let target = dlq.target();
+            if name.as_deref() == Some(target.topic.as_str())
+                || topic_id == Some(target.partition.topic_id)
+            {
+                return self.read_target(&target, &dlq.partition, principal, frame, outbound);
+            }
+        }
+        Err(ErrorCode::UnsupportedGuarantee)
+    }
+    fn read_target(
+        &self,
+        target: &ReadTarget,
+        partition: &Partition,
         principal: u128,
         frame: Frame,
         outbound: Outbound,
@@ -236,8 +539,8 @@ impl Route {
             return Err(ErrorCode::PermissionDenied);
         }
         for (id, expected) in [
-            (f::TENANT_ID, self.options.partition.tenant_id),
-            (f::TOPIC_ID, self.options.partition.topic_id),
+            (f::TENANT_ID, target.partition.tenant_id),
+            (f::TOPIC_ID, target.partition.topic_id),
         ] {
             if frame.field(id).is_some_and(|v| v != expected.to_be_bytes()) {
                 return Err(ErrorCode::PermissionDenied);
@@ -245,15 +548,15 @@ impl Route {
         }
         if frame
             .field(f::TOPIC_NAME)
-            .is_some_and(|v| v != self.options.topic.as_bytes())
+            .is_some_and(|v| v != target.topic.as_bytes())
         {
             return Err(ErrorCode::UnsupportedGuarantee);
         }
         if frame.field(f::TOPIC_NAME).is_none() && frame.field(f::TOPIC_ID).is_none() {
             return Err(ErrorCode::BadFrame);
         }
-        if number::<4>(&frame, f::PARTITION_ID)? != self.options.partition.partition_id as u128
-            || number::<16>(&frame, f::LOG_INCAR)? != self.options.incarnation
+        if number::<4>(&frame, f::PARTITION_ID)? != target.partition.partition_id as u128
+            || number::<16>(&frame, f::LOG_INCAR)? != target.incarnation
         {
             return Err(ErrorCode::ReplayNotAvailable);
         }
@@ -261,9 +564,9 @@ impl Route {
             return Err(ErrorCode::UnsupportedGuarantee);
         }
         let request = ReplayRequest {
-            partition: self.options.partition,
+            partition: target.partition,
             from: rovqet_core::DurableOffset {
-                log_incarnation: self.options.incarnation,
+                log_incarnation: target.incarnation,
                 sequence: number::<8>(&frame, f::OFFSET)? as u64,
             },
             max_messages: number::<4>(&frame, f::MAX_MESSAGES)? as usize,
@@ -276,16 +579,15 @@ impl Route {
                     .unwrap_or(0) as u64,
             ),
         };
-        let pending = self
-            .partition
+        let pending = partition
             .try_replay_encoded(request, replay::END_BYTES, replay::record_bytes)
             .map_err(map_read_error)?;
         let id = frame.request_id;
         let scope = ReadScope {
-            tenant: self.options.partition.tenant_id,
-            topic: self.options.partition.topic_id,
-            partition: self.options.partition.partition_id,
-            incarnation: self.options.incarnation,
+            tenant: target.partition.tenant_id,
+            topic: target.partition.topic_id,
+            partition: target.partition.partition_id,
+            incarnation: target.incarnation,
         };
         Ok(SessionReply::ReadOnly(Box::pin(async move {
             let batch = Arc::new(pending.wait_async().await.map_err(map_read_error)?);
@@ -525,6 +827,105 @@ impl Route {
             Ok(Some(frame))
         })))
     }
+    fn nack(&self, principal: u128, frame: Frame) -> Result<SessionReply, ErrorCode> {
+        use rovqet_durable::{NackOutcome, NackRequest};
+        if principal != 1 {
+            return Err(ErrorCode::PermissionDenied);
+        }
+        if frame
+            .field(f::PRINCIPAL_ID)
+            .is_some_and(|v| v != 1u64.to_be_bytes())
+        {
+            return Err(ErrorCode::PermissionDenied);
+        }
+        for (id, expected) in [
+            (f::TENANT_ID, self.options.partition.tenant_id),
+            (f::TOPIC_ID, self.options.partition.topic_id),
+        ] {
+            if frame.field(id).is_some_and(|v| v != expected.to_be_bytes()) {
+                return Err(ErrorCode::PermissionDenied);
+            }
+        }
+        if frame
+            .field(f::TOPIC_NAME)
+            .is_some_and(|v| v != self.options.topic.as_bytes())
+        {
+            return Err(ErrorCode::UnsupportedGuarantee);
+        }
+        if frame.field(f::TOPIC_NAME).is_none() && frame.field(f::TOPIC_ID).is_none() {
+            return Err(ErrorCode::BadFrame);
+        }
+        if number::<4>(&frame, f::PARTITION_ID)? != self.options.partition.partition_id as u128
+            || number::<16>(&frame, f::LOG_INCAR)? != self.options.incarnation
+        {
+            return Err(ErrorCode::ReplayNotAvailable);
+        }
+        let reason = frame
+            .field(f::CLOSE_REASON)
+            .map(uint::<2>)
+            .transpose()?
+            .map_or(1, |value| u8::try_from(value).unwrap_or(1).max(1));
+        let request = NackRequest {
+            partition: self.options.partition,
+            group_id: number::<8>(&frame, f::GROUP_ID)? as u64,
+            generation: number::<8>(&frame, f::GROUP_GENERATION)? as u64,
+            lease_id: number::<16>(&frame, f::LEASE_ID)?,
+            ownership_epoch: number::<8>(&frame, f::OWNERSHIP_EPOCH)? as u64,
+            offset: rovqet_core::DurableOffset {
+                log_incarnation: self.options.incarnation,
+                sequence: number::<8>(&frame, f::OFFSET)? as u64,
+            },
+            attempt: u32::try_from(number::<4>(&frame, f::DELIVERY_ATTEMPT)?)
+                .map_err(|_| ErrorCode::BadFrame)?,
+            principal,
+            reason,
+        };
+        let group_id = request.group_id;
+        let generation = request.generation;
+        let offset = request.offset.sequence;
+        let attempt = request.attempt;
+        let pending = self.partition.try_nack(request).map_err(map_group_error)?;
+        let id = frame.request_id;
+        let partition = self.options.partition;
+        let incarnation = self.options.incarnation;
+        Ok(SessionReply::Deferred(Box::pin(async move {
+            let outcome = pending.wait_async().await.map_err(map_group_error)?;
+            let (code, disposition, retry_after) = match outcome {
+                NackOutcome::RetryScheduled { retry_after_ms } => {
+                    (1u8, 0u128, Some(retry_after_ms))
+                }
+                NackOutcome::RetryExhausted => (2, 0, None),
+                NackOutcome::TerminalCommitted { disposition_id } => (3, disposition_id, None),
+                NackOutcome::TerminalPending { disposition_id } => (4, disposition_id, None),
+                NackOutcome::AlreadyClosed { disposition_id } => (5, disposition_id, None),
+            };
+            let mut frame = Frame::new(FrameType::ConsumerNackResult, id);
+            frame.fields = vec![
+                Field::required(f::TENANT_ID, partition.tenant_id.to_be_bytes()),
+                Field::required(f::TOPIC_ID, partition.topic_id.to_be_bytes()),
+                Field::required(f::QOS, [1]),
+                Field::required(f::PARTITION_ID, partition.partition_id.to_be_bytes()),
+                Field::required(f::LOG_INCAR, incarnation.to_be_bytes()),
+                Field::required(f::GROUP_ID, group_id.to_be_bytes()),
+                Field::required(f::GROUP_GENERATION, generation.to_be_bytes()),
+                Field::required(f::OFFSET, offset.to_be_bytes()),
+                Field::required(f::DELIVERY_ATTEMPT, attempt.to_be_bytes()),
+                Field::required(f::NACK_OUTCOME, [code]),
+            ];
+            if let Some(delay) = retry_after {
+                frame
+                    .fields
+                    .push(Field::required(f::RETRY_AFTER_MS, delay.to_be_bytes()));
+            }
+            if disposition != 0 {
+                frame.fields.push(Field::required(
+                    f::DISPOSITION_ID,
+                    disposition.to_be_bytes(),
+                ));
+            }
+            Ok(Some(frame))
+        })))
+    }
     fn publish(&self, principal: u128, frame: Frame) -> Result<SessionReply, ErrorCode> {
         if frame.field(f::QOS) != Some(&[1][..]) {
             return Err(ErrorCode::UnsupportedGuarantee);
@@ -653,6 +1054,7 @@ fn map_group_error(error: rovqet_durable::GroupError) -> ErrorCode {
         StaleGeneration => ErrorCode::StaleGeneration,
         NotLeased => ErrorCode::LeaseExpired,
         AckNotCommitted => ErrorCode::AckNotCommitted,
+        DlqUnavailable => ErrorCode::DlqUnavailable,
         Capacity => ErrorCode::ResourceExhausted,
         InvalidRequest | IncarnationMismatch | WrongPartition | GroupNotFound => {
             ErrorCode::ReplayNotAvailable
@@ -671,6 +1073,7 @@ fn map_error(error: DurableError) -> ErrorCode {
         DurableError::HistoryUnavailable => ErrorCode::ReplayNotAvailable,
         DurableError::Capacity => ErrorCode::ResourceExhausted,
         DurableError::Expired => ErrorCode::ExpiredBeforeDelivery,
+        DurableError::DlqUnavailable => ErrorCode::DlqUnavailable,
         DurableError::Unavailable | DurableError::InvalidConfig | DurableError::WorkerStart(_) => {
             ErrorCode::StorageUnavailable
         }
@@ -725,25 +1128,25 @@ impl SessionHandler for Dispatch {
                 None => SessionReply::Immediate(Err(ErrorCode::UnsupportedGuarantee)),
             };
         }
-        if matches!(frame.frame_type, FrameType::Fetch | FrameType::ConsumerAck) {
+        if matches!(
+            frame.frame_type,
+            FrameType::Fetch | FrameType::ConsumerAck | FrameType::ConsumerNack
+        ) {
             if self.draining.load(Ordering::Acquire) {
                 return SessionReply::Immediate(Err(ErrorCode::ServerDraining));
             }
             let Some(route) = &self.route else {
                 return SessionReply::Immediate(Err(ErrorCode::UnsupportedGuarantee));
             };
-            let result = if frame.frame_type == FrameType::Fetch {
-                route.group(principal, frame, outbound)
-            } else {
-                route.acknowledge(principal, frame)
+            let result = match frame.frame_type {
+                FrameType::Fetch => route.group(principal, frame, outbound),
+                FrameType::ConsumerAck => route.acknowledge(principal, frame),
+                _ => route.nack(principal, frame),
             };
             return result.unwrap_or_else(|e| SessionReply::Immediate(Err(e)));
         }
-        // Terminal disposition, NACK and lease extension belong to later work packages.
-        if matches!(
-            frame.frame_type,
-            FrameType::ConsumerNack | FrameType::ExtendLease
-        ) {
+        // Lease extension belongs to a later work package.
+        if frame.frame_type == FrameType::ExtendLease {
             return SessionReply::Immediate(Err(ErrorCode::UnsupportedCapability));
         }
         if frame.frame_type == FrameType::Publish {
@@ -780,9 +1183,15 @@ pub fn validate_test_environment() -> io::Result<()> {
     }
     Ok(())
 }
-fn group_config() -> rovqet_durable::GroupConfig {
+fn group_config(options: &Options) -> rovqet_durable::GroupConfig {
     #[cfg_attr(not(feature = "fault-injection"), allow(unused_mut))]
-    let mut group = rovqet_durable::GroupConfig::default();
+    let mut group = rovqet_durable::GroupConfig {
+        max_attempts: options.max_attempts,
+        retry_initial: options.retry_initial,
+        retry_max: options.retry_max,
+        terminal_policy: options.terminal_policy,
+        ..rovqet_durable::GroupConfig::default()
+    };
     #[cfg(feature = "fault-injection")]
     if let Some(value) = std::env::var("ROVQET_Q1_TEST_CHECKPOINT_AFTER")
         .ok()
@@ -806,6 +1215,17 @@ fn test_control() -> io::Result<Option<rovqet_durable::TestControl>> {
         Some("after-sync-before-reply") => Some(TestStage::AfterSyncBeforeReply),
         Some("checkpoint-after-append-before-sync") => {
             Some(TestStage::CheckpointAfterAppendBeforeSync)
+        }
+        Some("terminal-pending-after-append-before-sync") => {
+            Some(TestStage::TerminalPendingAfterAppendBeforeSync)
+        }
+        Some("terminal-pending-after-sync") => Some(TestStage::TerminalPendingAfterSync),
+        Some("dlq-after-publish-before-terminal") => Some(TestStage::DlqAfterPublishBeforeTerminal),
+        Some("terminal-commit-after-append-before-sync") => {
+            Some(TestStage::TerminalCommitAfterAppendBeforeSync)
+        }
+        Some("terminal-commit-after-sync-before-reply") => {
+            Some(TestStage::TerminalCommitAfterSyncBeforeReply)
         }
         _ => return Err(invalid("invalid Q1 test stage")),
     };
@@ -1045,11 +1465,15 @@ mod tests {
     }
     impl ReadServer {
         async fn start(label: &str) -> Self {
+            Self::start_with(label, |_| {}).await
+        }
+        async fn start_with(label: &str, mutate: impl FnOnce(&mut Options)) -> Self {
             let root =
                 std::env::temp_dir().join(format!("rovqet-read-{label}-{}", std::process::id()));
             std::fs::create_dir(&root).unwrap();
             let mut options = Options::parse(&values()).unwrap().unwrap();
             options.directory = root.clone();
+            mutate(&mut options);
             let wal = rovqet_wal::Config {
                 partition: options.partition,
                 incarnation: 42,
@@ -1065,12 +1489,47 @@ mod tests {
                 max_outcomes: 1000,
                 max_producers: 100,
                 dedup_window: Duration::from_secs(86400),
-                group: rovqet_durable::GroupConfig::default(),
+                group: group_config(&options),
             };
-            let partition = Partition::open(&root, wal, config).unwrap();
+            let dlq = options.dlq.clone().map(|dlq_options| {
+                std::fs::create_dir_all(&dlq_options.directory).unwrap();
+                let dlq_wal = rovqet_wal::Config {
+                    partition: dlq_options.partition,
+                    incarnation: dlq_options.incarnation,
+                    ..Default::default()
+                };
+                let dlq_config = PartitionConfig {
+                    partition: dlq_options.partition,
+                    ownership_epoch: dlq_options.owner_epoch,
+                    queue_messages: 64,
+                    queue_bytes: 4 * 1024 * 1024,
+                    max_outcomes: dlq_options.max_outcomes,
+                    max_producers: dlq_options.max_producers,
+                    dedup_window: Duration::from_secs(86400),
+                    group: rovqet_durable::GroupConfig::default(),
+                };
+                let partition = if std::fs::canonicalize(&dlq_options.directory)
+                    .unwrap()
+                    .join("MANIFEST")
+                    .is_file()
+                {
+                    Partition::open_existing(&dlq_options.directory, dlq_wal, dlq_config).unwrap()
+                } else {
+                    Partition::open(&dlq_options.directory, dlq_wal, dlq_config).unwrap()
+                };
+                Arc::new(DlqRoute {
+                    partition: Arc::new(partition),
+                    options: dlq_options,
+                })
+            });
+            let partition = match &dlq {
+                Some(dlq) => Partition::open_with_dlq(&root, wal, config, dlq.clone()).unwrap(),
+                None => Partition::open(&root, wal, config).unwrap(),
+            };
             let route = Arc::new(Route {
                 partition,
                 options,
+                dlq,
                 _lock: File::create(root.join("SERVER.lock")).unwrap(),
             });
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1311,6 +1770,125 @@ mod tests {
         }
         ReadServer::publish(&mut writer, 1).await;
         reader.close().await.unwrap();
+        writer.close().await.unwrap();
+        server.finish().await;
+    }
+    #[tokio::test]
+    async fn tcp_nack_quarantine_and_replayable_q1_dlq() {
+        use rovqet_sdk::{GroupOptions, NackOutcome, ReadOptions};
+        let server = ReadServer::start_with("dlq", |options| {
+            options.terminal_policy = rovqet_durable::TerminalPolicy::Dlq;
+            options.max_attempts = 1;
+            options.retry_initial = Duration::from_millis(50);
+            options.retry_max = Duration::from_millis(50);
+            let dlq = options.directory.join("dlq");
+            std::fs::create_dir_all(&dlq).unwrap();
+            options.dlq = Some(DlqOptions {
+                directory: dlq,
+                topic: "durable-dlq".into(),
+                partition: rovqet_core::PartitionRef {
+                    tenant_id: 1,
+                    topic_id: 4,
+                    partition_id: 0,
+                },
+                incarnation: 77,
+                owner_epoch: 7,
+                max_producers: 100,
+                max_outcomes: 100,
+            });
+        })
+        .await;
+        let mut writer = server.client().await;
+        ReadServer::publish(&mut writer, 0).await;
+        ReadServer::publish(&mut writer, 1).await;
+        let options = |generation: Option<u64>| GroupOptions {
+            partition: server.route.options.partition,
+            incarnation: 42,
+            group_id: 9,
+            generation,
+            max_messages: 8,
+            max_bytes: 64 * 1024,
+            wait: Duration::ZERO,
+        };
+        let mut consumer = server.client().await;
+        let batch = consumer
+            .fetch_q1_group("durable", options(None))
+            .await
+            .unwrap();
+        assert_eq!(batch.messages.len(), 2);
+        let outcome = consumer
+            .nack_q1_group("durable", &batch.messages[0].token, 1)
+            .await
+            .unwrap();
+        let NackOutcome::TerminalCommitted { disposition_id } = outcome else {
+            panic!("expected committed DLQ: {outcome:?}");
+        };
+        // Duplicate NACK is a read-only saved outcome.
+        assert!(matches!(
+            consumer
+                .nack_q1_group("durable", &batch.messages[0].token, 1)
+                .await,
+            Ok(NackOutcome::AlreadyClosed { disposition_id: id }) if id == disposition_id
+        ));
+        // The source cursor advances past the closed offset only after the terminal commit.
+        let after = consumer
+            .fetch_q1_group("durable", options(Some(batch.generation)))
+            .await
+            .unwrap();
+        assert!(after.messages.iter().all(|m| m.token.offset.sequence != 0));
+        // The DLQ is a normal read-only Q1 partition with a replayable message.
+        let dlq = consumer
+            .read_q1(
+                "durable-dlq",
+                rovqet_sdk::ReadOptions {
+                    partition: rovqet_core::PartitionRef {
+                        tenant_id: 1,
+                        topic_id: 4,
+                        partition_id: 0,
+                    },
+                    from: rovqet_sdk::DurableOffset {
+                        log_incarnation: 77,
+                        sequence: 0,
+                    },
+                    max_messages: 8,
+                    max_bytes: 64 * 1024,
+                    wait: Duration::ZERO,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(dlq.records.len(), 1);
+        assert_eq!(dlq.records[0].message_id, disposition_id);
+        let metadata = rovqet_durable::parse_dlq_payload(&dlq.records[0].payload).unwrap();
+        assert_eq!(metadata.original_message_id, 100);
+        assert_eq!(metadata.payload, b"event-0");
+        assert_eq!(metadata.disposition_id, disposition_id);
+        // The original source publication is not deleted by terminal disposition.
+        let source = consumer
+            .read_q1(
+                "durable",
+                ReadOptions {
+                    partition: server.route.options.partition,
+                    from: rovqet_sdk::DurableOffset {
+                        log_incarnation: 42,
+                        sequence: 0,
+                    },
+                    max_messages: 8,
+                    max_bytes: 64 * 1024,
+                    wait: Duration::ZERO,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(source.records.len(), 2);
+        assert!(matches!(
+            consumer
+                .nack_q1_group("durable", &batch.messages[1].token, 1)
+                .await
+                .unwrap(),
+            NackOutcome::TerminalCommitted { .. }
+        ));
+        consumer.close().await.unwrap();
         writer.close().await.unwrap();
         server.finish().await;
     }
