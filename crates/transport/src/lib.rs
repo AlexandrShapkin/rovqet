@@ -711,7 +711,10 @@ impl Outbound {
         frame: &Frame,
         reservation: Arc<T>,
     ) -> Result<(), ErrorCode> {
-        if !matches!(frame.frame_type, FrameType::ReadRecord | FrameType::ReadEnd) {
+        if !matches!(
+            frame.frame_type,
+            FrameType::ReadRecord | FrameType::ReadEnd | FrameType::Message | FrameType::FetchEnd
+        ) {
             return Err(ErrorCode::BadFrame);
         }
         let bytes = encode(frame, self.limits).map_err(|_| ErrorCode::ResourceExhausted)?;

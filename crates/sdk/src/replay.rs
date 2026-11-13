@@ -143,7 +143,7 @@ impl Client {
         let mut stream = self.stream.take().ok_or(ReadError::Closed)?;
         let mut records = Vec::with_capacity(options.max_messages as usize);
         let mut encoded_bytes = 0usize;
-        let mut next = options.from.sequence;
+        let mut last_offset: Option<u64> = None;
         let mut remote_terminal = false;
         let operation = async {
             write_frame(&mut stream, &request, self.limits)
@@ -211,10 +211,13 @@ impl Client {
                     .ok_or(ReadError::InvalidResponse("response byte limit"))?;
                 let offset = u64_field(&frame, f::OFFSET)
                     .map_err(|_| ReadError::InvalidResponse("invalid offset"))?;
-                if offset != next || offset % 2 != 0 {
-                    return Err(ReadError::InvalidResponse("noncontiguous MESSAGE offset"));
-                }
                 if frame.frame_type == FrameType::ReadRecord {
+                    // Application offsets are sparse and stable; metadata records between
+                    // messages consume WAL positions without consuming message offsets.
+                    let order = last_offset.map_or(options.from.sequence, |last| last + 1);
+                    if offset < order {
+                        return Err(ReadError::InvalidResponse("non-monotonic MESSAGE offset"));
+                    }
                     if records.len() >= options.max_messages as usize
                         || encoded_bytes + replay::END_BYTES > options.max_bytes as usize
                     {
@@ -222,9 +225,7 @@ impl Client {
                             "response count or terminal byte limit",
                         ));
                     }
-                    next = next
-                        .checked_add(2)
-                        .ok_or(ReadError::InvalidResponse("offset overflow"))?;
+                    last_offset = Some(offset);
                     let message_id = u128::from_be_bytes(
                         required(&frame, f::MESSAGE_ID)
                             .map_err(|_| ReadError::InvalidResponse("missing message ID"))?
@@ -246,36 +247,48 @@ impl Client {
                         .map_err(|_| ReadError::InvalidResponse("missing end status"))?[0],
                 )
                 .map_err(|_| ReadError::InvalidResponse("invalid end status"))?;
+                let continuation = offset;
+                let after_last = last_offset.is_none_or(|last| continuation > last);
                 let valid = match status {
-                    ReadStatus::Empty => records.is_empty() && next == 0,
-                    ReadStatus::End => next != 0,
+                    ReadStatus::Empty => {
+                        records.is_empty() && continuation == 0 && options.from.sequence == 0
+                    }
+                    ReadStatus::End => after_last,
                     ReadStatus::CountLimit => {
-                        !records.is_empty() && records.len() == options.max_messages as usize
+                        after_last
+                            && !records.is_empty()
+                            && records.len() == options.max_messages as usize
                     }
                     ReadStatus::ByteLimit => {
-                        !records.is_empty() && records.len() < options.max_messages as usize
+                        after_last
+                            && !records.is_empty()
+                            && records.len() < options.max_messages as usize
                     }
-                    ReadStatus::WaitExpired => records.is_empty() && !options.wait.is_zero(),
+                    ReadStatus::WaitExpired => {
+                        records.is_empty()
+                            && !options.wait.is_zero()
+                            && continuation == options.from.sequence
+                    }
                 };
                 if !valid {
                     return Err(ReadError::InvalidResponse("inconsistent end reason"));
                 }
                 let has_more = frame.field(f::HAS_MORE) == Some(&[1][..]);
-                return Ok((status, has_more));
+                return Ok((status, has_more, continuation));
             }
         };
         let result = tokio::time::timeout_at(deadline, operation)
             .await
             .unwrap_or(Err(ReadError::Incomplete));
         match result {
-            Ok((status, has_more)) => {
+            Ok((status, has_more, continuation)) => {
                 self.stream = Some(stream);
                 Ok(ReadBatch {
                     partition: options.partition,
                     records,
                     next: DurableOffset {
                         log_incarnation: expected_scope.incarnation,
-                        sequence: next,
+                        sequence: continuation,
                     },
                     has_more,
                     end_of_current_history: !has_more,

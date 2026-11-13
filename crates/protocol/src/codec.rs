@@ -321,6 +321,24 @@ fn validate_fields(frame: &Frame) -> Result<(), CodecError> {
             require(f::MAX_BYTES)?;
             require(f::MAX_MESSAGES)?;
         }
+        FrameType::FetchEnd => {
+            topic()?;
+            require(f::QOS)?;
+            if frame.field(f::QOS) != Some(&[1][..]) {
+                return Err(CodecError::InvalidFieldValue(f::QOS));
+            }
+            require(f::PARTITION_ID)?;
+            require(f::GROUP_ID)?;
+            require(f::GROUP_GENERATION)?;
+            require(f::LOG_INCAR)?;
+            require(f::OFFSET)?;
+            require(f::HAS_MORE)?;
+            match frame.field(f::HAS_MORE) {
+                Some([0] | [1]) => {}
+                Some(_) => return Err(CodecError::InvalidFieldValue(f::HAS_MORE)),
+                None => return Err(CodecError::MissingField(f::HAS_MORE)),
+            }
+        }
         FrameType::FlowCredit => {
             if !(has(f::SUBSCRIPTION_ID) || has(f::GROUP_ID)) {
                 return Err(CodecError::MissingField(f::SUBSCRIPTION_ID));

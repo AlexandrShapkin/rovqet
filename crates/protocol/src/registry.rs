@@ -28,6 +28,7 @@ pub enum FrameType {
     ReadFetch = 23,
     ReadRecord = 24,
     ReadEnd = 25,
+    FetchEnd = 26,
 }
 
 impl TryFrom<u64> for FrameType {
@@ -61,6 +62,7 @@ impl TryFrom<u64> for FrameType {
             23 => ReadFetch,
             24 => ReadRecord,
             25 => ReadEnd,
+            26 => FetchEnd,
             _ => return Err(()),
         })
     }

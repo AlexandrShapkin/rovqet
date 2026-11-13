@@ -173,6 +173,7 @@ impl Route {
             max_outcomes: options.max_outcomes,
             max_producers: options.max_producers,
             dedup_window: options.dedup_window,
+            group: rovqet_durable::GroupConfig::default(),
         };
         #[cfg(feature = "fault-injection")]
         let partition = if let Some(control) = test_control()? {
@@ -309,6 +310,201 @@ impl Route {
             Ok(None)
         })))
     }
+    fn group(
+        &self,
+        principal: u128,
+        frame: Frame,
+        outbound: Outbound,
+    ) -> Result<SessionReply, ErrorCode> {
+        use rovqet_durable::GroupFetchRequest;
+        if principal != 1 {
+            return Err(ErrorCode::PermissionDenied);
+        }
+        if frame
+            .field(f::PRINCIPAL_ID)
+            .is_some_and(|v| v != 1u64.to_be_bytes())
+        {
+            return Err(ErrorCode::PermissionDenied);
+        }
+        for (id, expected) in [
+            (f::TENANT_ID, self.options.partition.tenant_id),
+            (f::TOPIC_ID, self.options.partition.topic_id),
+        ] {
+            if frame.field(id).is_some_and(|v| v != expected.to_be_bytes()) {
+                return Err(ErrorCode::PermissionDenied);
+            }
+        }
+        if frame
+            .field(f::TOPIC_NAME)
+            .is_some_and(|v| v != self.options.topic.as_bytes())
+        {
+            return Err(ErrorCode::UnsupportedGuarantee);
+        }
+        if frame.field(f::TOPIC_NAME).is_none() && frame.field(f::TOPIC_ID).is_none() {
+            return Err(ErrorCode::BadFrame);
+        }
+        if number::<4>(&frame, f::PARTITION_ID)? != self.options.partition.partition_id as u128
+            || number::<16>(&frame, f::LOG_INCAR)? != self.options.incarnation
+        {
+            return Err(ErrorCode::ReplayNotAvailable);
+        }
+        if frame.field(f::QOS) != Some(&[1][..]) {
+            return Err(ErrorCode::UnsupportedGuarantee);
+        }
+        let group_id = number::<8>(&frame, f::GROUP_ID)? as u64;
+        if group_id == 0 {
+            return Err(ErrorCode::BadFrame);
+        }
+        let generation = frame
+            .field(f::GROUP_GENERATION)
+            .map(uint::<8>)
+            .transpose()?
+            .unwrap_or(0) as u64;
+        let request = GroupFetchRequest {
+            partition: self.options.partition,
+            group_id,
+            generation,
+            from: rovqet_core::DurableOffset {
+                log_incarnation: self.options.incarnation,
+                sequence: number::<8>(&frame, f::OFFSET)? as u64,
+            },
+            max_messages: number::<4>(&frame, f::MAX_MESSAGES)? as usize,
+            max_bytes: number::<4>(&frame, f::MAX_BYTES)? as usize,
+            wait: Duration::from_millis(
+                frame
+                    .field(f::WAIT_MS)
+                    .map(uint::<4>)
+                    .transpose()?
+                    .unwrap_or(0) as u64,
+            ),
+        };
+        let pending = self
+            .partition
+            .try_fetch_group(request)
+            .map_err(map_group_error)?;
+        let id = frame.request_id;
+        let partition = self.options.partition;
+        let incarnation = self.options.incarnation;
+        let owner_epoch = self.options.owner_epoch;
+        Ok(SessionReply::ReadOnly(Box::pin(async move {
+            let batch = Arc::new(pending.wait_async().await.map_err(map_group_error)?);
+            let limits = outbound.limits();
+            let mut frames = Vec::with_capacity(batch.deliveries.len());
+            for delivery in &batch.deliveries {
+                let mut message = Frame::new(FrameType::Message, id);
+                message.fields = vec![
+                    Field::required(f::TENANT_ID, partition.tenant_id.to_be_bytes()),
+                    Field::required(f::TOPIC_ID, partition.topic_id.to_be_bytes()),
+                    Field::required(f::QOS, [1]),
+                    Field::required(f::PARTITION_ID, partition.partition_id.to_be_bytes()),
+                    Field::required(f::LOG_INCAR, incarnation.to_be_bytes()),
+                    Field::required(f::OFFSET, delivery.offset.sequence.to_be_bytes()),
+                    Field::required(f::MESSAGE_ID, delivery.message_id.to_be_bytes()),
+                    Field::required(f::GROUP_ID, batch.group_id.to_be_bytes()),
+                    Field::required(f::GROUP_GENERATION, delivery.generation.to_be_bytes()),
+                    Field::required(f::LEASE_ID, delivery.lease_id.to_be_bytes()),
+                    Field::required(f::OWNERSHIP_EPOCH, owner_epoch.to_be_bytes()),
+                    Field::required(f::DELIVERY_ATTEMPT, delivery.attempt.to_be_bytes()),
+                    Field::required(f::ACK_DEADLINE_MS, delivery.ack_deadline_ms.to_be_bytes()),
+                ];
+                message.payload = delivery.payload.clone();
+                // Validate the whole batch before the first write; no skipped delivery.
+                if rovqet_protocol::encode(&message, limits).is_err() {
+                    return Err(ErrorCode::ResourceExhausted);
+                }
+                frames.push(message);
+            }
+            let mut end = Frame::new(FrameType::FetchEnd, id);
+            end.fields = vec![
+                Field::required(f::TENANT_ID, partition.tenant_id.to_be_bytes()),
+                Field::required(f::TOPIC_ID, partition.topic_id.to_be_bytes()),
+                Field::required(f::QOS, [1]),
+                Field::required(f::PARTITION_ID, partition.partition_id.to_be_bytes()),
+                Field::required(f::LOG_INCAR, incarnation.to_be_bytes()),
+                Field::required(f::GROUP_ID, batch.group_id.to_be_bytes()),
+                Field::required(f::GROUP_GENERATION, batch.generation.to_be_bytes()),
+                Field::required(f::OFFSET, batch.next.sequence.to_be_bytes()),
+                Field::required(f::HAS_MORE, [u8::from(batch.has_more)]),
+            ];
+            if rovqet_protocol::encode(&end, limits).is_err() {
+                return Err(ErrorCode::ResourceExhausted);
+            }
+            for message in frames {
+                outbound.send_read(&message, batch.clone()).await?;
+            }
+            outbound.send_read(&end, batch.clone()).await?;
+            Ok(None)
+        })))
+    }
+    fn acknowledge(&self, principal: u128, frame: Frame) -> Result<SessionReply, ErrorCode> {
+        use rovqet_durable::AckRequest;
+        if principal != 1 {
+            return Err(ErrorCode::PermissionDenied);
+        }
+        if frame
+            .field(f::PRINCIPAL_ID)
+            .is_some_and(|v| v != 1u64.to_be_bytes())
+        {
+            return Err(ErrorCode::PermissionDenied);
+        }
+        for (id, expected) in [
+            (f::TENANT_ID, self.options.partition.tenant_id),
+            (f::TOPIC_ID, self.options.partition.topic_id),
+        ] {
+            if frame.field(id).is_some_and(|v| v != expected.to_be_bytes()) {
+                return Err(ErrorCode::PermissionDenied);
+            }
+        }
+        if frame
+            .field(f::TOPIC_NAME)
+            .is_some_and(|v| v != self.options.topic.as_bytes())
+        {
+            return Err(ErrorCode::UnsupportedGuarantee);
+        }
+        if frame.field(f::TOPIC_NAME).is_none() && frame.field(f::TOPIC_ID).is_none() {
+            return Err(ErrorCode::BadFrame);
+        }
+        if number::<4>(&frame, f::PARTITION_ID)? != self.options.partition.partition_id as u128
+            || number::<16>(&frame, f::LOG_INCAR)? != self.options.incarnation
+        {
+            return Err(ErrorCode::ReplayNotAvailable);
+        }
+        let request = AckRequest {
+            partition: self.options.partition,
+            group_id: number::<8>(&frame, f::GROUP_ID)? as u64,
+            generation: number::<8>(&frame, f::GROUP_GENERATION)? as u64,
+            lease_id: number::<16>(&frame, f::LEASE_ID)?,
+            ownership_epoch: number::<8>(&frame, f::OWNERSHIP_EPOCH)? as u64,
+            offset: rovqet_core::DurableOffset {
+                log_incarnation: self.options.incarnation,
+                sequence: number::<8>(&frame, f::OFFSET)? as u64,
+            },
+            attempt: u32::try_from(number::<4>(&frame, f::DELIVERY_ATTEMPT)?)
+                .map_err(|_| ErrorCode::BadFrame)?,
+            principal,
+        };
+        let group_id = request.group_id;
+        let pending = self.partition.try_ack(request).map_err(map_group_error)?;
+        let id = frame.request_id;
+        let partition = self.options.partition;
+        let incarnation = self.options.incarnation;
+        Ok(SessionReply::Deferred(Box::pin(async move {
+            let result = pending.wait_async().await.map_err(map_group_error)?;
+            let mut frame = Frame::new(FrameType::ConsumerAckResult, id);
+            frame.fields = vec![
+                Field::required(f::ACK_OUTCOME, [1]),
+                Field::required(f::TENANT_ID, partition.tenant_id.to_be_bytes()),
+                Field::required(f::TOPIC_ID, partition.topic_id.to_be_bytes()),
+                Field::required(f::QOS, [1]),
+                Field::required(f::PARTITION_ID, partition.partition_id.to_be_bytes()),
+                Field::required(f::LOG_INCAR, incarnation.to_be_bytes()),
+                Field::required(f::GROUP_ID, group_id.to_be_bytes()),
+                Field::required(f::GROUP_GENERATION, result.generation.to_be_bytes()),
+                Field::required(f::OFFSET, result.offset.sequence.to_be_bytes()),
+            ];
+            Ok(Some(frame))
+        })))
+    }
     fn publish(&self, principal: u128, frame: Frame) -> Result<SessionReply, ErrorCode> {
         if frame.field(f::QOS) != Some(&[1][..]) {
             return Err(ErrorCode::UnsupportedGuarantee);
@@ -431,6 +627,19 @@ fn map_read_error(error: rovqet_durable::ReplayError) -> ErrorCode {
         Unavailable | Storage(_) | Corruption(_) => ErrorCode::StorageUnavailable,
     }
 }
+fn map_group_error(error: rovqet_durable::GroupError) -> ErrorCode {
+    use rovqet_durable::GroupError::*;
+    match error {
+        StaleGeneration => ErrorCode::StaleGeneration,
+        NotLeased => ErrorCode::LeaseExpired,
+        AckNotCommitted => ErrorCode::AckNotCommitted,
+        Capacity => ErrorCode::ResourceExhausted,
+        InvalidRequest | IncarnationMismatch | WrongPartition | GroupNotFound => {
+            ErrorCode::ReplayNotAvailable
+        }
+        Unavailable | Storage(_) | Corruption(_) => ErrorCode::StorageUnavailable,
+    }
+}
 fn map_error(error: DurableError) -> ErrorCode {
     match error {
         DurableError::WrongPartition | DurableError::WrongClass => ErrorCode::UnsupportedGuarantee,
@@ -496,14 +705,24 @@ impl SessionHandler for Dispatch {
                 None => SessionReply::Immediate(Err(ErrorCode::UnsupportedGuarantee)),
             };
         }
-        // Major-1 durable MESSAGE requires a real group/generation/lease. Until B-05
-        // there is no legal standalone FETCH response or terminal batch frame.
+        if matches!(frame.frame_type, FrameType::Fetch | FrameType::ConsumerAck) {
+            if self.draining.load(Ordering::Acquire) {
+                return SessionReply::Immediate(Err(ErrorCode::ServerDraining));
+            }
+            let Some(route) = &self.route else {
+                return SessionReply::Immediate(Err(ErrorCode::UnsupportedGuarantee));
+            };
+            let result = if frame.frame_type == FrameType::Fetch {
+                route.group(principal, frame, outbound)
+            } else {
+                route.acknowledge(principal, frame)
+            };
+            return result.unwrap_or_else(|e| SessionReply::Immediate(Err(e)));
+        }
+        // Terminal disposition, NACK and lease extension belong to later work packages.
         if matches!(
             frame.frame_type,
-            FrameType::Fetch
-                | FrameType::ConsumerAck
-                | FrameType::ConsumerNack
-                | FrameType::ExtendLease
+            FrameType::ConsumerNack | FrameType::ExtendLease
         ) {
             return SessionReply::Immediate(Err(ErrorCode::UnsupportedCapability));
         }
@@ -811,6 +1030,7 @@ mod tests {
                 max_outcomes: 1000,
                 max_producers: 100,
                 dedup_window: Duration::from_secs(86400),
+                group: rovqet_durable::GroupConfig::default(),
             };
             let partition = Partition::open(&root, wal, config).unwrap();
             let route = Arc::new(Route {
@@ -1030,12 +1250,13 @@ mod tests {
             reader.read_q1("durable", wrong).await,
             Err(ReadError::ReplayNotAvailable)
         ));
-        assert!(matches!(
-            reader
-                .read_q1("durable", server.options(1, 8, 2048, 0))
-                .await,
-            Err(ReadError::ReplayNotAvailable)
-        ));
+        // Position 1 is the publication outcome; sparse replay skips durable metadata.
+        let metadata = reader
+            .read_q1("durable", server.options(1, 8, 2048, 0))
+            .await
+            .unwrap();
+        assert!(metadata.records.is_empty());
+        assert_eq!(metadata.status, ReadStatus::End);
         // More cancelled sessions than actor slots: EOF must release long-poll reservations promptly.
         for _ in 0..70 {
             let mut cancelled = server.client().await;
@@ -1055,6 +1276,103 @@ mod tests {
         }
         ReadServer::publish(&mut writer, 1).await;
         reader.close().await.unwrap();
+        writer.close().await.unwrap();
+        server.finish().await;
+    }
+    #[tokio::test]
+    async fn tcp_group_delivery_ack_redelivery_and_generation_fencing() {
+        use rovqet_sdk::{AckOutcome, GroupError, GroupOptions};
+        let server = ReadServer::start("group").await;
+        let mut writer = server.client().await;
+        ReadServer::publish(&mut writer, 0).await;
+        ReadServer::publish(&mut writer, 1).await;
+        let options = |generation: Option<u64>| GroupOptions {
+            partition: server.route.options.partition,
+            incarnation: 42,
+            group_id: 9,
+            generation,
+            max_messages: 8,
+            max_bytes: 64 * 1024,
+            wait: Duration::ZERO,
+        };
+        let mut consumer = server.client().await;
+        let batch = consumer
+            .fetch_q1_group("durable", options(None))
+            .await
+            .unwrap();
+        assert_eq!(batch.generation, 1);
+        assert_eq!(batch.messages.len(), 2);
+        assert_eq!(batch.messages[0].token.offset.sequence, 0);
+        assert_eq!(batch.messages[0].payload, b"event-0");
+        assert_ne!(
+            batch.messages[0].token.lease_id,
+            batch.messages[1].token.lease_id
+        );
+        let committed = consumer
+            .ack_q1_group("durable", &batch.messages[0].token)
+            .await
+            .unwrap();
+        assert!(matches!(committed, AckOutcome::Committed { .. }));
+        // A duplicate committed ACK is a read-only saved-outcome lookup.
+        assert_eq!(
+            consumer
+                .ack_q1_group("durable", &batch.messages[0].token)
+                .await
+                .unwrap(),
+            committed
+        );
+        // The second record is still leased, so it is neither duplicated nor lost.
+        let in_flight = consumer
+            .fetch_q1_group("durable", options(Some(batch.generation)))
+            .await
+            .unwrap();
+        assert!(in_flight.messages.is_empty());
+        assert!(in_flight.has_more);
+        consumer
+            .ack_q1_group("durable", &batch.messages[1].token)
+            .await
+            .unwrap();
+        let end = consumer
+            .fetch_q1_group("durable", options(Some(batch.generation)))
+            .await
+            .unwrap();
+        assert!(end.messages.is_empty());
+        assert!(!end.has_more);
+        // Explicit replacement fences the previous generation.
+        let replaced = consumer
+            .fetch_q1_group("durable", options(None))
+            .await
+            .unwrap();
+        assert_eq!(replaced.generation, batch.generation + 1);
+        assert!(matches!(
+            consumer
+                .fetch_q1_group("durable", options(Some(batch.generation)))
+                .await,
+            Err(GroupError::StaleGeneration)
+        ));
+        // Any failed operation closes the framing-uncertain stream; probe with fresh sessions.
+        let mut wrong = options(None);
+        wrong.partition.partition_id = 1;
+        let mut probe = server.client().await;
+        assert!(matches!(
+            probe.fetch_q1_group("durable", wrong).await,
+            Err(GroupError::ReplayNotAvailable)
+        ));
+        let mut wrong = options(None);
+        wrong.partition.tenant_id = 2;
+        let mut probe = server.client().await;
+        assert!(matches!(
+            probe.fetch_q1_group("durable", wrong).await,
+            Err(GroupError::PermissionDenied)
+        ));
+        let mut wrong = options(None);
+        wrong.incarnation = 41;
+        let mut probe = server.client().await;
+        assert!(matches!(
+            probe.fetch_q1_group("durable", wrong).await,
+            Err(GroupError::ReplayNotAvailable)
+        ));
+        let _ = consumer.close().await;
         writer.close().await.unwrap();
         server.finish().await;
     }

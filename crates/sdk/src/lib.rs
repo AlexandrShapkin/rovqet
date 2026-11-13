@@ -4,6 +4,8 @@
 #![forbid(unsafe_code)]
 
 pub use rovqet_core::{DurableOffset, PartitionRef, Priority, PublishOutcome, QoS};
+mod group;
+pub use group::{AckOutcome, DeliveryToken, GroupBatch, GroupError, GroupMessage, GroupOptions};
 mod replay;
 pub use replay::{ReadBatch, ReadError, ReadOptions, ReadRecord, ReadStatus};
 use rovqet_protocol::{ErrorCode, Field, Frame, FrameType, Limits, registry::field as f};
@@ -1513,11 +1515,12 @@ mod tests {
                     end.request_id += 1;
                 }
                 if case == 6 {
+                    // A terminal continuation must not point at or before the last record.
                     end.fields
                         .iter_mut()
                         .find(|v| v.id == f::OFFSET)
                         .unwrap()
-                        .value = 4u64.to_be_bytes().to_vec();
+                        .value = 0u64.to_be_bytes().to_vec();
                 }
                 if case == 7 {
                     end = replay::end(request.request_id, read_scope(), 2, ReadStatus::CountLimit);
