@@ -153,10 +153,13 @@ fn a_foreign_owner_is_fenced_at_the_commit_boundary() {
 fn an_expired_lease_fails_closed() {
     let t = Temp::new();
     let p = open(&t, 5);
-    p.set_authority(Authority::new(5, 3, Duration::from_millis(1)))
+    p.set_authority(Authority::new(5, 3, Duration::from_secs(60)))
         .unwrap();
     assert!(publish(&p, 0).is_ok());
-    std::thread::sleep(Duration::from_millis(10));
+    // Reinstall the same epoch with a short lease: the lease is counted from installation.
+    p.set_authority(Authority::new(5, 3, Duration::from_millis(1)))
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(20));
     assert!(matches!(publish(&p, 1), Err(Error::FenceExpired)));
 }
 

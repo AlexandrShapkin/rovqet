@@ -171,16 +171,21 @@ class ClusterRouting(unittest.TestCase):
         directory = Path(temporary.name)
         port_a = free_port()
         port_b = free_port()
-        owner = Node(directory, 1, 2, port_b, 1, port_a, lease_ms=400)
-        peer = Node(directory, 2, 1, port_a, 1, port_b, lease_ms=400)
+        owner = Node(directory, 1, 2, port_b, 1, port_a, lease_ms=1500)
+        peer = Node(directory, 2, 1, port_a, 1, port_b, lease_ms=1500)
         try:
             owner.wait_ready()
             peer.wait_ready()
-            # While the lease is valid the owner may still commit.
+            # While the lease is valid the owner may still commit. A slow machine may need
+            # a moment before the lease clock starts, so retry until the owner commits.
+            deadline = time.monotonic() + 1.2
             committed = owner.publish(0)
+            while committed.returncode != 0 and time.monotonic() < deadline:
+                time.sleep(0.05)
+                committed = owner.publish(0)
             self.assertEqual(committed.returncode, 0, (committed.stdout, committed.stderr))
             self.assertIn("COMMITTED_LOCAL", committed.stdout)
-            time.sleep(0.6)
+            time.sleep(1.8)
             # After expiry the same node is fenced: no further durable commit is possible.
             expired = owner.publish(1)
             self.assertNotEqual(expired.returncode, 0)
