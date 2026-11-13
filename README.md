@@ -242,6 +242,29 @@ idempotent. Retry exhaustion without a terminal policy leaves the source incompl
 python3 scripts/test_q1_terminal.py   # NACK/retry/quarantine/DLQ crash ordering
 ```
 
+Cluster mode is opt-in and adds a typed inter-node layer: explicit cluster/node identities,
+a bounded peer transport, immutable versioned metadata snapshots and owner-aware routing
+with at most one forwarding hop.
+
+```sh
+rovqet --listen 127.0.0.1:7443 --q1-data-dir /tmp/wal1 --q1-topic durable \
+  --q1-tenant-id 1 --q1-topic-id 3 --q1-partition-id 0 --q1-incarnation 42 \
+  --q1-owner-epoch 7 --q1-initialize-new-log true \
+  --cluster-id 4242 --node-id 1 --cluster-listen 127.0.0.1:7444 \
+  --cluster-peer 2=127.0.0.1:7445 --cluster-metadata /tmp/metadata.json
+```
+
+The metadata file is an explicitly configured development authority fixture (not a
+Raft-committed snapshot); it is validated and installed atomically, revisions never
+regress and a restart starts without authority. A publication for a partition owned by
+another node is forwarded exactly once and the owner performs the durable commit, so
+`COMMITTED_LOCAL` always comes from the owner's own barrier. Peer traffic is loopback-only
+in this prototype.
+
+```sh
+python3 scripts/test_cluster_routing.py   # two local brokers, real forwarded publication
+```
+
 The durability campaign journals externally acknowledged publications and consumer ACKs in a
 parent-owned, fsynced file, kills the broker at deterministic barriers, restarts on the same
 storage and reconciles exact identities, sparse cursor state, generation fencing and WAL

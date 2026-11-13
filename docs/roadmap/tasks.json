@@ -821,13 +821,50 @@
         "A-01",
         "A-02"
       ],
-      "status": "TODO",
+      "status": "DONE",
       "architecture": "09",
-      "proof": "Stale map, one proxy hop and bounded request tests",
+      "proof": "Real two-process inter-node routing with validated identities, immutable snapshots, one-hop forwarding and loop avoidance",
       "paths": [
-        "crates/control/"
+        "crates/control/",
+        "crates/server/src/cluster.rs",
+        "scripts/test_cluster_routing.py",
+        "docs/architecture/inter-node-rpc.md",
+        "docs/architecture/09-cluster-control.md"
       ],
-      "evidence": null
+      "evidence": {
+        "commit": "PENDING",
+        "verification": "PASS: two locally running brokers with distinct node IDs, cluster identity, peer ports, metadata fixtures and data directories exchange typed inter-node RPCs over real loopback TCP; a publication sent to the non-owner is forwarded exactly once and committed by the owner, returning the owner's own durable offset.",
+        "test_command": [
+          "cargo fmt --all -- --check",
+          "cargo check --workspace --locked",
+          "cargo test -p rovqet-control --locked",
+          "cargo test -p rovqet-protocol --locked",
+          "cargo test -p rovqet-durable --locked",
+          "cargo test --workspace --locked",
+          "python3 scripts/check_docs.py",
+          "cargo build -p rovqet-server -p rovqet-sdk -p rovqet-control --examples --bins --locked",
+          "python3 scripts/q0_smoke.py",
+          "python3 scripts/q1_smoke.py --check-hooks-disabled",
+          "python3 scripts/test_q1_replay.py",
+          "python3 scripts/test_q1_consumer.py",
+          "python3 scripts/test_q1_terminal.py",
+          "python3 scripts/test_q1_durability.py",
+          "python3 scripts/test_cluster_routing.py",
+          "git diff --check"
+        ],
+        "observed_result": "Workspace tests pass with the new rovqet-control crate (24 control tests: 11 unit plus 13 real-socket integration tests). The Q0/Q1 process smokes, standalone replay, consumer, terminal/DLQ and B-07 durability suites remain green. Two multi-process cluster routing fixtures pass.",
+        "wire_contract": "Separate inter-node namespace with an explicit portable binary envelope (magic RQCL, api_version, rpc_kind, flags, cluster_id u128, source_node u64, target_node u64, request_id u128, metadata_revision u64, ownership_epoch u64, timeout_budget_ms u32, body_len u32, bounded body, CRC32C). Normative RPC kind numbering is used verbatim (1 ROUTE_PUBLISH, 2 ROUTE_FETCH, 3 ROUTE_CONSUMER_ACK, 4 ROUTE_Q0_FANOUT, 5 METADATA_SNAPSHOT_GET, 6 OWNERSHIP_INSPECT, 7-9 Q1_TRANSFER_*, 10 HEALTH). Unknown kinds and unsupported versions are rejected; kinds 4 and 7-9 answer UNSUPPORTED. Client-facing frames and golden vectors are unchanged.",
+        "identities_and_trust": "ClusterId, NodeId, PeerEndpoint, MetadataRevision, PartitionRef, partition owner, OwnershipEpoch, LeaseValidity, RpcRequestId, RpcKind and TimeoutBudget are distinct typed values; zero is reserved. The receiver validates cluster identity, target node and source against the configured static peer set, so a peer cannot assert ownership by supplying an epoch. The peer listener is loopback-only and refuses public binding.",
+        "metadata_snapshots": "MetadataSnapshot carries cluster identity, revision, issued/revalidate bounds, node endpoints, topic policies, placements (owner, ownership epoch, lease validity, desired replicas, shard id) and acl/policy/capability revisions. Installation is atomic and validated (wrong cluster, revision regression, duplicate node or partition, unknown owner, zero epoch, missing lease, incompatible policy are rejected). A stale snapshot can never replace a newer one. A fresh process starts with no authority, so a restart cannot extend ownership; expired authority fails closed.",
+        "routing": "One snapshot read per decision: local owner serves locally, a remote owner is forwarded exactly once, a stale epoch, expired authority, missing metadata or unknown partition return typed errors. A routed request is never routed again, which bounds redirect loops, and inconsistent maps between two nodes therefore cannot produce a ping-pong. The destination revalidates the routing authority before any mutation.",
+        "durable_semantics": "Forwarded publication keeps the original producer token, epoch, sequence, message id, digest and QoS; the proxy never substitutes a token, mints an epoch or downgrades the class. Only the owner's local barrier produces COMMITTED_LOCAL, and the owner's durable outcome is returned unchanged. A timeout after the request was sent stays uncertain (client sees OUTCOME_UNKNOWN), never a definite rollback. The producer token stays authoritative at the owner: a retry returns the original offset without a second record.",
+        "bounds": "1 MiB maximum body, 64 outstanding peer requests, 64 concurrent peer connections, 2 s connect timeout, 5 s request timeout, 60 s maximum advertised timeout budget; all validated before allocation. Bounded connections, bounded pending requests and bounded concurrency are covered by tests.",
+        "limitations": "Static development authority fixture, not a Raft-committed snapshot: no metadata consensus, membership management, placement rebalancing, coordinated handover, WAL migration, Q2 replication or majority acknowledgment. Consumer ROUTE_FETCH/ROUTE_CONSUMER_ACK are implemented at the owner but client-facing consumer traffic is not forwarded across nodes in C-01. Plaintext loopback peers with static identities are not production authentication. No cluster-scale benchmark or soak was run.",
+        "next_unblocked": [
+          "C-02"
+        ],
+        "next_note": "C-02 (metadata group, Raft-committed topology, epoch and lease renewal, staged Q1 transfer) is the next package; C-03 (Q2 storage adapter) depends on it."
+      }
     },
     {
       "id": "C-02",

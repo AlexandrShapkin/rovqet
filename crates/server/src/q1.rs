@@ -300,7 +300,7 @@ struct ReadTarget {
 }
 pub struct Route {
     partition: Partition,
-    options: Options,
+    pub(crate) options: Options,
     dlq: Option<Arc<DlqRoute>>,
     // Kept until the actor is drained and closed. Never unlink a lock file on crash/restart.
     _lock: File,
@@ -926,6 +926,84 @@ impl Route {
             Ok(Some(frame))
         })))
     }
+    /// Durable publication executed on behalf of a routed request. Only the owner runs it,
+    /// and only after the ownership epoch was revalidated.
+    pub async fn publish_durable(
+        &self,
+        request: &rovqet_control::RoutePublishRequest,
+    ) -> Result<rovqet_core::DurableOffset, ErrorCode> {
+        if request.qos != 1 {
+            return Err(ErrorCode::UnsupportedGuarantee);
+        }
+        if request.ownership_epoch != self.options.owner_epoch {
+            return Err(ErrorCode::StaleEpoch);
+        }
+        let publish = PublishRequest {
+            partition: self.options.partition,
+            qos: QoS::Q1,
+            ownership_epoch: self.options.owner_epoch,
+            principal: 1,
+            producer_id: request.producer_id,
+            producer_epoch: request.producer_epoch,
+            sequence: request.producer_sequence,
+            message_id: request.message_id,
+            payload: request.payload.clone(),
+        };
+        let deadline =
+            Instant::now() + Duration::from_millis(u64::from(request.ttl_ms.min(30_000)));
+        let pending = self
+            .partition
+            .try_publish_before(publish, deadline)
+            .map_err(map_error)?;
+        match pending.wait_async().await.map_err(map_error)? {
+            PublishOutcome::CommittedLocal(offset) => Ok(offset),
+            _ => Err(ErrorCode::OutcomeUnknown),
+        }
+    }
+    /// Group fetch executed on behalf of a routed request.
+    pub async fn group_fetch_routed(
+        &self,
+        request: &rovqet_control::RouteFetchRequest,
+    ) -> Result<rovqet_durable::GroupFetchBatch, ErrorCode> {
+        let fetch = rovqet_durable::GroupFetchRequest {
+            partition: self.options.partition,
+            group_id: request.group_id,
+            generation: request.generation,
+            from: rovqet_core::DurableOffset {
+                log_incarnation: self.options.incarnation,
+                sequence: 0,
+            },
+            max_messages: request.max_messages as usize,
+            max_bytes: request.max_bytes as usize,
+            wait: Duration::from_millis(u64::from(request.wait_ms.min(30_000))),
+        };
+        let pending = self
+            .partition
+            .try_fetch_group(fetch)
+            .map_err(map_group_error)?;
+        pending.wait_async().await.map_err(map_group_error)
+    }
+    /// Consumer acknowledgement executed on behalf of a routed request.
+    pub async fn group_ack_routed(
+        &self,
+        request: &rovqet_control::RouteAckRequest,
+    ) -> Result<rovqet_durable::AckResult, ErrorCode> {
+        let ack = rovqet_durable::AckRequest {
+            partition: self.options.partition,
+            group_id: request.group_id,
+            generation: request.generation,
+            lease_id: request.lease_id,
+            ownership_epoch: request.ownership_epoch,
+            offset: rovqet_core::DurableOffset {
+                log_incarnation: self.options.incarnation,
+                sequence: request.offset,
+            },
+            attempt: request.attempt,
+            principal: 1,
+        };
+        let pending = self.partition.try_ack(ack).map_err(map_group_error)?;
+        pending.wait_async().await.map_err(map_group_error)
+    }
     fn publish(&self, principal: u128, frame: Frame) -> Result<SessionReply, ErrorCode> {
         if frame.field(f::QOS) != Some(&[1][..]) {
             return Err(ErrorCode::UnsupportedGuarantee);
@@ -1028,6 +1106,32 @@ impl Route {
         })))
     }
 }
+/// Extracts the client publication identity without changing it: the proxy never
+/// substitutes a producer token or mints an epoch.
+fn parse_publish_request(
+    frame: &Frame,
+    partition: rovqet_core::PartitionRef,
+) -> Result<rovqet_control::RoutePublishRequest, ErrorCode> {
+    if frame.field(f::QOS) != Some(&[1][..]) {
+        return Err(ErrorCode::UnsupportedGuarantee);
+    }
+    if number::<4>(frame, f::PARTITION_ID)? != partition.partition_id as u128 {
+        return Err(ErrorCode::ReplayNotAvailable);
+    }
+    Ok(rovqet_control::RoutePublishRequest {
+        tenant_id: partition.tenant_id,
+        topic_id: partition.topic_id,
+        partition_id: partition.partition_id,
+        qos: 1,
+        ownership_epoch: number::<8>(frame, f::OWNERSHIP_EPOCH)? as u64,
+        producer_id: number::<16>(frame, f::PRODUCER_ID)?,
+        producer_epoch: number::<8>(frame, f::PRODUCER_EPOCH)? as u64,
+        producer_sequence: number::<8>(frame, f::PRODUCER_SEQUENCE)? as u64,
+        message_id: number::<16>(frame, f::MESSAGE_ID)?,
+        ttl_ms: number::<4>(frame, f::TTL_MS)? as u32,
+        payload: frame.payload.clone(),
+    })
+}
 fn uint<const N: usize>(bytes: &[u8]) -> Result<u128, ErrorCode> {
     if bytes.len() != N || N > 16 {
         return Err(ErrorCode::BadFrame);
@@ -1086,6 +1190,8 @@ fn map_error(error: DurableError) -> ErrorCode {
 pub struct Dispatch {
     pub broker: Arc<Broker>,
     pub route: Option<Arc<Route>>,
+    /// Cluster mode is opt-in and never changes single-node behaviour.
+    pub cluster: Option<Arc<crate::cluster::Cluster>>,
     draining: AtomicBool,
 }
 impl Dispatch {
@@ -1093,7 +1199,88 @@ impl Dispatch {
         Self {
             broker,
             route,
+            cluster: None,
             draining: AtomicBool::new(false),
+        }
+    }
+    /// Cluster mode adds owner-aware routing on top of the unchanged single-node behaviour.
+    pub fn with_cluster(
+        broker: Arc<Broker>,
+        route: Option<Arc<Route>>,
+        cluster: Arc<crate::cluster::Cluster>,
+    ) -> Self {
+        Self {
+            broker,
+            route,
+            cluster: Some(cluster),
+            draining: AtomicBool::new(false),
+        }
+    }
+    /// Forwards one client publication to the configured owner, at most one hop.
+    fn forward_publish(
+        &self,
+        cluster: &Arc<crate::cluster::Cluster>,
+        route: &Arc<Route>,
+        frame: &Frame,
+    ) -> Option<SessionReply> {
+        use rovqet_control::rpc::{RoutePublishRequest, RpcKind};
+        let partition = route.options.partition;
+        match cluster.route(&partition, false) {
+            rovqet_control::RouteDecision::Local { .. } => None,
+            rovqet_control::RouteDecision::Forward {
+                target,
+                epoch,
+                revision,
+            } => {
+                let request = match parse_publish_request(frame, partition) {
+                    Ok(request) => request,
+                    Err(code) => return Some(SessionReply::Immediate(Err(code))),
+                };
+                let transport = cluster.transport.clone();
+                let body = request.encode();
+                let request_id = frame.request_id;
+                Some(SessionReply::Deferred(Box::pin(async move {
+                    let response = transport
+                        .call(
+                            target,
+                            RpcKind::RoutePublish,
+                            body,
+                            crate::cluster::forward_budget(),
+                            revision.get(),
+                            epoch.get(),
+                        )
+                        .await
+                        .map_err(crate::cluster::map_transport_error)?;
+                    let decoded = rovqet_control::rpc::RoutePublishResponse::decode(&response.body)
+                        .map_err(|_| ErrorCode::BadFrame)?;
+                    if !decoded.committed {
+                        return Err(crate::cluster::map_rpc_error(
+                            decoded
+                                .error
+                                .unwrap_or(rovqet_control::RpcErrorCode::Uncertain),
+                        ));
+                    }
+                    Ok(Some(crate::cluster::publish_ack(
+                        request_id,
+                        partition,
+                        rovqet_core::DurableOffset {
+                            log_incarnation: decoded.incarnation,
+                            sequence: decoded.offset,
+                        },
+                    )))
+                })))
+            }
+            rovqet_control::RouteDecision::StaleEpoch { .. }
+            | rovqet_control::RouteDecision::ExpiredAuthority => {
+                Some(SessionReply::Immediate(Err(ErrorCode::StaleEpoch)))
+            }
+            rovqet_control::RouteDecision::NoMetadata
+            | rovqet_control::RouteDecision::ForwardHopExceeded => Some(SessionReply::Immediate(
+                Err(ErrorCode::UnsupportedGuarantee),
+            )),
+            rovqet_control::RouteDecision::UnknownPartition => {
+                Some(SessionReply::Immediate(Err(ErrorCode::ReplayNotAvailable)))
+            }
         }
     }
     pub fn drain(&self) {
@@ -1158,6 +1345,11 @@ impl SessionHandler for Dispatch {
                 .and_then(|b| std::str::from_utf8(b).ok());
             if let Some(route) = &self.route {
                 if topic == Some(&route.options.topic) {
+                    if let Some(cluster) = &self.cluster {
+                        if let Some(reply) = self.forward_publish(cluster, route, &frame) {
+                            return reply;
+                        }
+                    }
                     return route
                         .publish(principal, frame)
                         .unwrap_or_else(|e| SessionReply::Immediate(Err(e)));

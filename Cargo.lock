@@ -748,6 +748,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rovqet-control"
+version = "0.1.0"
+dependencies = [
+ "rovqet-core",
+ "serde",
+ "serde_json",
+ "socket2",
+ "tokio",
+]
+
+[[package]]
 name = "rovqet-core"
 version = "0.1.0"
 dependencies = [
@@ -810,6 +821,7 @@ name = "rovqet-server"
 version = "0.1.0"
 dependencies = [
  "fs2",
+ "rovqet-control",
  "rovqet-core",
  "rovqet-durable",
  "rovqet-protocol",
@@ -818,6 +830,7 @@ dependencies = [
  "rovqet-sdk",
  "rovqet-transport",
  "rovqet-wal",
+ "serde_json",
  "sha2",
  "tokio",
 ]

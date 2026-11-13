@@ -12,6 +12,7 @@ members = [
     "crates/wal",
     "crates/durable",
     "crates/testkit",
+    "crates/control",
 ]
 
 [workspace.package]

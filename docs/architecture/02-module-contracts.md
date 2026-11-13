@@ -149,3 +149,11 @@ rather than creating it. Detailed offset, memory, cancellation and wire boundari
 adapter uses `try_replay_encoded` at the same seam to enforce exact encoded batch bytes
 (including terminal frame), retain encoding reservations, and report typed stop reasons;
 the original memory-charge read API is unchanged.
+
+## C-01 control module
+
+`crates/control` (crate `rovqet-control`) owns the cluster identity types, the inter-node
+envelope codec, the metadata snapshot model and store, the bounded peer transport and the
+owner-aware routing decision. It depends on `rovqet-core` only: it never touches durable
+storage, so business logic is not duplicated in the network layer. The server delegates
+routed publications, fetches and acknowledgements to the existing Q1 route actor.

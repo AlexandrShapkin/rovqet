@@ -86,6 +86,12 @@ The campaign found and fixed a sparse-offset codec defect in the B-05 replay pat
 
 **C-01 — Inter-node RPC and snapshots** (depends A-01,A-02). Typed inter-node framing, bounded proxy hop, metadata snapshot version, node ID, cluster ID and owner epoch checks. Proof: stale map redirect, no uncontrolled forwarding loop.
 
+Implemented as `crates/control` (identities, envelope codec, bounded peer transport,
+immutable metadata snapshots, owner routing) plus an opt-in cluster mode in the server.
+`scripts/test_cluster_routing.py` runs two local brokers with distinct node IDs, cluster
+identity, peer ports, metadata fixtures and data directories and forwards a real Q1
+publication to the owner. Consensus, membership, handover and Q2 remain C-02/C-03 work.
+
 **C-02 — Metadata group and ownership** (depends C-01,B-04). Integrate external Raft for metadata; static 3 voters, topic/policy and placement snapshot, epoch+lease, staged Q1 transfer. Proof: stale owner fenced, no split brain under asymmetric partition.
 
 **C-03 — Q2 Raft storage adapter** (depends B-01,C-02). Integrate pinned OpenRaft, durable log/term/vote and deterministic snapshot/apply. Keep library confined to consensus crate. Proof: 3-node library smoke, snapshot install, committed prefix invariant.

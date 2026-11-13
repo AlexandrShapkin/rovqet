@@ -63,3 +63,25 @@ An already-authorized owner may continue allowed work while its persisted lease/
 ## Fault fixtures
 
 Stale metadata version, client proxy timeout after commit, duplicate transfer chunk, missing final transfer chunk, checksum mismatch, old owner sends after fencing, Q2 leader changed before proxy reply, CP lost during Q1 transfer, Q2 data quorum lost while CP works, asymmetric partition where old leader sees stale map.
+
+## C-01 implementation note
+
+C-01 implements the envelope above as a separate inter-node namespace with an explicit
+portable binary layout: magic `RQCL`, `api_version`, `rpc_kind`, flags, `cluster_id`,
+`source_node`, `target_node`, `request_id`, `metadata_revision`, `ownership_epoch`,
+`timeout_budget_ms`, `body_len`, the bounded body and a trailing CRC32C. The cluster
+namespace does not reuse or extend the client-facing frame registry; client frames and
+golden vectors are unchanged.
+
+The normative RPC kind numbering of the table above is used verbatim: 1 ROUTE_PUBLISH,
+2 ROUTE_FETCH, 3 ROUTE_CONSUMER_ACK, 4 ROUTE_Q0_FANOUT, 5 METADATA_SNAPSHOT_GET,
+6 OWNERSHIP_INSPECT, 7/8/9 Q1_TRANSFER_*, 10 HEALTH. Kinds 4 and 7-9 are answered with an
+explicit unsupported result; unknown kinds and unsupported envelope versions are rejected.
+Bodies use explicit big-endian fields with length-prefixed byte strings; no native Rust
+structure is serialized.
+
+Bounds chosen for the prototype (the frozen registry numbers remain authoritative for the
+client protocol): 1 MiB maximum body, 64 outstanding peer requests, 64 concurrent peer
+connections, 2 s connection establishment, 5 s request timeout and 60 s maximum advertised
+timeout budget. A timeout after a request was written is reported as an uncertain outcome
+(`OUTCOME_UNKNOWN` for client publications), never as a definite rollback.

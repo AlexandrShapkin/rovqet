@@ -67,3 +67,27 @@ In research MVP, use fixed credentials and a sandbox network to test routing log
 ## Tests
 
 Admit three nodes with unique IDs; kill metadata leader; kill Q2 data leader independently; stale map redirect; asymmetric partition; delayed reconnect; Q1 migration with intact WAL; lost Q1 owner with explicit incarnation reset; stale owner attempts publish and ACK; no metadata quorum plus expired lease; idempotent resumed migration after crash.
+
+## C-01 implementation status
+
+C-01 provides the network and routing foundation only. It implements the typed identities
+(cluster, node, peer endpoint, metadata revision, partition reference, partition owner,
+ownership epoch, lease validity, RPC request id, RPC kind and timeout budget), the inter-node
+envelope and codec, a bounded peer transport, immutable versioned metadata snapshots and the
+owner-aware routing decision.
+
+The metadata source in C-01 is an explicitly configured static fixture, installed atomically
+and validated (cluster identity, revision monotonicity, node references, duplicate entries,
+policy compatibility and lease validity). It is a development authority fixture and not a
+Raft-committed snapshot. A process restart starts without any installed authority, so a
+restart can never extend ownership authorization. Authority is time-bounded from local
+installation and expires fail-closed.
+
+Routing reads exactly one snapshot, validates the partition and epoch and then either serves
+locally, forwards once to the configured owner or returns a typed stale/expired/no-metadata
+error. A routed request is never routed again, which bounds redirect loops. A proxy never
+substitutes the producer token, never mints an epoch and never reports COMMITTED_LOCAL
+without the owner's own durable barrier.
+
+Metadata consensus, membership management, ownership handover, WAL migration, Q2 replication
+and majority acknowledgment remain C-02/C-03 work.

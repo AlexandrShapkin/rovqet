@@ -4,11 +4,13 @@ use rovqet_core::{Priority, QoS};
 use rovqet_q0::Broker;
 use rovqet_router::{OverflowPolicy, TopicConfig};
 use rovqet_transport::{Config, TransportStats, serve};
+mod cluster;
 mod q1;
 use std::{
     collections::{HashMap, HashSet},
     io,
     net::SocketAddr,
+    path::PathBuf,
     sync::{Arc, atomic::Ordering},
     time::{Duration, Instant},
 };
@@ -26,6 +28,7 @@ struct Options {
     connection_budget_bytes: usize,
     metrics_interval: Option<Duration>,
     q1: Option<q1::Options>,
+    cluster: Option<cluster::ClusterOptions>,
 }
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
@@ -38,10 +41,16 @@ impl Options {
             connection_budget_bytes: DEFAULT_CONNECTIONS * CONNECTION_ENVELOPE_BYTES,
             metrics_interval: None,
             q1: None,
+            cluster: None,
         };
         let mut q1_values = HashMap::new();
         let mut seen = HashSet::new();
         let mut explicit_budget = false;
+        let mut cluster_id: Option<u128> = None;
+        let mut node_id: Option<u64> = None;
+        let mut cluster_listen: Option<SocketAddr> = None;
+        let mut cluster_metadata: Option<PathBuf> = None;
+        let mut cluster_peers: Vec<(u64, SocketAddr)> = Vec::new();
         for pair in args.chunks(2) {
             if pair.len() != 2 || !seen.insert(pair[0].as_str()) {
                 return Err(invalid("expected unique --option value pairs; see --help"));
@@ -71,6 +80,32 @@ impl Options {
                         return Err(invalid("metrics interval must be 50..60000 ms"));
                     }
                     result.metrics_interval = Some(Duration::from_millis(ms));
+                }
+                "--cluster-id" => {
+                    cluster_id = Some(pair[1].parse().map_err(|_| invalid("invalid cluster id"))?)
+                }
+                "--node-id" => {
+                    node_id = Some(pair[1].parse().map_err(|_| invalid("invalid node id"))?)
+                }
+                "--cluster-listen" => {
+                    cluster_listen = Some(
+                        pair[1]
+                            .parse()
+                            .map_err(|_| invalid("invalid cluster listen address"))?,
+                    )
+                }
+                "--cluster-metadata" => cluster_metadata = Some(PathBuf::from(&pair[1])),
+                "--cluster-peer" => {
+                    let (id, address) = pair[1]
+                        .split_once('=')
+                        .ok_or_else(|| invalid("cluster peer must be node=host:port"))?;
+                    cluster_peers.push((
+                        id.parse()
+                            .map_err(|_| invalid("invalid cluster peer node id"))?,
+                        address
+                            .parse()
+                            .map_err(|_| invalid("invalid cluster peer address"))?,
+                    ));
                 }
                 "--q1-data-dir"
                 | "--q1-topic"
@@ -122,6 +157,34 @@ impl Options {
             )));
         }
         result.q1 = q1::Options::parse(&q1_values)?;
+        match (cluster_id, node_id) {
+            (Some(cluster_id), Some(node_id)) => {
+                let listen = cluster_listen.unwrap_or_else(|| "127.0.0.1:0".parse().unwrap());
+                if !listen.ip().is_loopback() {
+                    return Err(invalid("cluster listener must be loopback"));
+                }
+                result.cluster = Some(cluster::ClusterOptions {
+                    cluster_id,
+                    node_id,
+                    listen,
+                    peers: cluster_peers,
+                    metadata: cluster_metadata,
+                });
+            }
+            (None, None) => {
+                if cluster_listen.is_some()
+                    || !cluster_peers.is_empty()
+                    || cluster_metadata.is_some()
+                {
+                    return Err(invalid("cluster mode requires --cluster-id and --node-id"));
+                }
+            }
+            _ => {
+                return Err(invalid(
+                    "cluster mode requires both --cluster-id and --node-id",
+                ));
+            }
+        }
         Ok(result)
     }
 }
@@ -274,13 +337,47 @@ async fn main() -> io::Result<()> {
             }}
         })
     });
-    let handler = Arc::new(q1::Dispatch::new(broker.clone(), route.clone()));
+    let (cluster, cluster_stop) = match &options.cluster {
+        Some(cluster_options) => {
+            let cluster = Arc::new(cluster::Cluster::new(cluster_options)?);
+            let listener = tokio::net::TcpListener::bind(cluster_options.listen).await?;
+            let address = listener.local_addr()?;
+            if !address.ip().is_loopback() {
+                return Err(invalid("cluster listener must be loopback"));
+            }
+            eprintln!(
+                "cluster mode: node={} cluster={} peers={} metadata_revision={}",
+                cluster.node,
+                cluster.trust.cluster,
+                cluster_options.peers.len(),
+                cluster.revision()
+            );
+            let peer_server = rovqet_control::transport::PeerServer::new(
+                listener,
+                cluster.trust.clone(),
+                Arc::new(cluster::ClusterHandler::new(cluster.clone(), route.clone())),
+                Default::default(),
+            )
+            .map_err(|error| invalid(format!("cluster peer listener: {error}")))?;
+            let (stop, stop_rx) = tokio::sync::watch::channel(false);
+            tokio::spawn(peer_server.serve(stop_rx));
+            (Some(cluster), Some(stop))
+        }
+        None => (None, None),
+    };
+    let handler = Arc::new(match cluster.clone() {
+        Some(cluster) => q1::Dispatch::with_cluster(broker.clone(), route.clone(), cluster),
+        None => q1::Dispatch::new(broker.clone(), route.clone()),
+    });
     let drain = handler.clone();
     let result = serve(listener, config, handler.clone(), async move {
         let _ = tokio::signal::ctrl_c().await;
         drain.drain();
     })
     .await;
+    if let Some(stop) = cluster_stop {
+        let _ = stop.send(true);
+    }
     drop(handler);
     if let Some(route) = route {
         let owned = Arc::try_unwrap(route)

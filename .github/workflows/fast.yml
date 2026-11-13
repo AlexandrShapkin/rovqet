@@ -29,6 +29,8 @@ jobs:
         run: cargo check --workspace --locked
       - name: Fast workspace tests
         run: cargo test --workspace --locked
+      - name: Inter-node RPC and metadata tests
+        run: cargo test -p rovqet-control --locked
       - name: Verify executable identifies development profile
         run: cargo run --locked -p rovqet-server -- --version
       - name: Build independent-process smoke binaries
@@ -51,6 +53,8 @@ jobs:
         run: python3 scripts/test_q1_durability.py
       - name: Q1 NACK, retry, quarantine and real DLQ ordering
         run: python3 scripts/test_q1_terminal.py
+      - name: Cluster routing between two local brokers
+        run: python3 scripts/test_cluster_routing.py
       - name: Q1 TCP crash boundaries and Q0 isolation
         run: python3 scripts/test_q1_faults.py
       - name: Independent testkit fixtures and sampler tests
