@@ -1646,4 +1646,136 @@ mod tests {
         ));
         server.await.unwrap();
     }
+
+    fn group_options(generation: Option<u64>) -> GroupOptions {
+        GroupOptions {
+            partition: PartitionRef {
+                tenant_id: 1,
+                topic_id: 3,
+                partition_id: 0,
+            },
+            incarnation: 42,
+            group_id: 9,
+            generation,
+            max_messages: 8,
+            max_bytes: 65536,
+            wait: Duration::ZERO,
+        }
+    }
+    fn delivery_frame(request: u64, offset: u64, lease: u128, attempt: u32) -> Frame {
+        let mut frame = Frame::new(FrameType::Message, request);
+        frame.fields = vec![
+            Field::required(f::TENANT_ID, 1u64.to_be_bytes()),
+            Field::required(f::TOPIC_ID, 3u64.to_be_bytes()),
+            Field::required(f::QOS, [1]),
+            Field::required(f::PARTITION_ID, 0u32.to_be_bytes()),
+            Field::required(f::LOG_INCAR, 42u128.to_be_bytes()),
+            Field::required(f::OFFSET, offset.to_be_bytes()),
+            Field::required(f::MESSAGE_ID, (100 + u128::from(offset)).to_be_bytes()),
+            Field::required(f::GROUP_ID, 9u64.to_be_bytes()),
+            Field::required(f::GROUP_GENERATION, 1u64.to_be_bytes()),
+            Field::required(f::LEASE_ID, lease.to_be_bytes()),
+            Field::required(f::OWNERSHIP_EPOCH, 7u64.to_be_bytes()),
+            Field::required(f::DELIVERY_ATTEMPT, attempt.to_be_bytes()),
+            Field::required(f::ACK_DEADLINE_MS, 1000u32.to_be_bytes()),
+        ];
+        frame.payload = format!("event-{offset}").into_bytes();
+        frame
+    }
+    fn fetch_end_frame(request: u64, offset: u64, group: u64, has_more: u8) -> Frame {
+        let mut frame = Frame::new(FrameType::FetchEnd, request);
+        frame.fields = vec![
+            Field::required(f::TENANT_ID, 1u64.to_be_bytes()),
+            Field::required(f::TOPIC_ID, 3u64.to_be_bytes()),
+            Field::required(f::QOS, [1]),
+            Field::required(f::PARTITION_ID, 0u32.to_be_bytes()),
+            Field::required(f::LOG_INCAR, 42u128.to_be_bytes()),
+            Field::required(f::GROUP_ID, group.to_be_bytes()),
+            Field::required(f::GROUP_GENERATION, 1u64.to_be_bytes()),
+            Field::required(f::OFFSET, offset.to_be_bytes()),
+            Field::required(f::HAS_MORE, [has_more]),
+        ];
+        frame
+    }
+    #[tokio::test]
+    async fn group_fetch_requires_a_validated_terminal_and_complete_tokens() {
+        for case in 0..6 {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let config = ClientConfig {
+                endpoint: listener.local_addr().unwrap(),
+                ..Default::default()
+            };
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                handshake(&mut stream).await;
+                let request = read_frame(&mut stream, Limits::default())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(request.frame_type, FrameType::Fetch);
+                assert_eq!(request.field(f::GROUP_ID), Some(&9u64.to_be_bytes()[..]));
+                if case != 4 {
+                    let mut delivery = delivery_frame(request.request_id, 0, 77, 1);
+                    if case == 3 {
+                        // A delivery from another group must never be accepted as ours.
+                        delivery
+                            .fields
+                            .iter_mut()
+                            .find(|v| v.id == f::GROUP_ID)
+                            .unwrap()
+                            .value = 10u64.to_be_bytes().to_vec();
+                    }
+                    write_frame(&mut stream, &delivery, Limits::default())
+                        .await
+                        .unwrap();
+                }
+                if case == 0 {
+                    return;
+                }
+                if case != 0 {
+                    let frame = match case {
+                        1 => fetch_end_frame(request.request_id, 2, 10, 0),
+                        2 => fetch_end_frame(request.request_id + 1, 2, 9, 0),
+                        3 => fetch_end_frame(request.request_id, 4, 9, 0),
+                        4 => fetch_end_frame(request.request_id, 0, 9, 0),
+                        _ => {
+                            let mut error = Frame::new(FrameType::Error, request.request_id);
+                            error.fields = vec![
+                                Field::required(f::ERROR_CODE, 18u16.to_be_bytes()),
+                                Field::required(f::ERROR_RETRYABLE, [0]),
+                            ];
+                            error
+                        }
+                    };
+                    write_frame(&mut stream, &frame, Limits::default())
+                        .await
+                        .unwrap();
+                }
+            });
+            let mut client = Client::connect(config).await.unwrap();
+            let result = client.fetch_q1_group("durable", group_options(None)).await;
+            match case {
+                0 => assert!(matches!(result, Err(GroupError::Incomplete)), "case{case}"),
+                4 => {
+                    let batch = result.unwrap();
+                    assert!(batch.messages.is_empty());
+                    assert_eq!(batch.generation, 1);
+                    assert_eq!(batch.next.sequence, 0);
+                    assert!(!batch.has_more);
+                }
+                5 => assert!(
+                    matches!(result, Err(GroupError::StaleGeneration)),
+                    "case{case}"
+                ),
+                _ => assert!(result.is_err(), "case{case}"),
+            }
+            if case != 4 {
+                assert!(
+                    client.stream.is_none(),
+                    "case{case} must close uncertain framing"
+                );
+            }
+            server.await.unwrap();
+        }
+    }
 }

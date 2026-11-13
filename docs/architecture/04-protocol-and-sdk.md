@@ -45,6 +45,7 @@ TLV \`tag = (field_number << 1) | critical_bit\`; unknown critical tags fail UNS
 | 23 | READ_FETCH | standalone committed Q1 inspection request |
 | 24 | READ_RECORD | committed application record, no group/lease |
 | 25 | READ_END | terminal batch status and continuation |
+| 26 | FETCH_END | terminal group-batch continuation (B-05 additive) |
 
 Reserve 0 as invalid. Existing numeric assignments are immutable within wire major 1. Additions require a central registry entry and compatible codec fixtures; never assign conflicting IDs per component.
 
@@ -116,3 +117,27 @@ per frame. Existing volatile subscription deliveries may interleave under their 
 SDK pending bounds. The read API creates no leases or consumer ACK/cursor semantics.
 The original FETCH/MESSAGE group contracts are unchanged and remain unsupported by the
 prototype. See [the binary contract](protocol-registry.md#b-04-standalone-inspection-extension-major-1-additive).
+
+## B-05 durable consumer API
+
+`Client::fetch_q1_group(topic, GroupOptions)` sends FETCH (17) and validates zero or more
+MESSAGE (12) deliveries followed by mandatory FETCH_END (26). `GroupOptions` carries the
+partition, log incarnation, tenant-scoped group ID, optional generation (`None` claims or
+replaces the group), message/byte limits and bounded wait. Each `GroupMessage` exposes the
+original committed payload, message ID and a complete `DeliveryToken`
+(`partition, group, generation, lease_id, ownership_epoch, offset, attempt`).
+
+`Client::ack_q1_group(topic, &DeliveryToken)` sends CONSUMER_ACK (13) and returns only after
+a validated CONSUMER_ACK_RESULT (14) with `ACK_COMMITTED`. The SDK never mints a lease,
+never acknowledges automatically and never retries with a regenerated token. Duplicate
+tokens resolve to the saved committed outcome. `StaleGeneration`, `LeaseExpired`,
+`AckNotCommitted`, `PermissionDenied`, `ResourceExhausted` and `ReplayNotAvailable` are
+typed; any transport loss, timeout or interruption before FETCH_END returns `Incomplete`
+and closes the framing-uncertain stream, so a partial batch is never reported as complete.
+
+`fetch_q1_group` validates scope, group identity, generation continuity across the batch,
+strictly increasing application offsets, delivery count, payload byte bound, non-zero lease
+and attempt, and terminal consistency. Continuation is taken from FETCH_END and may point
+before the last delivered offset after out-of-order ACKs; clients must not reconstruct it by
+offset arithmetic. Existing Q0 and Q1 publication APIs and the B-04 read API remain
+compatible; READ_FETCH never consumes group leases or advances a cursor.

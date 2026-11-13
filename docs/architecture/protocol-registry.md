@@ -51,6 +51,7 @@ Decoder order: confirm magic/version → parse bounded varint lengths without al
 | 23 | READ_FETCH | none; standalone Q1 inspection |
 | 24 | READ_RECORD | committed application bytes; no lease |
 | 25 | READ_END | none; terminal continuation/status |
+| 26 | FETCH_END | none; terminal group batch continuation |
 
 ## Field IDs, encoding and scope
 
@@ -232,3 +233,47 @@ last retained write is released. Q0 delivery/credit queues and WAL independence 
 unchanged. Standalone readers must not pipeline requests within a batch; the Rust SDK
 serializes requests and closes a cancelled/partial stream. The network task awaits the
 actor asynchronously; filesystem IO remains on the existing partition owner.
+
+## B-05 consumer-group delivery completion (major 1, additive)
+
+FETCH (17), MESSAGE (12), CONSUMER_ACK (13) and CONSUMER_ACK_RESULT (14) keep their frozen
+identifiers and required fields. This section defines the prototype semantics and the one
+additive terminal frame. Field 50 `has_more:u8` is reused from the B-04 read batch.
+
+**FETCH (17)** carries topic_name or topic_id, partition_id, group_id, log_incarnation,
+offset, max_messages (1-1024), max_bytes (128-4194304) and optional wait_ms (0-30000). It
+may additionally carry `group_generation:u64` (field 25). Omitted or zero means "claim the
+group": the broker durably fences a new generation before delivering and returns it in
+MESSAGE/FETCH_END. A nonzero value must equal the current generation or the broker returns
+STALE_GENERATION (18). `offset` is a continuation hint only; the durable cursor governs
+delivery. FETCH never creates a second active receiver for the same generation.
+
+**MESSAGE (12)** for durable delivery carries tenant_id, topic_id, qos=1, partition_id,
+log_incarnation, offset, message_id, group_id, group_generation, lease_id, ownership_epoch,
+delivery_attempt, ack_deadline_ms and the original committed payload. The full token is
+`(tenant, group, partition, incarnation, offset, ownership_epoch, generation, lease_id,
+attempt)`. A lease always refers to a committed application MESSAGE; producer-outcome,
+consumer-ACK and checkpoint records are never delivered.
+
+**FETCH_END (26)** is the mandatory terminal frame of every group batch. Required fields:
+tenant_id, topic_id, qos=1, partition_id, log_incarnation, group_id, group_generation,
+offset (durable continuation = first unacknowledged application offset, or append end) and
+has_more (0/1). It has no payload. `has_more=1` means further records remain deliverable or
+are currently leased; `0` means the group has no unacknowledged application record. A batch
+whose connection fails before FETCH_END is never a completed SDK result. FETCH_END is not
+a consumer ACK and does not advance any cursor.
+
+**CONSUMER_ACK (13)** requires topic/partition/group/generation/lease/ownership_epoch/
+incarnation/offset and `delivery_attempt`. The broker validates the full token, appends a
+durable `CONSUMER_ACK` record, syncs and only then answers with **CONSUMER_ACK_RESULT (14)**
+`ack_outcome=1` (ACK_COMMITTED) echoing group, generation and offset. STALE_GENERATION (18),
+LEASE_EXPIRED (19) or ACK_NOT_COMMITTED (25) are explicit failures; none is success.
+Duplicate ACKs of an already committed offset return the saved ACK_COMMITTED without any new
+durable mutation, including after a generation change. CONSUMER_NACK (15) and EXTEND_LEASE
+(16) remain UNSUPPORTED_CAPABILITY in B-05.
+
+Cursor progression uses application MESSAGE offsets only. Interleaved consumer metadata
+consumes WAL positions but not application offsets, so READ_FETCH continuation may skip
+metadata records and the next application offset is not always an arithmetic step. Both
+read and group batches report the server-computed continuation; clients must not derive it
+by incrementing an offset.

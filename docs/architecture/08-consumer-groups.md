@@ -67,6 +67,38 @@ Crash at ACK receive, validation, append, fsync/quorum, response; crash between 
 
 B-04's READ_FETCH/READ_RECORD/READ_END and Rust `read_q1` API inspect committed history.
 They do not allocate leases, acknowledge deliveries, advance a group cursor, fence group
-generations or promise at-least-once consumer-group processing. Existing FETCH/MESSAGE
-retain their group requirements; consumer ACK/NACK/lease operations remain unsupported
-until B-05. An inspection continuation is a log reference, never consumer progress.
+generations or promise at-least-once consumer-group processing. An inspection continuation
+is a log reference, never consumer progress.
+
+## B-05 implemented local Q1 subset
+
+One explicitly configured Q1 partition supports multiple tenant-scoped group IDs, but only
+one active mutation generation per group. Implementation choices:
+
+- `FETCH` with no `group_generation` field or generation 0 **claims** the group: the actor
+  appends a generation fence (`CURSOR_CHECKPOINT`) and syncs before delivering. A later
+  claim durably increments the generation and cancels the previous generation's leases;
+  `FETCH`/`CONSUMER_ACK` carrying the old generation returns STALE_GENERATION.
+- A new group starts at the earliest committed application message. Leases are volatile
+  grants bounded by `max_inflight`, `max_lease_bytes` and a lease deadline; after expiry or
+  restart the same committed message is redelivered with a higher attempt or a new lease.
+  Attempts are delivery-scoped, not durable consumer progress.
+- `CONSUMER_ACK` validates principal, tenant/topic/partition, incarnation, ownership epoch,
+  generation, lease, offset, attempt and message identity. The actor appends a `CONSUMER_ACK`
+  WAL record, syncs, recomputes the contiguous cursor and only then returns ACK_COMMITTED.
+  A duplicate ACK for an already committed offset is a read-only saved-outcome lookup, valid
+  even after fencing. Any durability failure returns ACK_NOT_COMMITTED/OUTCOME_UNKNOWN and
+  poisons the actor; it is never success.
+- Out-of-order ACKs are retained in a bounded sparse set. The cursor advances only over the
+  contiguous acknowledged prefix; it never skips an unacknowledged application record.
+  Periodic `CURSOR_CHECKPOINT` records embed the cursor and the sparse set, so compaction
+  cannot erase acknowledged gaps.
+- `FETCH` batches terminate with the additive `FETCH_END` frame after all `MESSAGE` frames.
+  Losing the connection before `FETCH_END` yields no completed SDK batch. `CONSUMER_NACK`
+  and `EXTEND_LEASE` remain explicitly unsupported (B-06), and no timeout/NACK/disconnect
+  closes an offset. DLQ/quarantine, SEEK and rebalancing remain out of scope.
+
+Limitations: a lease token is valid only for its process lifetime; redelivery attempts reset
+after restart. Group state is not replicated (Q2/Raft remains C-03/C-05), and an
+irrecoverably lost Q1 history still requires an explicit authorized reset with a fresh
+incarnation — recovery never resets progress silently.

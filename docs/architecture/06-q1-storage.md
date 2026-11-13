@@ -254,3 +254,43 @@ expiry/shutdown. Fault-enabled tests hold an unsynced append and prove queued re
 expose it; cancellation releases the retained read budget. Disposable loss fixtures never
 invoke broker deletion or reset operations. TCP tests prove unsupported group operations
 fail-closed lost-history startup and explicit group-operation rejection. Real TCP/SDK tests add exact encoded bounds, multi-frame validation, continuation, long polling, negotiated frame limits, cancellation and read-only producer-state checks. The independent process ACK journal verifies message IDs, offsets and payload hashes through the SDK after clean restart and SIGKILL.
+
+## B-05 durable consumer metadata in the Q1 WAL
+
+The v1 record, segment and manifest formats are unchanged. B-05 uses the already reserved
+record kinds **CONSUMER_ACK (3)** and **CURSOR_CHECKPOINT (5)** with self-describing
+payloads; `MESSAGE` (1) and `PRODUCER_OUTCOME` (2) keep their exact existing encoding.
+
+- `CONSUMER_ACK` payload `RQCA\\0\\x01` (66 bytes): group_id u64, generation u64,
+  ownership_epoch u64, lease_id u128, application offset u64, attempt u32, principal u128,
+  message_id u128. The record's `message_id`/`sequence` mirror the delivery identity; the
+  payload is authoritative for group state.
+- `CURSOR_CHECKPOINT` payload `RQCP\\0\\x01`: group_id u64, generation u64, cursor u64,
+  acknowledged sparse-offset count u32, then that many u64 offsets in strictly ascending
+  order. The count is bounded by the configured sparse limit. A checkpoint embeds the full
+  sparse set, so later checkpoints never erase an acknowledged gap.
+- Leases, deadlines and delivery attempts are deliberately **volatile**. After a restart the
+  same committed record is redelivered with a fresh lease; a lease token from a previous
+  process is never accepted.
+
+Recovery is kind-aware and sequential. A committed `MESSAGE` must be immediately followed by
+a matching `PRODUCER_OUTCOME`; an orphan outcome, a missing pair, a malformed ACK/checkpoint
+payload, an ACK for an unknown application message, a checkpoint ahead of its own append
+position, a decreasing generation, or an unsupported terminal/tombstone record fails closed.
+Every ACK and checkpoint is replayed in WAL order; checkpoints replace the cursor state and
+ACKs then apply incrementally. Existing storage containing only publication pairs recovers
+without migration and without changing any previously acknowledged offset.
+
+Application message offsets remain the stable WAL logical offsets of `MESSAGE` records. Once
+consumer metadata is interleaved they become sparse: a MESSAGE is no longer guaranteed to sit
+at an even offset and consecutive messages are not an arithmetic sequence. Standalone replay
+therefore scans WAL positions, skips `PRODUCER_OUTCOME`/`CONSUMER_ACK`/`CURSOR_CHECKPOINT`
+records, and returns the next unread position as continuation. Cursor advancement likewise
+walks the ordered list of application messages; it never derives the next message by
+incrementing a physical or logical offset.
+
+Default group bounds are 8 groups, 256 in-flight leases, 4096 sparse ACK entries, 4 MiB leased
+bytes, a 30 s lease and a checkpoint every 64 ACKs. Group state, WAL reads and retained batch
+reservations are charged to the existing partition budget before IO; exhaustion is an explicit
+CAPACITY error. The single partition actor remains the only mutator, and all group durability
+barriers are ordinary Q1 segment+manifest syncs.

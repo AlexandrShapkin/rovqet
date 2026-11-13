@@ -43,6 +43,8 @@ jobs:
         run: cargo test -p rovqet-durable --features fault-injection --locked
       - name: Build isolated Q1 fault-test broker
         run: cargo build -p rovqet-server --features fault-injection --locked
+      - name: Durable consumer TCP delivery, ACK and crash windows
+        run: python3 scripts/test_q1_consumer.py
       - name: Q1 TCP crash boundaries and Q0 isolation
         run: python3 scripts/test_q1_faults.py
       - name: Independent testkit fixtures and sampler tests

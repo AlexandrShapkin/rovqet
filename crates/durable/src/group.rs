@@ -852,12 +852,17 @@ impl State {
         };
         let record_offset = self.next;
         let result = (|| {
+            #[cfg(feature = "fault-injection")]
+            self.test_barrier(TestStage::BeforeAppend, offset)
+                .map_err(|_| GroupError::AckNotCommitted)?;
             self.wal.append(record)?;
             #[cfg(feature = "fault-injection")]
-            self.test_barrier(TestStage::AfterAppendBeforeSync, offset)?;
+            self.test_barrier(TestStage::AfterAppendBeforeSync, offset)
+                .map_err(|_| GroupError::AckNotCommitted)?;
             self.wal.sync()?;
             #[cfg(feature = "fault-injection")]
-            self.test_barrier(TestStage::AfterSyncBeforeReply, offset)?;
+            self.test_barrier(TestStage::AfterSyncBeforeReply, offset)
+                .map_err(|_| GroupError::AckNotCommitted)?;
             Ok::<_, GroupError>(())
         })();
         if result.is_err() {

@@ -188,10 +188,35 @@ uncertain socket is closed. `ReadError` exposes typed authority, incarnation/his
 resource, storage, unsupported-peer and framing failures. The wire extension uses frames
 23–25 and fields 49–50; existing FETCH/MESSAGE and golden vectors remain unchanged.
 Read-only inspection creates no consumer leases, ACKs, cursors or at-least-once processing
-promise. B-05 is the next separate work package.
+promise.
+
+Durable Q1 consumer groups are available through the Rust SDK and an external example:
+
+```sh
+cargo run -p rovqet-sdk --example consume_q1 -- durable 1 3 0 42 9 0 8 65536 0 8
+# DELIVERY 42 0 100 1 1 1 30000 6576656e742d30
+# GROUP_BATCH 9 1 0 0 1
+# ACK_COMMITTED 42 0 1
+```
+
+Arguments are `topic tenant_id topic_id partition_id incarnation group_id generation
+max_messages max_bytes wait_ms ack_count`. Generation 0 claims (or replaces) the group and
+durably fences the previous consumer; the broker returns the new generation in every
+delivery. Each `DELIVERY` line carries the complete token fields
+`incarnation offset message_id generation lease_id attempt ack_deadline_ms payload`;
+`Client::ack_q1_group` returns ACK_COMMITTED only after the broker synced the
+`CONSUMER_ACK` record. Add an eleventh argument to acknowledge only that offset.
+
+Out-of-order ACKs are retained as a bounded sparse set and the cursor advances only over the
+contiguous acknowledged prefix; restart redelivers unacknowledged records instead of
+skipping them. Duplicate ACKs return the saved committed result without another durable
+mutation. Expired leases and stale generations are rejected explicitly. FETCH batches end
+with the additive FETCH_END (frame 26) frame, so a connection lost mid-batch is never a
+completed SDK result. See [the consumer contract](docs/architecture/08-consumer-groups.md).
 
 ```sh
 python3 scripts/test_q1_replay.py
+python3 scripts/test_q1_consumer.py   # needs the fault-injection broker build
 ```
 
 The Q1 restart smoke also reads all independently journaled ACKs through an external SDK

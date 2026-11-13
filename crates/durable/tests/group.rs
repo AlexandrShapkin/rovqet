@@ -531,3 +531,106 @@ fn shutdown_with_outstanding_lease_keeps_the_committed_ack() {
     assert_eq!(resumed.deliveries[0].offset.sequence, 2);
     assert_eq!(resumed.deliveries[0].attempt, 1);
 }
+
+#[test]
+fn concurrent_identical_acks_commit_exactly_once() {
+    let t = Temp::new();
+    let p = std::sync::Arc::new(open(&t, GroupConfig::default()));
+    publish(&p, 0);
+    publish(&p, 1);
+    let batch = fetch(&p, 0, 8);
+    assert_eq!(batch.deliveries.len(), 2);
+    let delivery = batch.deliveries[0].clone();
+    let mut handles = Vec::new();
+    for _ in 0..4 {
+        let partition = p.clone();
+        let delivery = delivery.clone();
+        handles.push(std::thread::spawn(move || ack(&partition, &delivery)));
+    }
+    for handle in handles {
+        assert!(handle.join().unwrap().is_ok());
+    }
+    drop(batch);
+    let partition = std::sync::Arc::try_unwrap(p).ok().unwrap();
+    drop(partition);
+    // Two publication pairs, one generation checkpoint and exactly one CONSUMER_ACK.
+    let wal = Wal::open(t.wal(), wal_config()).unwrap();
+    assert_eq!(wal.committed_position().unwrap().sequence + 1, 6);
+}
+
+#[test]
+fn admission_exhaustion_is_typed_before_any_delivery() {
+    let t = Temp::new();
+    fs::create_dir_all(t.wal()).unwrap();
+    let mut group = GroupConfig::default();
+    group.max_groups = 1;
+    let mut config = config(group);
+    config.queue_bytes = 8192;
+    let p = Partition::open(t.wal(), wal_config(), config).unwrap();
+    publish(&p, 0);
+    // The reservation for a full batch cannot fit the tiny partition budget.
+    assert!(matches!(
+        p.try_fetch_group(GroupFetchRequest {
+            partition: partition_id(),
+            group_id: 9,
+            generation: 0,
+            from: DurableOffset {
+                log_incarnation: 42,
+                sequence: 0
+            },
+            max_messages: 8,
+            max_bytes: 65536,
+            wait: Duration::ZERO,
+        }),
+        Err(GroupError::Capacity)
+    ));
+    // No group generation was claimed by a rejected admission.
+    let batch = p
+        .try_fetch_group(GroupFetchRequest {
+            partition: partition_id(),
+            group_id: 9,
+            generation: 0,
+            from: DurableOffset {
+                log_incarnation: 42,
+                sequence: 0,
+            },
+            max_messages: 1,
+            max_bytes: 1024,
+            wait: Duration::ZERO,
+        })
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert_eq!(batch.generation, 1);
+    assert_eq!(batch.deliveries.len(), 1);
+}
+
+#[test]
+fn cancelled_group_wait_releases_its_reservation_and_keeps_publication_alive() {
+    let t = Temp::new();
+    let p = open(&t, GroupConfig::default());
+    let waiting = p
+        .try_fetch_group(GroupFetchRequest {
+            partition: partition_id(),
+            group_id: 9,
+            generation: 0,
+            from: DurableOffset {
+                log_incarnation: 42,
+                sequence: 0,
+            },
+            max_messages: 8,
+            max_bytes: 65536,
+            wait: Duration::from_secs(30),
+        })
+        .unwrap();
+    drop(waiting);
+    publish(&p, 0);
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while p.usage().messages != 0 {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let batch = fetch(&p, 0, 8);
+    assert_eq!(batch.deliveries.len(), 1);
+    assert_eq!(batch.deliveries[0].payload, b"event-0");
+}

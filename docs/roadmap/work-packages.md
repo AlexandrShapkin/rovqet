@@ -57,6 +57,14 @@ Standalone inspection does not implement B-05 delivery, leases or cursor persist
 
 **B-05 — Durable group lease/ACK/cursor** (depends B-03,B-04). Lease tokens, generation fencing, bounded sparse ACK set, contiguous cursor durable barrier and idempotent duplicate ACK read. Proof: out-of-order ACK gap, stale generation, crash before/after fsync result, redelivery.
 
+B-05 uses FETCH/MESSAGE/CONSUMER_ACK/CONSUMER_ACK_RESULT with an additive terminal
+FETCH_END (26). One generation per group is durably fenced when FETCH omits/zeros the
+generation; leases are volatile and redelivery follows expiry or restart; CONSUMER_ACK and
+CURSOR_CHECKPOINT records extend the existing v1 WAL without changing its binary layout.
+Real external consumer processes, a parent-owned ACK/cursor journal and three ACK crash
+windows are exercised by `scripts/test_q1_consumer.py`. B-06 owns NACK, quarantine/DLQ and
+terminal disposition; B-07 is the crash/oracle gate.
+
 **B-06 — Q1 terminal disposition** (depends B-05). Retry/NACK, quarantine and DLQ idempotent two-step protocol using Q1; keep source incomplete if DLQ fails. Proof: crash between DLQ commit and terminal record, no cursor skip. Can follow first Q1 PoC if strict time pressure; cannot claim terminal support until tested.
 
 **B-07 — Q1 crash/oracle gate** (depends B-05,R0-02). External acknowledged set versus recovered WAL after repeated SIGKILL at controlled barriers; memory and fsync p99. Proof: 0 acknowledged Q1 losses with intact disk and honest uncertain outcomes. SIGKILL != physical power cut.

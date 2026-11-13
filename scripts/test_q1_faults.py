@@ -412,7 +412,7 @@ class Q1ProcessFaults(unittest.TestCase):
         self.assertEqual(list(broker.wal.iterdir()), [])
         self.assertTrue((self.directory / "unavailable-wal" / "MANIFEST").exists())
 
-    def test_group_fetch_and_ack_are_explicitly_unsupported_without_fake_leases(self):
+    def test_fabricated_leases_and_terminal_group_operations_are_rejected(self):
         broker = self.broker()
         committed(broker.publish(), 0)
         with connect(broker) as connection:
@@ -423,9 +423,22 @@ class Q1ProcessFaults(unittest.TestCase):
             ack = {9: b"durable", 19: (0).to_bytes(4, "big"),
                    24: (1).to_bytes(8, "big"), 25: (1).to_bytes(8, "big"),
                    26: (1).to_bytes(16, "big"), 27: (7).to_bytes(8, "big"),
-                   20: (42).to_bytes(16, "big"), 21: (0).to_bytes(8, "big")}
-            for request, (kind, fields) in enumerate([(17, fetch), (13, ack), (15, ack), (16, ack)], 10):
-                connection.sendall(frame(kind, request, fields))
+                   20: (42).to_bytes(16, "big"), 21: (0).to_bytes(8, "big"),
+                   37: (1).to_bytes(4, "big")}
+            # A FETCH without qos=1 is not a durable group request, so it cannot borrow
+            # the Q1 consumer lane.
+            connection.sendall(frame(17, 10, fetch))
+            response, correlation, fields = read_frame(connection)
+            self.assertEqual((response, correlation), (20, 10))
+            self.assertEqual(int.from_bytes(fields[28], "big"), 14)
+            # A forged ACK cannot mint a lease or commit progress for an unknown group.
+            connection.sendall(frame(13, 11, ack))
+            response, correlation, fields = read_frame(connection)
+            self.assertEqual((response, correlation), (20, 11))
+            self.assertEqual(int.from_bytes(fields[28], "big"), 26)
+            # NACK and lease extension belong to later work packages.
+            for request, kind in enumerate([15, 16], 12):
+                connection.sendall(frame(kind, request, ack))
                 response, correlation, fields = read_frame(connection)
                 self.assertEqual((response, correlation), (20, request))
                 self.assertEqual(int.from_bytes(fields[28], "big"), 3)
