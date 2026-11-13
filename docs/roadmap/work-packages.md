@@ -69,6 +69,13 @@ terminal disposition; B-07 is the crash/oracle gate.
 
 **B-07 — Q1 crash/oracle gate** (depends B-05,R0-02). External acknowledged set versus recovered WAL after repeated SIGKILL at controlled barriers; memory and fsync p99. Proof: 0 acknowledged Q1 losses with intact disk and honest uncertain outcomes. SIGKILL != physical power cut.
 
+B-07 is executed by `scripts/test_q1_durability.py` with the append-only journal oracle in
+`scripts/q1_oracle.py` and its self-corruption fixtures. The matrix covers publication and
+ACK crash barriers, checkpoint append/sync, generation-claim fencing, sparse ACKs, all seven
+WAL fault points across segment rotation, corrupt/missing storage and Q0 isolation; raw
+journals, exact reconciliation and measurements live under `benchmarks/evidence/q1-durability-*`.
+The campaign found and fixed a sparse-offset codec defect in the B-05 replay path.
+
 ## C — Cluster ownership and Q2 quorum
 
 **C-01 — Inter-node RPC and snapshots** (depends A-01,A-02). Typed inter-node framing, bounded proxy hop, metadata snapshot version, node ID, cluster ID and owner epoch checks. Proof: stale map redirect, no uncontrolled forwarding loop.

@@ -160,11 +160,26 @@ impl Route {
             File::open(parent)?.sync_all()?;
         }
         File::open(&dir)?.sync_all()?;
-        let wal = rovqet_wal::Config {
+        let mut wal = rovqet_wal::Config {
             partition: options.partition,
             incarnation: options.incarnation,
             ..Default::default()
         };
+        #[cfg(feature = "fault-injection")]
+        {
+            if let Some(bytes) = std::env::var("ROVQET_Q1_TEST_SEGMENT_BYTES")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+            {
+                wal.max_segment_bytes = bytes;
+            }
+            if let Some(bytes) = std::env::var("ROVQET_Q1_TEST_RECORD_BYTES")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+            {
+                wal.max_record_bytes = bytes;
+            }
+        }
         let config = PartitionConfig {
             partition: options.partition,
             ownership_epoch: options.owner_epoch,
@@ -173,7 +188,7 @@ impl Route {
             max_outcomes: options.max_outcomes,
             max_producers: options.max_producers,
             dedup_window: options.dedup_window,
-            group: rovqet_durable::GroupConfig::default(),
+            group: group_config(),
         };
         #[cfg(feature = "fault-injection")]
         let partition = if let Some(control) = test_control()? {
@@ -292,7 +307,9 @@ impl Route {
                     message.message_id,
                     message.payload.clone(),
                 );
-                outbound.send_read(&record, batch.clone()).await?;
+                if let Err(error) = outbound.send_read(&record, batch.clone()).await {
+                    return Err(error);
+                }
             }
             let status = match batch.stop {
                 ReplayStop::Empty => ReadStatus::Empty,
@@ -301,12 +318,15 @@ impl Route {
                 ReplayStop::ByteLimit => ReadStatus::ByteLimit,
                 ReplayStop::WaitExpired => ReadStatus::WaitExpired,
             };
-            outbound
+            if let Err(error) = outbound
                 .send_read(
                     &replay::end(id, scope, batch.next.sequence, status),
                     batch.clone(),
                 )
-                .await?;
+                .await
+            {
+                return Err(error);
+            }
             Ok(None)
         })))
     }
@@ -760,6 +780,18 @@ pub fn validate_test_environment() -> io::Result<()> {
     }
     Ok(())
 }
+fn group_config() -> rovqet_durable::GroupConfig {
+    #[cfg_attr(not(feature = "fault-injection"), allow(unused_mut))]
+    let mut group = rovqet_durable::GroupConfig::default();
+    #[cfg(feature = "fault-injection")]
+    if let Some(value) = std::env::var("ROVQET_Q1_TEST_CHECKPOINT_AFTER")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+    {
+        group.checkpoint_after = value.max(1);
+    }
+    group
+}
 #[cfg(feature = "fault-injection")]
 fn test_control() -> io::Result<Option<rovqet_durable::TestControl>> {
     use rovqet_durable::{TestControl, TestStage};
@@ -772,6 +804,9 @@ fn test_control() -> io::Result<Option<rovqet_durable::TestControl>> {
         Some("before-append") => Some(TestStage::BeforeAppend),
         Some("after-append-before-sync") => Some(TestStage::AfterAppendBeforeSync),
         Some("after-sync-before-reply") => Some(TestStage::AfterSyncBeforeReply),
+        Some("checkpoint-after-append-before-sync") => {
+            Some(TestStage::CheckpointAfterAppendBeforeSync)
+        }
         _ => return Err(invalid("invalid Q1 test stage")),
     };
     let wal_fault = match std::env::var("ROVQET_Q1_TEST_WAL_FAULT").ok().as_deref() {

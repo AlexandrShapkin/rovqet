@@ -156,9 +156,8 @@ pub(crate) fn validate(frame: &Frame) -> Result<(), CodecError> {
             require(f::TENANT_ID)?;
             require(f::TOPIC_ID)?;
             require(f::MESSAGE_ID)?;
-            if u64::from_be_bytes(frame.field(f::OFFSET).unwrap().try_into().unwrap()) % 2 != 0 {
-                return Err(CodecError::InvalidFieldValue(f::OFFSET));
-            }
+            // Application message offsets are sparse and stable: durable consumer
+            // metadata interleaves WAL positions, so offsets need not be even.
         }
         FrameType::ReadEnd => {
             require(f::TENANT_ID)?;
@@ -166,8 +165,7 @@ pub(crate) fn validate(frame: &Frame) -> Result<(), CodecError> {
             require(f::READ_STATUS)?;
             require(f::HAS_MORE)?;
             let offset = u64::from_be_bytes(frame.field(f::OFFSET).unwrap().try_into().unwrap());
-            if offset % 2 != 0
-                || (frame.field(f::READ_STATUS) == Some(&[1][..]) && offset != 0)
+            if (frame.field(f::READ_STATUS) == Some(&[1][..]) && offset != 0)
                 || (matches!(frame.field(f::READ_STATUS), Some([2] | [3] | [4])) && offset == 0)
             {
                 return Err(CodecError::InvalidFieldValue(f::OFFSET));

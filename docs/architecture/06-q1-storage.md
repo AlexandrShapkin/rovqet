@@ -285,7 +285,9 @@ Application message offsets remain the stable WAL logical offsets of `MESSAGE` r
 consumer metadata is interleaved they become sparse: a MESSAGE is no longer guaranteed to sit
 at an even offset and consecutive messages are not an arithmetic sequence. Standalone replay
 therefore scans WAL positions, skips `PRODUCER_OUTCOME`/`CONSUMER_ACK`/`CURSOR_CHECKPOINT`
-records, and returns the next unread position as continuation. Cursor advancement likewise
+records, and returns the next unread position as continuation. That continuation may be odd:
+`READ_RECORD` and `READ_END` accept every in-range application position, and refusing odd
+positions would break replay as soon as consumer metadata is interleaved. Cursor advancement likewise
 walks the ordered list of application messages; it never derives the next message by
 incrementing a physical or logical offset.
 

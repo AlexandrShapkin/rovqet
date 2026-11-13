@@ -45,6 +45,10 @@ jobs:
         run: cargo build -p rovqet-server --features fault-injection --locked
       - name: Durable consumer TCP delivery, ACK and crash windows
         run: python3 scripts/test_q1_consumer.py
+      - name: Q1 oracle self-corruption fixtures
+        run: python3 scripts/test_q1_oracle.py
+      - name: Q1 independent durability and crash-recovery matrix
+        run: python3 scripts/test_q1_durability.py
       - name: Q1 TCP crash boundaries and Q0 isolation
         run: python3 scripts/test_q1_faults.py
       - name: Independent testkit fixtures and sampler tests

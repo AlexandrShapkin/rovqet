@@ -189,3 +189,21 @@ fn old_group_fetch_and_message_requirements_and_unknown_capability_stay_frozen()
         Err(CodecError::UnknownFrameType(126))
     ));
 }
+
+#[test]
+fn sparse_application_offsets_allow_odd_record_and_terminal_positions() {
+    // Consumer metadata occupies WAL positions, so the next application message and the
+    // replay continuation may be odd. Refusing them would break replay after ACK records.
+    let record = replay::record(1, scope(), 3, 100, b"event".to_vec());
+    let bytes = encode(&record, Limits::default()).unwrap();
+    assert_eq!(
+        decode_prefix(&bytes, Limits::default()).unwrap().unwrap().0,
+        record
+    );
+    let end = replay::end(1, scope(), 9, ReadStatus::End);
+    let bytes = encode(&end, Limits::default()).unwrap();
+    assert_eq!(
+        decode_prefix(&bytes, Limits::default()).unwrap().unwrap().0,
+        end
+    );
+}

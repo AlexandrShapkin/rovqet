@@ -217,7 +217,16 @@ completed SDK result. See [the consumer contract](docs/architecture/08-consumer-
 ```sh
 python3 scripts/test_q1_replay.py
 python3 scripts/test_q1_consumer.py   # needs the fault-injection broker build
+python3 scripts/test_q1_durability.py # B-07 oracle campaign, fault-injection build
+python3 scripts/test_q1_oracle.py     # oracle self-corruption fixtures
 ```
+
+The durability campaign journals externally acknowledged publications and consumer ACKs in a
+parent-owned, fsynced file, kills the broker at deterministic barriers, restarts on the same
+storage and reconciles exact identities, sparse cursor state, generation fencing and WAL
+rotation. Raw journals, per-run verdicts and measurements are preserved under
+`benchmarks/evidence/q1-durability-*/`; verdicts are PASS, FAIL, INVALID or NOT_RUN, and a
+truncated or incomplete journal can never pass.
 
 The Q1 restart smoke also reads all independently journaled ACKs through an external SDK
 process and verifies IDs, offsets and payload hashes after clean restart and SIGKILL.

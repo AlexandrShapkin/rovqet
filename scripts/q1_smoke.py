@@ -37,7 +37,8 @@ def q1_command(sequence=0, *, producer=11, epoch=0, message=None,
 class Broker:
     """A broker subprocess with bounded readiness/exit waits and complete cleanup."""
     def __init__(self, directory: Path, *, stage=None, fault=None, incarnation=42,
-                 configure=True, data_directory=None):
+                 configure=True, data_directory=None, checkpoint_after=None,
+                 segment_bytes=None, record_bytes=None, sequence=0):
         self.directory = directory
         self.wal = Path(data_directory) if data_directory else directory / "wal"
         self.controls = directory / "controls"
@@ -54,11 +55,17 @@ class Broker:
         env["TOKIO_WORKER_THREADS"] = "1"
         if stage or fault:
             env["ROVQET_Q1_TEST_DIR"] = str(self.controls)
-            env["ROVQET_Q1_TEST_SEQUENCE"] = "0"
+            env["ROVQET_Q1_TEST_SEQUENCE"] = str(sequence)
         if stage:
             env["ROVQET_Q1_TEST_STAGE"] = stage
         if fault:
             env["ROVQET_Q1_TEST_WAL_FAULT"] = fault
+        if checkpoint_after is not None:
+            env["ROVQET_Q1_TEST_CHECKPOINT_AFTER"] = str(checkpoint_after)
+        if segment_bytes is not None:
+            env["ROVQET_Q1_TEST_SEGMENT_BYTES"] = str(segment_bytes)
+        if record_bytes is not None:
+            env["ROVQET_Q1_TEST_RECORD_BYTES"] = str(record_bytes)
         command = [str(SERVER), "--listen", "127.0.0.1:0"]
         if configure:
             command += ["--q1-data-dir", str(self.wal), "--q1-topic", "durable",

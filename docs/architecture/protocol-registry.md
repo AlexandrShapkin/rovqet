@@ -195,7 +195,7 @@ log_incarnation, offset, max_messages:u32 (1–1024), max_bytes:u32 (78–419430
 Optional wait_ms:u32 (0–30000, default zero); principal_id/tenant_id are assertions
 checked against authenticated context, never authorization sources. Both topic forms
 must match the configured route when supplied together. No group/lease/ACK fields
-are legal. An odd/out-of-range offset or obsolete incarnation is REPLAY_NOT_AVAILABLE.
+are legal. An out-of-range offset or obsolete incarnation is REPLAY_NOT_AVAILABLE; an in-range position that holds durable metadata is skipped to the next application message.
 
 Each READ_RECORD echoes request_id and requires tenant_id, topic_id, partition_id,
 log_incarnation, original offset, qos=1, message_id; payload is the original committed

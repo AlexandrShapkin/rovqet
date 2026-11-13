@@ -499,7 +499,13 @@ impl State {
             _ => Err(Error::Corruption("unexpected consumer metadata")),
         }
     }
-    fn append_checkpoint(&mut self, payload: Vec<u8>) -> std::result::Result<(), GroupError> {
+    fn append_checkpoint(
+        &mut self,
+        payload: Vec<u8>,
+        trigger: Option<u64>,
+    ) -> std::result::Result<(), GroupError> {
+        #[cfg(not(feature = "fault-injection"))]
+        let _ = trigger;
         let record = Record {
             kind: RecordKind::CursorCheckpoint,
             logical_offset: self.next,
@@ -512,6 +518,11 @@ impl State {
             payload,
         };
         self.wal.append(record)?;
+        #[cfg(feature = "fault-injection")]
+        if let Some(offset) = trigger {
+            self.test_barrier(TestStage::CheckpointAfterAppendBeforeSync, offset)
+                .map_err(|_| GroupError::AckNotCommitted)?;
+        }
         self.wal.sync()?;
         self.next = self.next.checked_add(1).ok_or(GroupError::Capacity)?;
         self.committed
@@ -557,7 +568,7 @@ impl State {
             candidate.cursor,
             &candidate.acked,
         );
-        self.append_checkpoint(payload)?;
+        self.append_checkpoint(payload, Some(0))?;
         // Only after the fence is durable does the new generation hold authority.
         match self.groups.get_mut(&group_id) {
             Some(group) => {
@@ -882,7 +893,7 @@ impl State {
             // Compaction includes the sparse set, so no committed ACK is lost.
             let payload =
                 CursorCheckpoint::encode(r.group_id, group.generation, group.cursor, &group.acked);
-            let _ = self.append_checkpoint(payload);
+            let _ = self.append_checkpoint(payload, Some(offset));
             if let Some(group) = self.groups.get_mut(&r.group_id) {
                 group.ack_records = 0;
             }

@@ -62,3 +62,44 @@ Record CPU, memory RSS, kernel socket memory, NIC, disk writes/fsync, pending qu
 ## CI philosophy
 
 PR-free by default. On docs change: run doc checker and optionally diagram syntax check. On Rust change: formatting, cargo check and tests touching changed crate; on WAL/ACK/Raft: targeted crash/model tests. Do not run a 72-hour soak or generate release artifacts on every commit. Trigger large benchmark or compatibility suite only at corresponding milestone, manual dispatch or explicit performance-impacting change.
+
+## B-07 Q1 durability and crash-recovery campaign
+
+`scripts/test_q1_durability.py` executes the B gate with real external SDK processes. Each
+campaign has its own `scripts/q1_oracle.py` journal: append-only JSONL written and fsynced
+by the parent process outside the broker data directory before any deliberate termination.
+The journal records publication attempts and received `COMMITTED_LOCAL` results, delivery
+tokens, ACK attempts and received `ACK_COMMITTED` results, generation changes, faults and
+restart observations. Broker WAL files are only supplementary; the independent journal is
+authoritative for externally observed outcomes.
+
+Reconciliation compares exact identities, not counts: each externally acknowledged
+publication must be recovered with the same message ID, payload SHA-256, incarnation and
+offset; repeated producer tokens must not create a second committed record; a conflicting
+payload for a committed token must be rejected; sparse ACKs may not move the cursor past an
+unattempted or unacknowledged application record; acknowledged offsets must not be
+redelivered. A delivered record whose ACK reply was lost is classified as uncertain progress,
+never as a skip or a durability failure.
+
+Verdicts are `PASS`, `FAIL`, `INVALID`, `NOT_RUN`. Missing conclusions, truncated lines,
+non-contiguous journal sequence numbers or missing post-recovery observations are `INVALID`;
+an interrupted fixture can never yield a pass. `scripts/test_q1_oracle.py` feeds deliberately
+corrupted evidence (missing records, changed digests, duplicate publications, wrong
+offsets/incarnations, missing ACK state, cursor gaps, stale-generation commits, truncated
+journals) and requires rejection.
+
+The executed matrix covers publication crashes before append, after append/before sync and
+after sync/before reply; consumer ACK crashes at the same barriers plus cursor-checkpoint
+append/sync; generation-claim crash before the fence is durable; sparse out-of-order ACKs;
+generation replacement; all seven WAL fault points across segment rotation; corrupt and
+missing committed storage; Q0 isolation under a blocked Q1 storage barrier; and repeated
+restart identity stability. Measurements include end-to-end publication/ACK latency, direct
+WAL append/fsync latency, broker peak RSS and CPU jiffies, recovery readiness time and
+recovered record counts. Q1 internal queue, lease and sparse-set occupancy have no public
+metric endpoint and are reported `UNAVAILABLE`. Small samples are exploratory: p99.9 is
+reported with its sample count and is not a production SLO claim.
+
+A defect found by this campaign has been fixed: B-05 made application offsets sparse, but
+the major-1 codec still rejected odd `READ_RECORD`/`READ_END` offsets, so replay after
+interleaved consumer metadata returned `RESOURCE_EXHAUSTED`. The codec now accepts sparse
+positions; the golden vectors are unchanged and a protocol regression pinned the behavior.

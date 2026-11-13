@@ -12,6 +12,8 @@ pub enum TestStage {
     BeforeAppend,
     AfterAppendBeforeSync,
     AfterSyncBeforeReply,
+    /// Crash after a cursor-checkpoint record was appended but before it was synced.
+    CheckpointAfterAppendBeforeSync,
 }
 impl TestStage {
     pub fn as_str(self) -> &'static str {
@@ -19,6 +21,7 @@ impl TestStage {
             Self::BeforeAppend => "before-append",
             Self::AfterAppendBeforeSync => "after-append-before-sync",
             Self::AfterSyncBeforeReply => "after-sync-before-reply",
+            Self::CheckpointAfterAppendBeforeSync => "checkpoint-after-append-before-sync",
         }
     }
 }
