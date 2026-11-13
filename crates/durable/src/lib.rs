@@ -20,6 +20,13 @@ use std::{
 use tokio::sync::oneshot;
 
 const OUTCOME_BYTES: usize = 30;
+mod group;
+use group::{AckCommand, GroupFetchCommand, GroupState, MessageMeta};
+pub use group::{
+    AckRequest, AckResult, GROUP_BATCH_BYTES, GROUP_MESSAGE_BYTES, GroupConfig, GroupDelivery,
+    GroupError, GroupFetchBatch, GroupFetchRequest, GroupStop, MAX_GROUP_BYTES, MAX_GROUP_MESSAGES,
+    MAX_GROUP_WAIT, PendingAck, PendingGroupFetch,
+};
 mod replay;
 use replay::ReplayCommand;
 pub use replay::{
@@ -67,6 +74,7 @@ pub struct PartitionConfig {
     pub max_producers: usize,
     /// Minimum retained logical time; downtime and uncertain clock intervals do not count.
     pub dedup_window: Duration,
+    pub group: GroupConfig,
 }
 #[derive(Debug, Clone)]
 pub struct PublishRequest {
@@ -138,12 +146,15 @@ struct PublishCommand {
 enum Command {
     Publish(PublishCommand),
     Replay(ReplayCommand),
+    GroupFetch(GroupFetchCommand),
+    Ack(AckCommand),
 }
 /// One caller-owned handle; shared references may submit concurrently. No socket or Q0 dependencies.
 pub struct Partition {
     sender: Option<SyncSender<Command>>,
     worker: Option<JoinHandle<()>>,
     budget: Arc<Budget>,
+    committed: Arc<std::sync::atomic::AtomicU64>,
     config: PartitionConfig,
     max_record_bytes: usize,
 }
@@ -225,13 +236,21 @@ impl Partition {
         let path = path.as_ref().to_path_buf();
         let max_record_bytes = wal_config.max_record_bytes;
         let budget = Budget::new(config.queue_messages, config.queue_bytes);
+        let committed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let committed_worker = committed.clone();
         let (tx, rx) = mpsc::sync_channel::<Command>(config.queue_messages);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let actor_config = config.clone();
         let worker = thread::Builder::new()
             .name("rovqet-q1-partition".into())
             .spawn(move || {
-                let state = State::open_clock(&path, wal_config, actor_config, _options.clock);
+                let state = State::open_clock(
+                    &path,
+                    wal_config,
+                    actor_config,
+                    _options.clock,
+                    committed_worker,
+                );
                 match state {
                     Err(e) => {
                         let _ = ready_tx.send(Err(e));
@@ -245,10 +264,11 @@ impl Partition {
                             return;
                         }
                         let mut reads = Vec::new();
+                        let mut group_waits = Vec::new();
                         loop {
                             // Waiting reads never occupy the storage owner while idle. A short
                             // bounded poll also releases cancelled response reservations promptly.
-                            let command = if reads.is_empty() {
+                            let command = if reads.is_empty() && group_waits.is_empty() {
                                 rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected)
                             } else {
                                 rx.recv_timeout(Duration::from_millis(10))
@@ -261,13 +281,21 @@ impl Partition {
                                     let _ = command.reply.send(result);
                                 }
                                 Ok(Command::Replay(command)) => reads.push(command),
+                                Ok(Command::GroupFetch(command)) => group_waits.push(command),
+                                Ok(Command::Ack(command)) => {
+                                    let result = state.ack(command.request);
+                                    drop(command._reservation);
+                                    let _ = command.reply.send(result);
+                                }
                                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                                     state.complete_replays(&mut reads, true);
+                                    state.complete_group_fetches(&mut group_waits, true);
                                     break;
                                 }
                             }
                             state.complete_replays(&mut reads, false);
+                            state.complete_group_fetches(&mut group_waits, false);
                         }
                     }
                 }
@@ -278,6 +306,7 @@ impl Partition {
                 sender: Some(tx),
                 worker: Some(worker),
                 budget,
+                committed,
                 config,
                 max_record_bytes,
             }),
@@ -351,6 +380,10 @@ impl Partition {
     pub fn usage(&self) -> Usage {
         self.budget.usage()
     }
+    /// Number of durably committed WAL records (diagnostics; never a delivery cursor).
+    pub fn committed_records(&self) -> u64 {
+        self.committed.load(std::sync::atomic::Ordering::Acquire)
+    }
     /// Stop admission, drain accepted writes and join the worker. May block on filesystem IO.
     pub fn shutdown(mut self) -> Result<()> {
         drop(self.sender.take());
@@ -386,6 +419,12 @@ struct State {
     clock_sample: Option<u64>,
     logical_time: u64,
     producers: HashMap<(u128, u128), (u64, u64)>,
+    /// Application messages in WAL order. Offsets are sparse once ACK/checkpoint records
+    /// are interleaved, so they are never derived by incrementing a physical offset.
+    messages: Vec<MessageMeta>,
+    message_index: HashMap<u64, u128>,
+    groups: HashMap<u64, GroupState>,
+    committed: Arc<std::sync::atomic::AtomicU64>,
     next: u64,
     unhealthy: bool,
     #[cfg(feature = "fault-injection")]
@@ -394,13 +433,20 @@ struct State {
 impl State {
     #[cfg(test)]
     fn open(path: &Path, wal_config: WalConfig, config: PartitionConfig) -> Result<Self> {
-        Self::open_clock(path, wal_config, config, WorkerOptions::default().clock)
+        Self::open_clock(
+            path,
+            wal_config,
+            config,
+            WorkerOptions::default().clock,
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        )
     }
     fn open_clock(
         path: &Path,
         wal_config: WalConfig,
         config: PartitionConfig,
         clock: Arc<dyn Clock>,
+        committed: Arc<std::sync::atomic::AtomicU64>,
     ) -> Result<Self> {
         let wal = Wal::open(path, wal_config.clone()).map_err(Error::Storage)?;
         let mut s = Self {
@@ -412,6 +458,10 @@ impl State {
             clock,
             logical_time: 1,
             producers: HashMap::new(),
+            messages: Vec::new(),
+            message_index: HashMap::new(),
+            groups: HashMap::new(),
+            committed,
             next: 0,
             unhealthy: false,
             #[cfg(feature = "fault-injection")]
@@ -463,77 +513,117 @@ impl State {
             })
             .transpose()?
             .unwrap_or(0);
-        if count % 2 != 0 {
-            return Err(Error::Corruption("incomplete durable publication pair"));
-        }
-        while self.next < count {
-            let records = self
+        let mut offset = 0u64;
+        while offset < count {
+            let mut records = self
                 .wal
                 .read(
                     DurableOffset {
                         log_incarnation: self.wal_config.incarnation,
-                        sequence: self.next,
+                        sequence: offset,
                     },
-                    2,
-                    self.wal_config
-                        .max_record_bytes
-                        .checked_mul(2)
-                        .ok_or(Error::InvalidConfig)?,
+                    1,
+                    self.wal_config.max_record_bytes,
                 )
                 .map_err(Error::Storage)?;
-            if records.len() != 2 {
-                return Err(Error::Corruption("missing publication pair"));
+            if records.len() != 1 {
+                return Err(Error::Corruption("missing committed record"));
             }
-            let message = &records[0];
-            let outcome = &records[1];
-            if !replay::valid_pair(message, outcome) {
-                return Err(Error::Corruption("publication outcome binding"));
+            let record = records.pop().unwrap();
+            if record.logical_offset != offset {
+                return Err(Error::Corruption("logical offset gap"));
             }
-            let principal = u128::from_be_bytes(outcome.payload[6..22].try_into().unwrap());
-            let offset = message.logical_offset;
-            if message.owner_epoch > self.config.ownership_epoch {
-                return Err(Error::StaleOwner);
+            match record.kind {
+                RecordKind::Message => {
+                    if offset.checked_add(1).is_none_or(|next| next >= count) {
+                        return Err(Error::Corruption("incomplete publication pair"));
+                    }
+                    let mut pair = self
+                        .wal
+                        .read(
+                            DurableOffset {
+                                log_incarnation: self.wal_config.incarnation,
+                                sequence: offset + 1,
+                            },
+                            1,
+                            self.wal_config.max_record_bytes,
+                        )
+                        .map_err(Error::Storage)?;
+                    if pair.len() != 1 {
+                        return Err(Error::Corruption("missing publication pair"));
+                    }
+                    let outcome = pair.pop().unwrap();
+                    if !replay::valid_pair(&record, &outcome) {
+                        return Err(Error::Corruption("publication outcome binding"));
+                    }
+                    self.recover_publication(&record, &outcome)?;
+                    self.messages.push(MessageMeta {
+                        offset,
+                        message_id: record.message_id,
+                    });
+                    self.message_index.insert(offset, record.message_id);
+                    offset += 2;
+                }
+                RecordKind::ProducerOutcome => {
+                    return Err(Error::Corruption("orphan publication outcome"));
+                }
+                _ => {
+                    self.apply_group_record(&record)?;
+                    offset += 1;
+                }
             }
-            let token = Token {
-                principal,
-                producer: message.producer_id,
-                epoch: message.producer_epoch,
-                sequence: message.sequence,
-            };
-            self.validate_token(token)
-                .map_err(|_| Error::Corruption("producer history"))?;
-            if message.server_timestamp != 0 && message.server_timestamp < self.logical_time {
-                return Err(Error::Corruption("nonmonotonic producer timestamp"));
-            }
-            self.logical_time = self.logical_time.max(message.server_timestamp);
-            self.expire();
-            if !self.producers.contains_key(&(principal, token.producer))
-                && self.producers.len() >= self.config.max_producers
-            {
-                return Err(Error::Capacity);
-            }
-            if self.outcomes.len() >= self.config.max_outcomes {
-                return Err(Error::Capacity);
-            }
-            if self
-                .outcomes
-                .insert(token, (offset, message.server_timestamp))
-                .is_some()
-            {
-                return Err(Error::Corruption("duplicate outcome"));
-            }
-            self.producers.insert(
-                (principal, token.producer),
-                (
-                    token.epoch,
-                    token
-                        .sequence
-                        .checked_add(1)
-                        .ok_or(Error::Corruption("producer sequence overflow"))?,
-                ),
-            );
-            self.next += 2;
         }
+        self.next = count;
+        self.committed
+            .store(count, std::sync::atomic::Ordering::Release);
+        self.finalize_cursors();
+        Ok(())
+    }
+    /// Rebuilds producer/dedup state for one committed MESSAGE/PRODUCER_OUTCOME pair.
+    fn recover_publication(&mut self, message: &Record, outcome: &Record) -> Result<()> {
+        let principal = u128::from_be_bytes(outcome.payload[6..22].try_into().unwrap());
+        let offset = message.logical_offset;
+        if message.owner_epoch > self.config.ownership_epoch {
+            return Err(Error::StaleOwner);
+        }
+        let token = Token {
+            principal,
+            producer: message.producer_id,
+            epoch: message.producer_epoch,
+            sequence: message.sequence,
+        };
+        self.validate_token(token)
+            .map_err(|_| Error::Corruption("producer history"))?;
+        if message.server_timestamp != 0 && message.server_timestamp < self.logical_time {
+            return Err(Error::Corruption("nonmonotonic producer timestamp"));
+        }
+        self.logical_time = self.logical_time.max(message.server_timestamp);
+        self.expire();
+        if !self.producers.contains_key(&(principal, token.producer))
+            && self.producers.len() >= self.config.max_producers
+        {
+            return Err(Error::Capacity);
+        }
+        if self.outcomes.len() >= self.config.max_outcomes {
+            return Err(Error::Capacity);
+        }
+        if self
+            .outcomes
+            .insert(token, (offset, message.server_timestamp))
+            .is_some()
+        {
+            return Err(Error::Corruption("duplicate outcome"));
+        }
+        self.producers.insert(
+            (principal, token.producer),
+            (
+                token.epoch,
+                token
+                    .sequence
+                    .checked_add(1)
+                    .ok_or(Error::Corruption("producer sequence overflow"))?,
+            ),
+        );
         Ok(())
     }
     fn validate_token(&self, t: Token) -> Result<()> {
@@ -710,6 +800,9 @@ impl State {
             (token.principal, token.producer),
             (token.epoch, token.sequence + 1),
         );
+        self.note_message(offset, r.message_id);
+        self.committed
+            .store(self.next, std::sync::atomic::Ordering::Release);
         Ok(PublishOutcome::CommittedLocal(DurableOffset {
             log_incarnation: self.wal_config.incarnation,
             sequence: offset,
@@ -750,6 +843,7 @@ mod tests {
             max_outcomes: 32,
             max_producers: 32,
             dedup_window: Duration::from_secs(86400),
+            group: GroupConfig::default(),
         };
         (w, p)
     }
@@ -819,6 +913,7 @@ mod tests {
             sender: Some(tx),
             worker: None,
             budget: budget.clone(),
+            committed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             config: p,
             max_record_bytes: 1024,
         };
@@ -846,6 +941,7 @@ mod tests {
             sender: Some(tx),
             worker: None,
             budget: Budget::new(2, 256),
+            committed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             config,
             max_record_bytes: 1024,
         };

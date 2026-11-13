@@ -1,5 +1,6 @@
 //! Read-only committed history; group delivery and consumer acknowledgement are separate.
 use super::*;
+use rovqet_wal::RecordKind;
 
 pub const MAX_REPLAY_MESSAGES: usize = 1024;
 pub const MAX_REPLAY_BYTES: usize = 4 * 1024 * 1024;
@@ -11,8 +12,9 @@ pub const REPLAY_MESSAGE_BYTES: usize = 128;
 #[derive(Debug, Clone)]
 pub struct ReplayRequest {
     pub partition: PartitionRef,
-    /// MESSAGE WAL offsets are even; the following PRODUCER_OUTCOME consumes the odd offset.
-    /// The returned next offset is the only supported continuation (no contiguous-message fiction).
+    /// WAL position to start scanning from. Positions may contain consumer metadata records;
+    /// they are skipped, so continuation is the next unread WAL position, not an arithmetic
+    /// message step. Application message offsets are sparse and stable.
     pub from: DurableOffset,
     pub max_messages: usize,
     pub max_bytes: usize,
@@ -246,7 +248,7 @@ impl State {
         if r.from.log_incarnation != self.wal_config.incarnation {
             return Err(ReplayError::IncarnationMismatch);
         }
-        if r.from.sequence > self.next || r.from.sequence % 2 != 0 {
+        if r.from.sequence > self.next {
             return Err(ReplayError::ReplayNotAvailable);
         }
         let mut cursor = r.from.sequence;
@@ -260,29 +262,60 @@ impl State {
         };
         let mut messages = Vec::with_capacity(capacity);
         while cursor < self.next && messages.len() < r.max_messages {
-            let records = self
+            let mut records = self
                 .wal
                 .read(
                     DurableOffset {
                         log_incarnation: r.from.log_incarnation,
                         sequence: cursor,
                     },
-                    2,
-                    self.wal_config
-                        .max_record_bytes
-                        .checked_mul(2)
-                        .ok_or(ReplayError::InvalidLimits)?,
+                    1,
+                    self.wal_config.max_record_bytes,
                 )
                 .map_err(|e| {
                     self.unhealthy = true;
                     ReplayError::Storage(e)
                 })?;
-            if records.len() != 2 || !valid_pair(&records[0], &records[1]) {
+            if records.len() != 1 {
+                self.unhealthy = true;
+                return Err(ReplayError::Corruption("missing committed record"));
+            }
+            let record = records.pop().unwrap();
+            if record.kind != RecordKind::Message {
+                match record.kind {
+                    RecordKind::ProducerOutcome
+                    | RecordKind::ConsumerAck
+                    | RecordKind::CursorCheckpoint => {
+                        // Durable metadata (including a publication outcome reached by a
+                        // continuation) is not an application message.
+                        cursor += 1;
+                        continue;
+                    }
+                    _ => {
+                        self.unhealthy = true;
+                        return Err(ReplayError::Corruption("unexpected committed record"));
+                    }
+                }
+            }
+            let mut pair = self
+                .wal
+                .read(
+                    DurableOffset {
+                        log_incarnation: r.from.log_incarnation,
+                        sequence: cursor + 1,
+                    },
+                    1,
+                    self.wal_config.max_record_bytes,
+                )
+                .map_err(|e| {
+                    self.unhealthy = true;
+                    ReplayError::Storage(e)
+                })?;
+            if pair.len() != 1 || !valid_pair(&record, &pair[0]) {
                 self.unhealthy = true;
                 return Err(ReplayError::Corruption("committed replay pair"));
             }
-            let mut records = records.into_iter();
-            let message = records.next().unwrap();
+            let message = record;
             let required = match sizing.record {
                 Some(size) => size(message.payload.len()),
                 None => REPLAY_MESSAGE_BYTES.checked_add(message.payload.len()),

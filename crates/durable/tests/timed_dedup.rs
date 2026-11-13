@@ -49,6 +49,7 @@ impl Fixture {
             max_outcomes: outcomes,
             max_producers: producers,
             dedup_window: Duration::from_millis(100),
+            group: rovqet_durable::GroupConfig::default(),
         };
         let clock = Arc::new(Time::default());
         let actor = Some(

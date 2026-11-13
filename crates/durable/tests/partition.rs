@@ -113,6 +113,7 @@ fn actor_config() -> PartitionConfig {
         max_outcomes: 64,
         max_producers: 100_000,
         dedup_window: std::time::Duration::from_secs(86400),
+        group: rovqet_durable::GroupConfig::default(),
     }
 }
 fn request(sequence: u64) -> PublishRequest {
@@ -536,10 +537,12 @@ fn replay_empty_history_invalid_offsets_incarnation_partition_and_limits_are_typ
         assert!(matches!(p.try_replay(r), Err(ReplayError::InvalidLimits)));
     }
     publish(&p, request(0)).unwrap();
-    assert!(matches!(
-        p.try_replay(replay_request(1)).unwrap().wait(),
-        Err(ReplayError::ReplayNotAvailable)
-    ));
+    // Position 1 holds the producer outcome, not an application message. Standalone replay
+    // skips durable metadata and reports the append watermark as continuation.
+    let batch = p.try_replay(replay_request(1)).unwrap().wait().unwrap();
+    assert!(batch.messages.is_empty());
+    assert_eq!(batch.next.sequence, 2);
+    assert!(batch.end_of_available_history);
 }
 #[test]
 fn replay_byte_limits_are_exact_and_oversize_first_message_is_not_a_false_empty_end() {
