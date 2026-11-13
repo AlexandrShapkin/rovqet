@@ -586,6 +586,26 @@
         "resource_and_authority": "AUTH-derived dev principal and configured tenant/topic/Q1 route authorize reads. Wrong asserted authority denied; wrong partition/incarnation/range explicit REPLAY_NOT_AVAILABLE. Existing actor ownership/index retained; encoded sizing only refines the read seam. Actor reservations cover immutable snapshot, encoding scratch, waiting/queued/active responses and one-slot socket reply completion. Q0 queues/credits/control reserve remain separate.70 cancelled long-poll sessions release actor quota; cancellation of a queued write retains the guard until write release.",
         "crash_recovery": "External SDK replay reconciles4 independently journaled successful ACKs (message IDs, offsets, SHA-256 payloads) after clean restart and SIGKILL. Existing pre/post-fsync fault recovery remains intact. New real-TCP barrier fixture proves no READ_RECORD or terminal response before an unsynced publication commits. Corrupt/missing committed segments return storage failure without successful partial batches; lost-history startup never initializes/reset history. Sparse MESSAGE offsets0,2,4,... exclude internal outcomes.",
         "limitations": "Trusted loopback/static dev identity and one configured Q1 route; no production TLS/ACL service, consumer groups/leases/ACK/cursors, retention deletion, Q2 or physical power-loss certification.4MiB is a wire ceiling, not reserved availability: aggregate partition quotas may reject smaller requests. Serial batches; unread pipelined input can defer EOF detection until bounded wait ends. Filesystem IO is non-preemptible. Fresh incarnation allocation remains configuration authority responsibility.",
+        "followup": {
+          "commit": "15185eb99e47a13e2898a3b768d1a816b573fde2",
+          "verification": "PASS: bounded-wait expiry at a nonzero committed end returns WAIT_EXPIRED with the requested offset unchanged as continuation. The registry text previously claimed a zero continuation, which only holds for a request starting at offset zero; it now states the actual rule and the existing real-TCP wait-expiry test asserts empty records, continuation equal to the request offset, has_more false and end_of_current_history true.",
+          "test_command": [
+            "cargo fmt --all -- --check",
+            "cargo check --workspace --locked",
+            "cargo test -p rovqet-server --locked",
+            "cargo test --workspace --locked",
+            "python3 scripts/check_docs.py",
+            "python3 scripts/q0_smoke.py",
+            "python3 scripts/q1_smoke.py --check-hooks-disabled",
+            "python3 scripts/test_q1_replay.py",
+            "cargo test -p rovqet-durable --features fault-injection --locked",
+            "cargo build -p rovqet-server --features fault-injection --locked",
+            "python3 scripts/test_q1_faults.py",
+            "git diff --check"
+          ],
+          "observed_result": "170 workspace tests (19 protocol,31 WAL,35 default durable,11 server,13 transport,18 SDK);37 fault-enabled durable tests;8 standalone TCP replay fixtures;20 TCP/process fault tests;Q0 and Q1 process smokes, documentation and formatting pass. The added fixture publishes six 16KiB messages, reads one READ_RECORD over raw TCP, closes the socket before READ_END, then proves a fresh SDK replay returns all six original payloads at sparse offsets 0,2,4,6,8,10 with END and an unchanged MANIFEST.",
+          "limitations": "Same prototype limits as the parent evidence: loopback static identity, one configured Q1 route, no consumer-group leases/cursors and no physical power-loss certification. The disconnect fixture proves no completed batch and intact replayable history, not a hard OS-level cancellation latency bound."
+        },
         "next_unblocked": [
           "B-05"
         ]
