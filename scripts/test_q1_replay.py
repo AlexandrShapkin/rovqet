@@ -83,6 +83,27 @@ class StandaloneReplay(unittest.TestCase):
         committed(self.broker.publish(1), 2)
         completed(sdk(self.broker), offsets=[0, 2], next_offset=4, more=0, status=2)
 
+    def test_disconnect_mid_batch_never_completes_and_history_stays_replayable(self):
+        payload = "x" * 16384
+        for sequence in range(6):
+            committed(self.broker.publish(sequence, payload=payload), sequence * 2)
+        manifest = (self.broker.wal / "MANIFEST").read_bytes()
+        with connect(self.broker) as connection:
+            connection.sendall(frame(23, 400, fields(count=6, size=262144)))
+            kind, request, record = read_frame(connection)
+            self.assertEqual((kind, request), (24, 400))
+            self.assertEqual(int.from_bytes(record[21], "big"), 0)
+        # Closing before READ_END abandons the batch; it never becomes a success result.
+        result = sdk(self.broker, count=6, size=262144)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = [line.split() for line in result.stdout.splitlines()]
+        self.assertEqual([int(line[2]) for line in lines[:-1]], [0, 2, 4, 6, 8, 10])
+        for line in lines[:-1]:
+            self.assertEqual(line[0], "READ_RECORD")
+            self.assertEqual(bytes.fromhex(line[4]), payload.encode())
+        self.assertEqual(lines[-1][:5], ["READ_END", "42", "12", "0", "2"])
+        self.assertEqual((self.broker.wal / "MANIFEST").read_bytes(), manifest)
+
     def test_large_record_uses_lossless_bounded_reply_path_not_control_queue(self):
         payload = "x" * 8192
         committed(self.broker.publish(payload=payload), 0)

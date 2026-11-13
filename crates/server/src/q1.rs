@@ -1004,11 +1004,14 @@ mod tests {
         assert_eq!(batch.records.len(), 1);
         assert_eq!(batch.status, ReadStatus::End);
         let mut reader = server.client().await;
-        let timeout = reader
-            .read_q1("durable", server.options(2, 8, 2048, 1))
-            .await
-            .unwrap();
+        // Expiry at a nonzero committed end keeps the requested offset as continuation.
+        let expiry = server.options(2, 8, 2048, 1);
+        let timeout = reader.read_q1("durable", expiry.clone()).await.unwrap();
         assert_eq!(timeout.status, ReadStatus::WaitExpired);
+        assert!(timeout.records.is_empty());
+        assert_eq!(timeout.next, expiry.from);
+        assert!(!timeout.has_more);
+        assert!(timeout.end_of_current_history);
         let mut wrong = server.options(0, 8, 2048, 0);
         wrong.partition.tenant_id = 2;
         assert!(matches!(

@@ -204,10 +204,12 @@ read_status and has_more. It has no payload. Status values are 1 EMPTY (offset z
 no history), 2 END (current committed end), 3 COUNT_LIMIT, 4 BYTE_LIMIT, 5 WAIT_EXPIRED
 (no record became available before a requested bounded wait ended). has_more is one
 exactly for statuses 3/4 and zero otherwise. Empty/end without wait completes immediately;
-nonzero wait at current end completes on new commit or expires boundedly. Empty at
-wait expiry has status 5 and continuation zero. End has precedence over count/byte
-limits when the same snapshot is fully exhausted; count takes precedence over byte when
-both limits are reached. A nonempty batch never has status 5.
+nonzero wait at current end completes on new commit or expires boundedly. A bounded wait
+that expires before any record becomes available returns status 5 with the requested
+offset unchanged as continuation, so the continuation is zero only when the request
+started at offset zero. End has precedence over count/byte limits when the same snapshot
+is fully exhausted; count takes precedence over byte when both limits are reached. A
+nonempty batch never has status 5.
 
 Offsets remain sparse MESSAGE indexes 0,2,4,...; continuation is the last returned
 MESSAGE offset plus two, or unchanged for an empty batch. Only READ_END makes a batch
