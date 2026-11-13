@@ -688,13 +688,63 @@
       "depends_on": [
         "B-05"
       ],
-      "status": "TODO",
+      "status": "DONE",
       "architecture": "08",
-      "proof": "Crash between DLQ and source terminal marker leaves no skip",
+      "proof": "Crash between DLQ commit and source terminal record leaves no cursor skip and no duplicate DLQ message",
       "paths": [
-        "crates/durable/"
+        "crates/durable/src/terminal.rs",
+        "crates/durable/src/group.rs",
+        "crates/durable/tests/terminal.rs",
+        "crates/server/src/q1.rs",
+        "crates/sdk/examples/nack_q1.rs",
+        "crates/sdk/src/group.rs",
+        "crates/protocol/tests/nack_result.rs",
+        "scripts/test_q1_terminal.py",
+        "scripts/q1_oracle.py"
       ],
-      "evidence": null
+      "evidence": {
+        "commit": "ef1b57b52036ae7bd4e94f79f5930bbcba073688",
+        "verification": "PASS: real external consumers NACK Q1 deliveries; bounded retry, quarantine, durable terminal disposition and a real replayable Q1 DLQ were exercised over TCP with independent journals and six deliberate broker kills across the PENDING/DLQ/terminal ordering.",
+        "test_command": [
+          "cargo fmt --all -- --check",
+          "cargo check --workspace --locked",
+          "cargo test -p rovqet-protocol --locked",
+          "cargo test -p rovqet-wal --locked",
+          "cargo test -p rovqet-durable --locked",
+          "cargo test -p rovqet-testkit --locked",
+          "cargo test --workspace --locked",
+          "cargo test -p rovqet-durable --features fault-injection --locked",
+          "python3 scripts/check_docs.py",
+          "python3 scripts/test_q1_oracle.py",
+          "python3 scripts/q0_smoke.py",
+          "python3 scripts/q1_smoke.py --check-hooks-disabled",
+          "python3 scripts/test_q1_replay.py",
+          "python3 scripts/test_q1_consumer.py",
+          "python3 scripts/test_q1_faults.py",
+          "python3 scripts/test_q1_durability.py",
+          "python3 scripts/test_q1_terminal.py",
+          "git diff --check"
+        ],
+        "observed_result": "200 workspace tests, 24 protocol, 31 WAL, 57 default durable (7 terminal), 59 fault-enabled durable, 16 testkit, 13 server and 19 SDK tests pass. 28 oracle self-corruption, 12 NACK/terminal, 9 B-07 durability, 8 replay, 6 consumer and 20 process-fault fixtures pass. Q0/Q1 smokes, documentation and formatting pass.",
+        "wire_contract": "Additive CONSUMER_NACK_RESULT=27 with field NACK_OUTCOME=51; existing CONSUMER_NACK fields and all prior IDs/encodings unchanged. Outcomes are RETRY_SCHEDULED(1, retry_after_ms), RETRY_EXHAUSTED(2), TERMINAL_COMMITTED(3), TERMINAL_PENDING(4) and ALREADY_CLOSED(5), each with disposition identity where applicable. ACK_COMMITTED is never reused for NACK acceptance. Golden vector nack-v1 pins the frame; negative tests reject outcome 0, missing retry delay and missing disposition.",
+        "retry_semantics": "NACK validates principal, tenant/group/topic/partition, incarnation, offset, ownership epoch, generation, lease and attempt. It never acknowledges processing or advances the cursor. Backoff is initial delay doubled per attempt, capped by retry_max; max_attempts is configurable. Repeated NACK of the same attempt is idempotent. Lease expiry/disconnect make a record eligible for redelivery; generation replacement fences old leases. Retry/attempt state is durable in RETRY(7) records. Exhaustion without a terminal policy persists and leaves the message incomplete.",
+        "terminal_semantics": "Terminal disposition is PENDING then COMMITTED in the same Q1 WAL using TERMINAL_DISPOSITION(4) with an RQTD v1 payload. Only a committed disposition enters the sparse completed set and may advance the contiguous cursor. Quarantine keeps the source publication and closes only its offset. Disposition IDs are deterministic from group/incarnation/offset. Corrupt or inconsistent committed terminal metadata fails recovery closed.",
+        "dlq_ordering": "The DLQ is a separate explicitly configured local Q1 partition with its own directory, incarnation, WAL and manifest. Ordering is PENDING source record, DLQ Q1 publication with stable disposition identity, verified destination commit, COMMITTED source record, cursor closure. The DLQ payload is RQDL v1 preserving original bytes and message identity and is readable via READ_FETCH. Publication is idempotent per disposition; a duplicate terminal token returns ALREADY_CLOSED without another DLQ message. DLQ unavailability reports DLQ_UNAVAILABLE and leaves the cursor unchanged.",
+        "crash_recovery": "Six deliberate kills cover PENDING append/before sync, PENDING after sync, DLQ committed/before source terminal, committed terminal append/before sync, committed terminal after sync/before reply, and quarantine pending/before sync. Recovery reconciles durable PENDING records, republishes or verifies the DLQ message, completes the source terminal only after its own barrier, and re-verifies committed DLQ proofs at startup. Every crash window converged with exactly one DLQ record, retained source data, no duplicate publication and no cursor skip; before-fsync quarantine left the source incomplete and redeliverable.",
+        "oracle": "q1_oracle.reconcile_terminal rejects terminal DLQ without prior publication, missing/duplicate destination, payload digest mismatch, terminal for an uncommitted source offset, unexplained cursor movement, stale-generation mutation and incomplete journals. 8 new corruption fixtures plus the existing 20 pass.",
+        "defect": "Fixed a real regression: standalone replay skipped ACK/checkpoint metadata but not RETRY/TERMINAL_DISPOSITION, so replay after terminal disposition poisoned the actor and returned STORAGE_UNAVAILABLE. The skip set now includes all internal metadata; the TCP test asserts source replay after terminal closure.",
+        "artifacts": [
+          "benchmarks/evidence/q1-terminal-ef1b57b/REPORT.md",
+          "benchmarks/evidence/q1-terminal-ef1b57b/matrix.json",
+          "benchmarks/evidence/q1-terminal-ef1b57b/source-index.json",
+          "benchmarks/evidence/q1-terminal-ef1b57b/journals/"
+        ],
+        "limitations": "Single-node local Q1 source and one local DLQ partition; no distributed atomic transaction, Q2/Raft, rebalance, retention or admin redrive. SIGKILL on intact ext4 is process-crash recovery, not physical power loss. Retry eligibility is not wall-clock preserved across restart (pending retries become immediately eligible), and attempts for crashes before a retry record may be replayed; this can cause more retries, never premature closure. EXTEND_LEASE and SEEK remain unsupported. At-least-once delivery is verified, not exactly-once execution.",
+        "next_unblocked": [
+          "C-01"
+        ],
+        "next_note": "B-06 completes Q1 terminal disposition. The next roadmap work is C-01 (inter-node routing/snapshots), followed by C-02/C-03; Q2 remains unimplemented."
+      }
     },
     {
       "id": "B-07",
