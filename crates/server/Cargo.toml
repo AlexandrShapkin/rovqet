@@ -23,6 +23,7 @@ rovqet-wal = { path = "../wal" }
 fs2 = "0.4.3"
 sha2 = "0.10"
 serde_json = "1"
+serde = { version = "1", features = ["derive"] }
 
 [features]
 fault-injection = ["rovqet-durable/fault-injection"]

@@ -4,7 +4,7 @@
 //! it transfers the committed history, fences itself durably, transfers the final delta
 //! and only then asks the metadata group to commit the activation. The committed metadata
 //! is the only authority: a local timer never advances a stage.
-use crate::transfer::sha256;
+use crate::transfer::{bytes_to_hex, hex_to_bytes, sha256};
 use rovqet_control::TimeoutBudget;
 use rovqet_control::ids::NodeId;
 use rovqet_control::rpc::{
@@ -593,4 +593,175 @@ pub async fn run_coordinator(
             return;
         }
     }
+}
+
+/// The storage lifecycle of a successor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivationState {
+    /// The transferred bytes are staged and not yet verified.
+    Staging,
+    /// The inventory was verified by the target.
+    Verified,
+    /// The old owner confirmed its durable fence.
+    FenceConfirmed,
+    /// The metadata group committed the activation.
+    ActivationCommitted,
+    /// The verified storage was published into the partition directory.
+    Promoted,
+    /// The route is open and the committed authority is installed.
+    Active,
+}
+
+/// Opens the Q1 route of this node as soon as the committed metadata allows it.
+///
+/// A node without a committed placement stays inactive. A successor of a migration waits
+/// for the committed activation, promotes the verified inventory and only then opens the
+/// transferred history: an empty log is never a substitute for the transferred history.
+pub async fn run_activator(
+    cluster: std::sync::Arc<crate::cluster::Cluster>,
+    raft: std::sync::Arc<MetadataNode>,
+    route_slot: std::sync::Arc<crate::q1::RouteSlot>,
+    options: crate::q1::Options,
+    node: u64,
+    staging_root: Option<std::path::PathBuf>,
+) {
+    let mut updates = raft.committed_updates();
+    loop {
+        {
+            let state = raft.applied_state();
+            let Some(placement) = state.placement(
+                options.partition.tenant_id,
+                options.partition.topic_id,
+                options.partition.partition_id,
+            ) else {
+                // No committed placement: this node stays inactive.
+                if updates.changed().await.is_err() {
+                    return;
+                }
+                continue;
+            };
+            if placement.owner != node {
+                if updates.changed().await.is_err() {
+                    return;
+                }
+                continue;
+            }
+            // A committed migration that targets this node decides how the storage is
+            // obtained.
+            let migration = state
+                .migrations
+                .values()
+                .find(|record| {
+                    record.target_node == node
+                        && record.tenant_id == options.partition.tenant_id
+                        && record.topic_id == options.partition.topic_id
+                        && record.partition_id == options.partition.partition_id
+                })
+                .cloned();
+            let mut route_options = options.clone();
+            route_options.owner_epoch = placement.ownership_epoch;
+            // A successor must never initialize an empty log as a substitute for the
+            // transferred history: it opens the promoted storage instead.
+            route_options.initialize_new_log = options.initialize_new_log && migration.is_none();
+            if let Some(record) = &migration {
+                // The activation must be committed and the successor must be the target.
+                if record.stage != MigrationStage::ActivateNew {
+                    if updates.changed().await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                // The dependent partitions must be available: a terminal disposition that
+                // references a DLQ record needs a recoverable destination.
+                if !dependencies_available(&route_options, record) {
+                    eprintln!(
+                        "the dependent history of the migration is not available locally; \
+                         the successor stays inactive"
+                    );
+                    if updates.changed().await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                // The transferred storage is promoted before the route is opened.
+                let Some(staging_root) = staging_root.clone() else {
+                    if updates.changed().await.is_err() {
+                        return;
+                    }
+                    continue;
+                };
+                let inventory = hex_to_bytes(record.manifest_id.as_deref().unwrap_or_default());
+                let staging =
+                    crate::promotion::staging_area(&staging_root, record.migration_id, &inventory);
+                let plan = crate::promotion::PromotionRecord {
+                    migration_id: record.migration_id,
+                    inventory_digest: bytes_to_hex(&inventory),
+                    incarnation: record.source_incarnation,
+                    tenant_id: options.partition.tenant_id,
+                    topic_id: options.partition.topic_id,
+                    partition_id: options.partition.partition_id,
+                    target_epoch: placement.ownership_epoch,
+                    activation_revision: state.revision,
+                    files: Vec::new(),
+                    state: crate::promotion::PromotionState::Promoted,
+                };
+                if let Err(error) = crate::promotion::promote_with_manifest(
+                    &staging,
+                    &route_options.directory,
+                    &plan,
+                ) {
+                    eprintln!("the promoted storage was refused: {error}");
+                    if updates.changed().await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                // The transferred history keeps its incarnation.
+                route_options.incarnation = record.source_incarnation;
+            }
+            let partition = route_options.partition;
+            match crate::q1::Route::open(route_options) {
+                Ok(route) => {
+                    let route = std::sync::Arc::new(route);
+                    if let Some(authority) = cluster.authority_for(&partition) {
+                        route.install_authority(Some(authority));
+                    }
+                    route_slot.install(route);
+                    return;
+                }
+                Err(error) => {
+                    // A failed reopen leaves the node inactive and reports the error.
+                    eprintln!("the Q1 route stays inactive: {error}");
+                    if updates.changed().await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
+            }
+        }
+    }
+}
+
+/// True when every dependent partition of the migration is available locally.
+///
+/// A dependency is only satisfied by storage that exists and can be recovered: the
+/// existence of the dependency field is never proof of durability.
+pub fn dependencies_available(
+    options: &crate::q1::Options,
+    record: &rovqet_metadata_raft::sm::MigrationState,
+) -> bool {
+    record.dependent_partitions.iter().all(|dependency| {
+        let Some(dlq) = &options.dlq else {
+            return false;
+        };
+        if dependency.tenant_id != dlq.partition.tenant_id
+            || dependency.topic_id != dlq.partition.topic_id
+            || dependency.partition_id != dlq.partition.partition_id
+        {
+            return false;
+        }
+        std::fs::canonicalize(&dlq.directory)
+            .map(|path| path.join("MANIFEST").is_file())
+            .unwrap_or(false)
+    })
 }

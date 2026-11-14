@@ -301,6 +301,37 @@ struct ReadTarget {
     partition: PartitionRef,
     incarnation: u128,
 }
+/// The Q1 route of this process.
+///
+/// A broker that receives a transferred history opens its route only after the promoted
+/// storage is validated, so the handle is replaced at runtime. Readers take a cheap read
+/// lock and the route itself stays an `Arc` that the sessions share.
+#[derive(Clone, Default)]
+pub struct RouteSlot {
+    inner: Arc<std::sync::RwLock<Option<Arc<Route>>>>,
+}
+impl RouteSlot {
+    /// Creates a slot that holds an already opened route.
+    pub fn new(route: Option<Arc<Route>>) -> Self {
+        Self {
+            inner: Arc::new(std::sync::RwLock::new(route)),
+        }
+    }
+    /// The current route, if the partition is active on this node.
+    pub fn current(&self) -> Option<Arc<Route>> {
+        self.inner.read().ok().and_then(|guard| guard.clone())
+    }
+    /// Publishes the route. The previous route is released by its last holder.
+    pub fn install(&self, route: Arc<Route>) {
+        if let Ok(mut guard) = self.inner.write() {
+            *guard = Some(route);
+        }
+    }
+    /// Removes the route and returns it, so that its owner can shut it down.
+    pub fn take(&self) -> Option<Arc<Route>> {
+        self.inner.write().ok().and_then(|mut guard| guard.take())
+    }
+}
 pub struct Route {
     partition: Partition,
     pub(crate) options: Options,
@@ -1223,13 +1254,13 @@ fn map_error(error: DurableError) -> ErrorCode {
 
 pub struct Dispatch {
     pub broker: Arc<Broker>,
-    pub route: Option<Arc<Route>>,
+    pub route: RouteSlot,
     /// Cluster mode is opt-in and never changes single-node behaviour.
     pub cluster: Option<Arc<crate::cluster::Cluster>>,
     draining: AtomicBool,
 }
 impl Dispatch {
-    pub fn new(broker: Arc<Broker>, route: Option<Arc<Route>>) -> Self {
+    pub fn new(broker: Arc<Broker>, route: RouteSlot) -> Self {
         Self {
             broker,
             route,
@@ -1240,7 +1271,7 @@ impl Dispatch {
     /// Cluster mode adds owner-aware routing on top of the unchanged single-node behaviour.
     pub fn with_cluster(
         broker: Arc<Broker>,
-        route: Option<Arc<Route>>,
+        route: RouteSlot,
         cluster: Arc<crate::cluster::Cluster>,
     ) -> Self {
         Self {
@@ -1342,7 +1373,7 @@ impl SessionHandler for Dispatch {
             if self.draining.load(Ordering::Acquire) {
                 return SessionReply::Immediate(Err(ErrorCode::ServerDraining));
             }
-            return match &self.route {
+            return match self.route.current() {
                 Some(route) => route
                     .read(principal, frame, outbound)
                     .unwrap_or_else(|e| SessionReply::Immediate(Err(e))),
@@ -1356,7 +1387,7 @@ impl SessionHandler for Dispatch {
             if self.draining.load(Ordering::Acquire) {
                 return SessionReply::Immediate(Err(ErrorCode::ServerDraining));
             }
-            let Some(route) = &self.route else {
+            let Some(route) = self.route.current() else {
                 return SessionReply::Immediate(Err(ErrorCode::UnsupportedGuarantee));
             };
             let result = match frame.frame_type {
@@ -1377,10 +1408,10 @@ impl SessionHandler for Dispatch {
             let topic = frame
                 .field(f::TOPIC_NAME)
                 .and_then(|b| std::str::from_utf8(b).ok());
-            if let Some(route) = &self.route {
+            if let Some(route) = self.route.current() {
                 if topic == Some(&route.options.topic) {
                     if let Some(cluster) = &self.cluster {
-                        if let Some(reply) = self.forward_publish(cluster, route, &frame) {
+                        if let Some(reply) = self.forward_publish(cluster, &route, &frame) {
                             return reply;
                         }
                     }
@@ -1768,7 +1799,7 @@ mod tests {
                 Default::default(),
                 Arc::new(Dispatch::new(
                     crate::development_broker(1024),
-                    Some(route.clone()),
+                    RouteSlot::new(Some(route.clone())),
                 )),
                 async {
                     let _ = closed.await;

@@ -1327,6 +1327,7 @@ dependencies = [
  "rovqet-sdk",
  "rovqet-transport",
  "rovqet-wal",
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",

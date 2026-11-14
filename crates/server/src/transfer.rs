@@ -124,7 +124,7 @@ impl TransferStaging {
                 "files": request.files.iter().map(|file| serde_json::json!({
                     "name": file.name,
                     "size": file.size,
-                    "digest": file.digest,
+                    "digest": bytes_to_hex(&file.digest),
                 })).collect::<Vec<_>>(),
             });
             if existing != expected {
@@ -136,7 +136,7 @@ impl TransferStaging {
                 "files": request.files.iter().map(|file| serde_json::json!({
                     "name": file.name,
                     "size": file.size,
-                    "digest": file.digest,
+                    "digest": bytes_to_hex(&file.digest),
                 })).collect::<Vec<_>>(),
             });
             let bytes = serde_json::to_vec(&document)

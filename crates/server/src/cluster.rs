@@ -225,11 +225,13 @@ impl Cluster {
 /// Answers inter-node requests.
 pub struct ClusterHandler {
     cluster: Arc<Cluster>,
-    route: Option<Arc<Route>>,
+    /// The Q1 route of this node. A successor installs its route only after the promoted
+    /// storage is validated, so the handle is replaced at runtime.
+    route: crate::q1::RouteSlot,
 }
 
 impl ClusterHandler {
-    pub fn new(cluster: Arc<Cluster>, route: Option<Arc<Route>>) -> Self {
+    pub fn new(cluster: Arc<Cluster>, route: crate::q1::RouteSlot) -> Self {
         Self { cluster, route }
     }
 
@@ -346,7 +348,7 @@ impl PeerHandler for ClusterHandler {
                 RpcKind::RoutePublish => {
                     let request = RoutePublishRequest::decode(&envelope.body)
                         .map_err(|_| RpcErrorCode::Malformed)?;
-                    let route = route.as_ref().ok_or(RpcErrorCode::NotOwner)?;
+                    let route = route.current().ok_or(RpcErrorCode::NotOwner)?;
                     let partition = route.options.partition;
                     if request.partition_id != partition.partition_id
                         || request.topic_id != partition.topic_id
@@ -379,7 +381,7 @@ impl PeerHandler for ClusterHandler {
                 RpcKind::RouteFetch => {
                     let request = RouteFetchRequest::decode(&envelope.body)
                         .map_err(|_| RpcErrorCode::Malformed)?;
-                    let route = route.as_ref().ok_or(RpcErrorCode::NotOwner)?;
+                    let route = route.current().ok_or(RpcErrorCode::NotOwner)?;
                     let partition = route.options.partition;
                     if request.topic_id != partition.topic_id
                         || request.tenant_id != partition.tenant_id
@@ -415,7 +417,7 @@ impl PeerHandler for ClusterHandler {
                 RpcKind::RouteConsumerAck => {
                     let request = RouteAckRequest::decode(&envelope.body)
                         .map_err(|_| RpcErrorCode::Malformed)?;
-                    let route = route.as_ref().ok_or(RpcErrorCode::NotOwner)?;
+                    let route = route.current().ok_or(RpcErrorCode::NotOwner)?;
                     let partition = route.options.partition;
                     if request.topic_id != partition.topic_id
                         || request.tenant_id != partition.tenant_id
@@ -735,7 +737,10 @@ mod transfer_tests {
         let server = rovqet_control::transport::PeerServer::new(
             listener,
             cluster.trust.clone(),
-            Arc::new(ClusterHandler::new(cluster, None)),
+            Arc::new(ClusterHandler::new(
+                cluster,
+                crate::q1::RouteSlot::default(),
+            )),
             Default::default(),
         )
         .expect("peer server");
@@ -927,7 +932,7 @@ mod transfer_tests {
         let mut options = options(1, address, 2, address, directory("unused"));
         options.transfer_staging = None;
         let cluster = Arc::new(Cluster::new(&options).await.expect("cluster"));
-        let handler = ClusterHandler::new(cluster, None);
+        let handler = ClusterHandler::new(cluster, crate::q1::RouteSlot::default());
         let envelope = rovqet_control::wire::Envelope::new(
             5150,
             2,
@@ -1024,7 +1029,10 @@ mod migration_tests {
         let server = rovqet_control::transport::PeerServer::new(
             listener,
             cluster.trust.clone(),
-            Arc::new(ClusterHandler::new(cluster, None)),
+            Arc::new(ClusterHandler::new(
+                cluster,
+                crate::q1::RouteSlot::default(),
+            )),
             Default::default(),
         )
         .expect("peer server");
@@ -1281,5 +1289,349 @@ mod migration_tests {
             sequence: 0,
         };
         let _ = QoS::Q1;
+    }
+}
+
+#[cfg(test)]
+mod successor_tests {
+    use super::*;
+    use crate::migration::MigrationDriver;
+    use crate::q1::{Options as Q1Options, RouteSlot};
+    use rovqet_control::rpc::RoutePublishRequest;
+    use rovqet_metadata_raft::types::{MetadataCommand, MigrationStage};
+
+    const CLUSTER: u128 = 770077;
+
+    fn free_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("port");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        port
+    }
+
+    fn directory(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "rovqet-successor-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&path).expect("directory");
+        path
+    }
+
+    fn partition() -> PartitionRef {
+        PartitionRef {
+            tenant_id: 1,
+            topic_id: 3,
+            partition_id: 0,
+        }
+    }
+
+    fn q1_options(directory: PathBuf, node_id: u64, initialize: bool) -> Q1Options {
+        Q1Options {
+            directory,
+            topic: "durable".into(),
+            node_id,
+            partition: partition(),
+            incarnation: 42,
+            owner_epoch: 7,
+            dedup_window: Duration::from_secs(86400),
+            max_producers: 64,
+            max_outcomes: 64,
+            initialize_new_log: initialize,
+            terminal_policy: rovqet_durable::TerminalPolicy::Dlq,
+            max_attempts: 3,
+            retry_initial: Duration::from_millis(10),
+            retry_max: Duration::from_millis(100),
+            dlq: None,
+        }
+    }
+
+    async fn serve(cluster: Arc<Cluster>, listen: SocketAddr) -> tokio::sync::watch::Sender<bool> {
+        let listener = tokio::net::TcpListener::bind(listen)
+            .await
+            .expect("listener");
+        let server = rovqet_control::transport::PeerServer::new(
+            listener,
+            cluster.trust.clone(),
+            Arc::new(ClusterHandler::new(cluster, RouteSlot::default())),
+            Default::default(),
+        )
+        .expect("peer server");
+        let (stop, stop_rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(server.serve(stop_rx));
+        stop
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn the_successor_opens_the_transferred_history_and_keeps_the_producer_outcome() {
+        let raft_ports = [free_port(), free_port(), free_port()];
+        let raft_peers: Vec<(u64, SocketAddr)> = (1..=3)
+            .map(|node| {
+                (
+                    node,
+                    format!("127.0.0.1:{}", raft_ports[node as usize - 1])
+                        .parse()
+                        .expect("addr"),
+                )
+            })
+            .collect();
+        let source_address: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+        let target_address: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+        let source_staging = directory("source-transfer");
+        let target_staging = directory("target-transfer");
+        let source_directory = directory("source-q1");
+        let target_directory = directory("target-q1");
+
+        // The source and the target are two brokers that are also voters of the metadata
+        // group. The third voter is configured but not started.
+        let source_cluster = Arc::new(
+            Cluster::new(&ClusterOptions {
+                cluster_id: CLUSTER,
+                node_id: 1,
+                listen: source_address,
+                peers: vec![(2, target_address)],
+                metadata: None,
+                metadata_raft: Some(MetadataRaftOptions {
+                    cluster_id: CLUSTER,
+                    node_id: 1,
+                    listen: raft_peers[0].1,
+                    peers: raft_peers.clone(),
+                    data_directory: directory("source-raft"),
+                    bootstrap: true,
+                }),
+                transfer_staging: Some(source_staging.clone()),
+            })
+            .await
+            .expect("the source cluster"),
+        );
+        let target_cluster = Arc::new(
+            Cluster::new(&ClusterOptions {
+                cluster_id: CLUSTER,
+                node_id: 2,
+                listen: target_address,
+                peers: vec![(1, source_address)],
+                metadata: None,
+                metadata_raft: Some(MetadataRaftOptions {
+                    cluster_id: CLUSTER,
+                    node_id: 2,
+                    listen: raft_peers[1].1,
+                    peers: raft_peers.clone(),
+                    data_directory: directory("target-raft"),
+                    bootstrap: false,
+                }),
+                transfer_staging: Some(target_staging.clone()),
+            })
+            .await
+            .expect("the target cluster"),
+        );
+        let _source_stop = serve(source_cluster.clone(), source_address).await;
+        let _target_stop = serve(target_cluster.clone(), target_address).await;
+
+        let source_raft = source_cluster.raft.clone().expect("the source voter");
+        let target_raft = target_cluster.raft.clone().expect("the target voter");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while source_raft.current_leader().await != Some(1) && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(source_raft.current_leader().await, Some(1));
+
+        // The committed metadata places the partition on the source.
+        for command in [
+            MetadataCommand::SetNode {
+                node: 1,
+                address: "127.0.0.1:1".into(),
+            },
+            MetadataCommand::SetNode {
+                node: 2,
+                address: "127.0.0.1:2".into(),
+            },
+            MetadataCommand::SetPlacement {
+                tenant_id: 1,
+                topic_id: 3,
+                partition_id: 0,
+                owner: 1,
+                ownership_epoch: 7,
+                lease_valid_for_ms: 600_000,
+            },
+        ] {
+            let response = source_raft
+                .propose(command)
+                .await
+                .expect("committed metadata");
+            assert!(
+                matches!(
+                    response,
+                    rovqet_metadata_raft::types::MetadataCommandResponse::Applied { .. }
+                ),
+                "the metadata command must be applied"
+            );
+        }
+
+        // The source opens its route because the committed metadata names it as the owner.
+        let source_slot = Arc::new(RouteSlot::default());
+        tokio::spawn(crate::migration::run_activator(
+            source_cluster.clone(),
+            source_raft.clone(),
+            source_slot.clone(),
+            q1_options(source_directory.clone(), 1, true),
+            1,
+            Some(source_staging.clone()),
+        ));
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while source_slot.current().is_none() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let source_route = source_slot.current().expect("the source route must open");
+
+        // The source publishes and the outcome is recorded externally.
+        let request = RoutePublishRequest {
+            tenant_id: 1,
+            topic_id: 3,
+            partition_id: 0,
+            qos: 1,
+            ownership_epoch: 7,
+            producer_id: 11,
+            producer_epoch: 1,
+            producer_sequence: 0,
+            message_id: 777,
+            ttl_ms: 5000,
+            payload: b"committed before the migration".to_vec(),
+        };
+        let published = source_route
+            .publish_durable(&request)
+            .await
+            .expect("the publication must commit");
+        let original_offset = published.sequence;
+        assert_eq!(
+            published.log_incarnation, 42,
+            "the incarnation is preserved"
+        );
+
+        // The target waits for the committed activation.
+        let target_slot = Arc::new(RouteSlot::default());
+        tokio::spawn(crate::migration::run_activator(
+            target_cluster.clone(),
+            target_raft.clone(),
+            target_slot.clone(),
+            q1_options(target_directory.clone(), 2, false),
+            2,
+            Some(target_staging.clone()),
+        ));
+
+        // The operator commits the migration and the source drives the stages.
+        let migration_id = crate::migration::migration_id(1, 3, 0, 42, 1, 2);
+        let response = source_raft
+            .propose(MetadataCommand::BeginMigration {
+                migration_id,
+                tenant_id: 1,
+                topic_id: 3,
+                partition_id: 0,
+                source_node: 1,
+                target_node: 2,
+                source_incarnation: 42,
+                original_epoch: 7,
+                next_epoch: 8,
+                dependent_partitions: Vec::new(),
+            })
+            .await
+            .expect("the migration must be committed");
+        assert!(
+            matches!(
+                response,
+                rovqet_metadata_raft::types::MetadataCommandResponse::Applied { .. }
+            ),
+            "the migration must be accepted"
+        );
+        let driver = MigrationDriver::new(
+            source_cluster.transport.clone(),
+            source_raft.clone(),
+            source_directory.clone(),
+            1,
+        );
+        tokio::spawn(crate::migration::run_coordinator(
+            driver,
+            source_route.clone(),
+            1,
+            None,
+        ));
+
+        // The activation is committed.
+        let deadline = std::time::Instant::now() + Duration::from_secs(90);
+        let mut activated = false;
+        while std::time::Instant::now() < deadline {
+            let state = source_raft.applied_state();
+            if let Some(record) = state.migrations.get(&migration_id) {
+                if record.stage == MigrationStage::ActivateNew {
+                    activated = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(activated, "the migration must be committed");
+
+        // The successor opens the transferred history.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while target_slot.current().is_none() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let target_route = target_slot
+            .current()
+            .expect("the successor must open the transferred history");
+
+        // The producer outcome survives: a retry with the original token returns the
+        // original offset and does not append a second publication.
+        // The retry carries the new ownership epoch but the original producer token.
+        let retry = target_route
+            .publish_durable(&RoutePublishRequest {
+                ownership_epoch: 8,
+                ..request.clone()
+            })
+            .await
+            .expect("the retry must be answered");
+        assert_eq!(
+            retry.sequence, original_offset,
+            "the retry must return the original offset"
+        );
+        assert_eq!(retry.log_incarnation, 42, "the incarnation must not change");
+
+        // The committed history is readable on the successor.
+        let fetched = target_route
+            .group_fetch_routed(&rovqet_control::rpc::RouteFetchRequest {
+                tenant_id: 1,
+                topic_id: 3,
+                partition_id: 0,
+                group_id: 1,
+                generation: 0,
+                max_messages: 16,
+                max_bytes: 65536,
+                wait_ms: 0,
+            })
+            .await
+            .expect("the transferred history must be fetchable");
+        assert!(
+            !fetched.deliveries.is_empty(),
+            "the transferred message must be delivered"
+        );
+        assert_eq!(fetched.deliveries[0].offset.sequence, original_offset);
+
+        // The old owner is still fenced and refuses another publication.
+        let refused = source_route
+            .publish_durable(&RoutePublishRequest {
+                producer_sequence: 1,
+                message_id: 778,
+                payload: b"after the fence".to_vec(),
+                ..request.clone()
+            })
+            .await;
+        assert!(
+            refused.is_err(),
+            "the fenced old owner must not commit another publication"
+        );
     }
 }

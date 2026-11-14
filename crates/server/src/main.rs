@@ -6,6 +6,7 @@ use rovqet_router::{OverflowPolicy, TopicConfig};
 use rovqet_transport::{Config, TransportStats, serve};
 mod cluster;
 mod migration;
+mod promotion;
 mod q1;
 mod transfer;
 use std::{
@@ -426,40 +427,49 @@ async fn main() -> io::Result<()> {
         // The durable partition learns its own node identity so that it can be fenced.
         q1.node_id = cluster.node.get();
     }
-    let route = if let Some(q1) = q1_options {
-        Some(Arc::new(
+    // In Raft mode the route is opened by the activator: only a committed placement may
+    // make this node the owner of a partition, and a successor opens the transferred
+    // history after the promotion instead of an empty log.
+    let raft_mode = cluster
+        .as_ref()
+        .and_then(|cluster| cluster.raft.clone())
+        .is_some();
+    let route = match q1_options.clone() {
+        Some(q1) if !raft_mode => Some(Arc::new(
             tokio::task::spawn_blocking(move || q1::Route::open(q1))
                 .await
                 .map_err(io::Error::other)??,
-        ))
-    } else {
-        None
+        )),
+        _ => None,
     };
+    let route_slot = Arc::new(q1::RouteSlot::new(route.clone()));
     let mut cluster_stop = None;
     if let Some(cluster) = &cluster {
         if let Some(q1) = &options.q1 {
             // Fencing: the local partition only accepts durable mutations while the
             // committed metadata names this node as owner with a valid lease.
             let authority = cluster.authority_for(&q1.partition);
-            if let Some(route) = &route {
+            if let Some(route) = route_slot.current() {
                 route.install_authority(authority);
-                // In Raft mode the authority follows the committed metadata: it is installed
-                // again whenever the committed revision changes. Nothing mints an epoch, extends
-                // a lease or activates a replacement owner.
-                if let Some(node) = cluster.raft_node() {
-                    let cluster = cluster.clone();
-                    let route = route.clone();
-                    let partition = q1.partition;
-                    let mut updates = node.committed_updates();
-                    tokio::spawn(async move {
-                        loop {
-                            if updates.changed().await.is_err() {
-                                return;
-                            }
+            }
+            // In Raft mode the authority follows the committed metadata: it is installed
+            // again whenever the committed revision changes. Nothing mints an epoch, extends
+            // a lease or activates a replacement owner.
+            if let Some(node) = cluster.raft_node() {
+                let cluster = cluster.clone();
+                let route_slot = route_slot.clone();
+                let partition = q1.partition;
+                let mut updates = node.committed_updates();
+                tokio::spawn(async move {
+                    loop {
+                        if updates.changed().await.is_err() {
+                            return;
+                        }
+                        if let Some(route) = route_slot.current() {
                             route.install_authority(cluster.authority_for(&partition));
                         }
-                    });
-                }
+                    }
+                });
             }
             if authority.is_some() {
                 eprintln!(
@@ -473,7 +483,7 @@ async fn main() -> io::Result<()> {
         // The migration coordinator drives a committed handover of this partition. It only
         // acts on a committed migration record, and it never activates a successor without
         // a durable fence of the old owner.
-        if let (Some(raft), Some(route)) = (cluster.raft.clone(), &route) {
+        if let (Some(raft), Some(route)) = (cluster.raft.clone(), route_slot.current()) {
             let driver = migration::MigrationDriver::new(
                 cluster.transport.clone(),
                 raft.clone(),
@@ -498,6 +508,23 @@ async fn main() -> io::Result<()> {
                 target_request,
             ));
         }
+        // The activator opens the Q1 route when the committed metadata makes this node the
+        // owner of the partition. A successor opens the transferred history after the
+        // promotion; it never starts with an empty log.
+        if let (Some(raft), Some(q1)) = (cluster.raft.clone(), q1_options.clone()) {
+            let staging = options
+                .cluster
+                .as_ref()
+                .and_then(|cluster_options| cluster_options.transfer_staging.clone());
+            tokio::spawn(migration::run_activator(
+                cluster.clone(),
+                raft,
+                route_slot.clone(),
+                q1,
+                cluster.node.get(),
+                staging,
+            ));
+        }
         let listener = tokio::net::TcpListener::bind(cluster_options_listen(&options)).await?;
         let address = listener.local_addr()?;
         if !address.ip().is_loopback() {
@@ -506,7 +533,10 @@ async fn main() -> io::Result<()> {
         let peer_server = rovqet_control::transport::PeerServer::new(
             listener,
             cluster.trust.clone(),
-            Arc::new(cluster::ClusterHandler::new(cluster.clone(), route.clone())),
+            Arc::new(cluster::ClusterHandler::new(
+                cluster.clone(),
+                (*route_slot).clone(),
+            )),
             Default::default(),
         )
         .map_err(|error| invalid(format!("cluster peer listener: {error}")))?;
@@ -552,8 +582,8 @@ async fn main() -> io::Result<()> {
         })
     });
     let handler = Arc::new(match cluster.clone() {
-        Some(cluster) => q1::Dispatch::with_cluster(broker.clone(), route.clone(), cluster),
-        None => q1::Dispatch::new(broker.clone(), route.clone()),
+        Some(cluster) => q1::Dispatch::with_cluster(broker.clone(), (*route_slot).clone(), cluster),
+        None => q1::Dispatch::new(broker.clone(), (*route_slot).clone()),
     });
     let drain = handler.clone();
     let result = serve(listener, config, handler.clone(), async move {
@@ -565,7 +595,7 @@ async fn main() -> io::Result<()> {
         let _ = stop.send(true);
     }
     drop(handler);
-    if let Some(route) = route {
+    if let Some(route) = route_slot.take() {
         let owned = Arc::try_unwrap(route)
             .map_err(|_| io::Error::other("Q1 route retained after session shutdown"))?;
         match tokio::time::timeout(
