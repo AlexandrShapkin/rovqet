@@ -335,6 +335,21 @@ pub fn report(event: &str, record: &rovqet_metadata_raft::sm::MigrationState, re
     );
 }
 
+/// The operator request that asks a broker to hand its partition over.
+#[derive(Debug, Clone)]
+pub struct OperatorRequest {
+    /// The node that receives the partition.
+    pub target_node: u64,
+    pub tenant_id: u64,
+    pub topic_id: u64,
+    pub partition_id: u32,
+    pub incarnation: u128,
+    /// The ownership epoch the source holds today.
+    pub epoch: u64,
+    /// The endpoints of the metadata group, used to register the handover's nodes.
+    pub peers: Vec<(u64, std::net::SocketAddr)>,
+}
+
 /// The stage that follows the given one, if any.
 pub fn next_stage(stage: MigrationStage) -> Option<MigrationStage> {
     stage.next()
@@ -372,7 +387,7 @@ pub async fn run_coordinator(
     driver: MigrationDriver,
     route_slot: std::sync::Arc<crate::q1::RouteSlot>,
     node: u64,
-    target_request: Option<(u64, u64, u64, u32, u128, u64)>,
+    target_request: Option<OperatorRequest>,
 ) {
     let raft = driver.raft().clone();
     let mut updates = raft.committed_updates();
@@ -391,30 +406,48 @@ pub async fn run_coordinator(
                 .cloned()
             else {
                 // No migration is committed yet. The operator may have asked for one.
-                if let Some((target_node, tenant_id, topic_id, partition_id, incarnation, epoch)) =
-                    target_request
-                {
-                    // The operator asked for a handover of this partition. The partition
-                    // must be placed on this node first, and that placement is committed by
-                    // the metadata group like every other topology change.
+                if let Some(request) = target_request.clone() {
+                    // The operator asked for a handover of this partition. The endpoints of
+                    // the handover are registered first: a placement of an unknown owner is
+                    // rejected by the metadata group, so the handover could never start.
+                    let mut missing_endpoint = false;
+                    for (peer, address) in &request.peers {
+                        if !state.nodes.contains_key(peer) {
+                            missing_endpoint = true;
+                            let _ = driver
+                                .commit(
+                                    MetadataCommand::SetNode {
+                                        node: *peer,
+                                        address: address.to_string(),
+                                    },
+                                    Duration::from_secs(30),
+                                )
+                                .await;
+                        }
+                    }
+                    if missing_endpoint {
+                        return;
+                    }
+                    // The partition must be placed on this node, and that placement is
+                    // committed by the metadata group like every other topology change.
                     let placement = state
                         .placements
                         .iter()
                         .find(|placement| {
-                            placement.tenant_id == tenant_id
-                                && placement.topic_id == topic_id
-                                && placement.partition_id == partition_id
+                            placement.tenant_id == request.tenant_id
+                                && placement.topic_id == request.topic_id
+                                && placement.partition_id == request.partition_id
                         })
                         .cloned();
                     if placement.is_none() {
                         let _ = driver
                             .commit(
                                 MetadataCommand::SetPlacement {
-                                    tenant_id,
-                                    topic_id,
-                                    partition_id,
+                                    tenant_id: request.tenant_id,
+                                    topic_id: request.topic_id,
+                                    partition_id: request.partition_id,
                                     owner: node,
-                                    ownership_epoch: epoch,
+                                    ownership_epoch: request.epoch,
                                     lease_valid_for_ms: 600_000,
                                 },
                                 Duration::from_secs(30),
@@ -438,19 +471,19 @@ pub async fn run_coordinator(
                         .commit(
                             MetadataCommand::BeginMigration {
                                 migration_id: migration_id(
-                                    tenant_id,
-                                    topic_id,
-                                    partition_id,
-                                    incarnation,
+                                    request.tenant_id,
+                                    request.topic_id,
+                                    request.partition_id,
+                                    request.incarnation,
                                     node,
-                                    target_node,
+                                    request.target_node,
                                 ),
-                                tenant_id,
-                                topic_id,
-                                partition_id,
+                                tenant_id: request.tenant_id,
+                                topic_id: request.topic_id,
+                                partition_id: request.partition_id,
                                 source_node: node,
-                                target_node,
-                                source_incarnation: incarnation,
+                                target_node: request.target_node,
+                                source_incarnation: request.incarnation,
                                 original_epoch: placement
                                     .as_ref()
                                     .map(|placement| placement.ownership_epoch)

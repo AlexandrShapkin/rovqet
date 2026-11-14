@@ -31,10 +31,23 @@ TOPIC = 3
 TENANT = 1
 
 
+_ALLOCATED: set[int] = set()
+
+
 def free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
+    """An unused loopback port.
+
+    The kernel hands the same ephemeral port out again right after it was released,
+    so the allocated ports are remembered: two voters must never share a port.
+    """
+    for _ in range(1000):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        if port not in _ALLOCATED:
+            _ALLOCATED.add(port)
+            return port
+    raise RuntimeError("no free loopback port available")
 
 
 class Node:

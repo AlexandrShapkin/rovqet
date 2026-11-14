@@ -125,6 +125,8 @@ pub struct Cluster {
     pub raft: Option<Arc<rovqet_metadata_raft::MetadataNode>>,
     /// The staging areas of the incoming Q1 transfers.
     pub transfers: Option<Arc<tokio::sync::Mutex<crate::transfer::TransferManager>>>,
+    /// The endpoints of the metadata group, used to register the nodes of a handover.
+    pub metadata_peers: Vec<(u64, SocketAddr)>,
 }
 
 /// Rejects a configuration in which a static fixture could override committed metadata.
@@ -170,6 +172,11 @@ impl Cluster {
             Some(raft_options) => Some(start_metadata_raft(raft_options, &store).await?),
             None => None,
         };
+        let metadata_peers = options
+            .metadata_raft
+            .as_ref()
+            .map(|raft| raft.peers.clone())
+            .unwrap_or_default();
         let transfers = options.transfer_staging.as_ref().map(|root| {
             Arc::new(tokio::sync::Mutex::new(
                 crate::transfer::TransferManager::new(root),
@@ -183,6 +190,7 @@ impl Cluster {
             started: Instant::now(),
             raft,
             transfers,
+            metadata_peers,
         })
     }
 

@@ -493,15 +493,14 @@ async fn main() -> io::Result<()> {
                 cluster.node.get(),
             );
             let target_request = options.migrate_to.and_then(|target| {
-                options.q1.as_ref().map(|q1| {
-                    (
-                        target,
-                        q1.partition.tenant_id,
-                        q1.partition.topic_id,
-                        q1.partition.partition_id,
-                        q1.incarnation,
-                        q1.owner_epoch,
-                    )
+                options.q1.as_ref().map(|q1| migration::OperatorRequest {
+                    target_node: target,
+                    tenant_id: q1.partition.tenant_id,
+                    topic_id: q1.partition.topic_id,
+                    partition_id: q1.partition.partition_id,
+                    incarnation: q1.incarnation,
+                    epoch: q1.owner_epoch,
+                    peers: cluster.metadata_peers.clone(),
                 })
             });
             tokio::spawn(migration::run_coordinator(

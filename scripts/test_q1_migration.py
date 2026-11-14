@@ -44,10 +44,24 @@ TOPIC_NAME = "durable"
 GROUP = "9"
 
 
+_ALLOCATED: set[int] = set()
+
+
 def free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
+    """An unused loopback port.
+
+    The kernel happily hands the same ephemeral port out again right after it was
+    released, so the allocated ports are remembered: two processes must never be
+    given the same port.
+    """
+    for _ in range(1000):
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        if port not in _ALLOCATED:
+            _ALLOCATED.add(port)
+            return port
+    raise RuntimeError("no free loopback port available")
 
 
 class Process:
