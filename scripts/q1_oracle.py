@@ -392,3 +392,126 @@ def reconcile_terminal(
         "cursor": cursor,
     }
     return _result(FAIL if reasons else PASS, reasons, counts)
+
+
+MIGRATION_STAGES = ("prepare", "catch_up", "fence_old", "activate_new", "cleanup")
+
+
+def reconcile_migration(records: list[dict], *, require_conclusion: bool = True) -> dict:
+    """Checks an ownership migration journal for safety violations.
+
+    The journal is written by the parent harness and the oracle uses only the observed
+    events. A contradiction in the evidence is INVALID, a broken safety invariant is FAIL
+    and a journal without migration evidence is NOT_RUN. Nothing here is inferred from a
+    clock: an old owner that was not fenced counts as a violation, not as an expiry.
+    """
+    reasons: list[str] = []
+    begins = [r for r in records if r["event"] == "migration_begin"]
+    stages = [r for r in records if r["event"] == "migration_stage"]
+    fences = [r for r in records if r["event"] == "fence_confirmed"]
+    activations = [r for r in records if r["event"] == "activation"]
+    commits = [r for r in records if r["event"] == "publication_committed"]
+
+    if not begins and not stages and not activations:
+        return _result(NOT_RUN, ["no migration evidence"], {})
+
+    identifiers = {
+        r.get("migration_id")
+        for r in begins + stages + fences + activations
+        if r.get("migration_id") is not None
+    }
+    if len(identifiers) > 1:
+        reasons.append(
+            f"conflicting migration ids: {sorted(str(value) for value in identifiers)}"
+        )
+    if not identifiers:
+        reasons.append("migration evidence without a migration id")
+    migration_id = next(iter(identifiers), None)
+
+    # The committed stages may not skip and may not move backwards.
+    order: list[tuple[int, str]] = []
+    for record in stages:
+        stage = record.get("stage")
+        if stage not in MIGRATION_STAGES:
+            reasons.append(f"unknown migration stage {stage}")
+            continue
+        order.append((MIGRATION_STAGES.index(stage), stage))
+    for previous, current in zip(order, order[1:]):
+        if current[0] < previous[0]:
+            reasons.append(f"migration stage moved back from {previous[1]} to {current[1]}")
+        elif current[0] > previous[0] + 1:
+            reasons.append(f"migration stage jumped from {previous[1]} to {current[1]}")
+
+    # The activation needs a durable fence confirmation and the transfer evidence.
+    if activations and not fences:
+        reasons.append("the activation has no durable fence confirmation")
+    if activations and fences:
+        if fences[0]["seq"] > activations[0]["seq"]:
+            reasons.append("the activation precedes the fence confirmation")
+    if activations:
+        activation = activations[0]
+        for field in ("fence_offset", "fence_digest", "manifest_generation"):
+            if activation.get(field) in (None, ""):
+                reasons.append(f"the activation has no {field}")
+        if activation.get("target_ready") is False:
+            reasons.append("the activation has no target readiness evidence")
+        if activation.get("transfer_watermark") is None:
+            reasons.append("the activation has no verified transfer watermark")
+
+    # No dual owner: the source may not commit after its fence and the target may not
+    # commit before the activation.
+    fence_seq = fences[0]["seq"] if fences else None
+    activation_seq = activations[0]["seq"] if activations else None
+    source = begins[0].get("source") if begins else None
+    target = begins[0].get("target") if begins else None
+    for record in commits:
+        node = record.get("node")
+        if fence_seq is not None and node == source and record["seq"] > fence_seq:
+            reasons.append(
+                f"the old owner committed at seq {record['seq']} after its fence at {fence_seq}"
+            )
+        if activation_seq is not None and node == target and record["seq"] < activation_seq:
+            reasons.append(
+                f"the new owner committed at seq {record['seq']} before the activation at {activation_seq}"
+            )
+
+    # The producer outcomes survive: one token keeps one offset and one message identity.
+    outcomes: dict[tuple, dict] = {}
+    for record in commits:
+        key = (record.get("producer"), record.get("epoch"), record.get("sequence"))
+        previous = outcomes.get(key)
+        if previous is None:
+            outcomes[key] = record
+            continue
+        if previous.get("offset") != record.get("offset"):
+            reasons.append(f"the producer token {key} changed its offset after the migration")
+        if previous.get("message_id") != record.get("message_id"):
+            reasons.append(f"the producer token {key} changed its message identity")
+
+    # The incarnation may not be replaced silently.
+    incarnations = {record.get("incarnation") for record in commits if record.get("incarnation")}
+    if len(incarnations) > 1:
+        reasons.append(f"the log incarnation changed during the migration: {sorted(map(str, incarnations))}")
+
+    # The committed watermark of the source and the target must agree.
+    if activations and fences:
+        final = [r for r in records if r["event"] == "transfer_finalize"]
+        if final:
+            target_watermark = final[-1].get("last_committed_offset")
+            activation_watermark = activations[0].get("transfer_watermark")
+            if target_watermark is not None and activation_watermark is not None:
+                if int(target_watermark) != int(activation_watermark):
+                    reasons.append(
+                        f"the target watermark {target_watermark} differs from the committed "
+                        f"activation watermark {activation_watermark}"
+                    )
+
+    counts = {
+        "migration_id": str(migration_id),
+        "stages": len(stages),
+        "fences": len(fences),
+        "activations": len(activations),
+        "commits": len(commits),
+    }
+    verdict = FAIL if reasons else PASS
+    return _result(verdict, reasons, counts)

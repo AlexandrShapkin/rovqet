@@ -21,9 +21,12 @@ use tokio::sync::oneshot;
 
 const OUTCOME_BYTES: usize = 30;
 mod authority;
+mod fence;
 pub use authority::{Authority, Fence, FenceError};
 mod group;
 mod terminal;
+pub use fence::{FenceProof, FenceState};
+use fence::{decode_fence, encode_fence, fence_digest};
 use group::{AckCommand, GroupFetchCommand, GroupState, MessageMeta};
 pub use group::{
     AckRequest, AckResult, GROUP_BATCH_BYTES, GROUP_MESSAGE_BYTES, GroupConfig, GroupDelivery,
@@ -167,6 +170,14 @@ enum Command {
     Ack(AckCommand),
     Nack(terminal::NackCommand),
     SetAuthority(Option<Authority>),
+    Fence(FenceCommand),
+}
+/// A request to durably revoke the write authority of this owner.
+struct FenceCommand {
+    migration_id: u128,
+    old_epoch: u64,
+    next_epoch: u64,
+    reply: oneshot::Sender<Result<FenceProof>>,
 }
 /// One caller-owned handle; shared references may submit concurrently. No socket or Q0 dependencies.
 pub struct Partition {
@@ -394,6 +405,14 @@ impl Partition {
                                 Ok(Command::SetAuthority(authority)) => {
                                     state.set_authority(authority);
                                 }
+                                Ok(Command::Fence(command)) => {
+                                    let result = state.fence_old_owner(
+                                        command.migration_id,
+                                        command.old_epoch,
+                                        command.next_epoch,
+                                    );
+                                    let _ = command.reply.send(result);
+                                }
                                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                                     state.complete_replays(&mut reads, true);
@@ -495,6 +514,56 @@ impl Partition {
     pub fn incarnation(&self) -> u128 {
         self.incarnation
     }
+    /// Durably revokes the write authority of this partition.
+    ///
+    /// The returned proof exists only after the fence record is durable. A fenced
+    /// partition refuses every durable mutation, also after a restart: the revocation is
+    /// a record of the Q1 WAL and is replayed on recovery.
+    pub fn fence_old_owner(
+        &self,
+        migration_id: u128,
+        old_epoch: u64,
+        next_epoch: u64,
+    ) -> Result<FenceProof> {
+        let sender = self.sender.as_ref().ok_or(Error::Unavailable)?;
+        let (tx, rx) = oneshot::channel();
+        sender
+            .try_send(Command::Fence(FenceCommand {
+                migration_id,
+                old_epoch,
+                next_epoch,
+                reply: tx,
+            }))
+            .map_err(|error| match error {
+                TrySendError::Full(_) => Error::Capacity,
+                TrySendError::Disconnected(_) => Error::Unavailable,
+            })?;
+        rx.blocking_recv().unwrap_or(Err(Error::OutcomeUnknown))
+    }
+
+    /// Durably revokes the write authority of this partition without blocking a worker.
+    pub async fn fence_old_owner_async(
+        &self,
+        migration_id: u128,
+        old_epoch: u64,
+        next_epoch: u64,
+    ) -> Result<FenceProof> {
+        let sender = self.sender.as_ref().ok_or(Error::Unavailable)?;
+        let (tx, rx) = oneshot::channel();
+        sender
+            .try_send(Command::Fence(FenceCommand {
+                migration_id,
+                old_epoch,
+                next_epoch,
+                reply: tx,
+            }))
+            .map_err(|error| match error {
+                TrySendError::Full(_) => Error::Capacity,
+                TrySendError::Disconnected(_) => Error::Unavailable,
+            })?;
+        rx.await.unwrap_or(Err(Error::OutcomeUnknown))
+    }
+
     /// Installs (or clears) the committed ownership authority of this partition. The
     /// command is ordered with durable mutations in the actor, so a mutation accepted
     /// before the transition may still commit, and every later mutation is fenced.
@@ -556,6 +625,9 @@ struct State {
     message_index: HashMap<u64, u128>,
     groups: HashMap<u64, GroupState>,
     fence: Fence,
+    /// The durable revocation of this owner's write authority, if it was fenced. It is
+    /// recovered from the WAL, so a restart cannot restore an obsolete authority.
+    fenced: Option<FenceState>,
     dlq: Option<Arc<dyn DlqPublisher>>,
     pending_terminal: HashMap<(u64, u64), terminal::PendingTerminal>,
     recovered_dlq_commits: Vec<(u128, u128, u64, u128)>,
@@ -600,6 +672,7 @@ impl State {
             message_index: HashMap::new(),
             groups: HashMap::new(),
             fence: Fence::standalone(),
+            fenced: None,
             dlq,
             pending_terminal: HashMap::new(),
             recovered_dlq_commits: Vec::new(),
@@ -710,6 +783,23 @@ impl State {
                 RecordKind::ProducerOutcome => {
                     return Err(Error::Corruption("orphan publication outcome"));
                 }
+                RecordKind::Fence => {
+                    // The durable revocation is replayed: the revoked owner stays fenced.
+                    // The record travels with the transferred history, so it only revokes
+                    // the node that wrote it: the successor is not fenced by it.
+                    let (migration_id, old_owner, old_epoch, next_epoch) =
+                        decode_fence(&record.payload)?;
+                    if old_owner == self.config.node_id {
+                        self.fenced = Some(FenceState {
+                            migration_id,
+                            old_owner,
+                            old_epoch,
+                            next_epoch,
+                            offset: record.logical_offset,
+                        });
+                    }
+                    offset += 1;
+                }
                 _ => {
                     self.apply_group_record(&record)?;
                     offset += 1;
@@ -723,6 +813,76 @@ impl State {
         self.reconcile_recovered_terminal()?;
         Ok(())
     }
+    /// Durably revokes the write authority of this owner.
+    ///
+    /// The fence is a record in the Q1 WAL: it is written and synced before the proof is
+    /// returned, so a proof exists only after the durable boundary. The command runs in
+    /// the same actor as the durable mutations, so every mutation accepted before the
+    /// fence is already committed and every mutation after it is refused.
+    fn fence_old_owner(
+        &mut self,
+        migration_id: u128,
+        old_epoch: u64,
+        next_epoch: u64,
+    ) -> Result<FenceProof> {
+        if self.unhealthy {
+            return Err(Error::Unavailable);
+        }
+        if self.fenced.is_some() {
+            return Err(Error::Fenced);
+        }
+        // Only the committed owner may revoke itself, and only for the epoch it holds.
+        match self.fence.authority() {
+            Some(authority)
+                if authority.owner == self.config.node_id && authority.epoch == old_epoch => {}
+            _ => return Err(Error::Fenced),
+        }
+        if migration_id == 0 || next_epoch <= old_epoch {
+            return Err(Error::StaleOwner);
+        }
+        let payload = encode_fence(migration_id, self.config.node_id, old_epoch, next_epoch);
+        let digest = fence_digest(&payload);
+        let offset = self.next;
+        let record = Record {
+            kind: RecordKind::Fence,
+            logical_offset: offset,
+            owner_epoch: old_epoch,
+            producer_id: 0,
+            producer_epoch: 0,
+            sequence: 0,
+            message_id: 0,
+            server_timestamp: 0,
+            payload,
+        };
+        let result = (|| {
+            self.wal.append(record).map_err(Error::Storage)?;
+            self.wal.sync().map_err(Error::Storage)?;
+            Ok::<_, Error>(())
+        })();
+        if let Err(error) = result {
+            self.unhealthy = true;
+            return Err(error);
+        }
+        self.next += 1;
+        let manifest_generation = self.wal.generation();
+        self.fenced = Some(FenceState {
+            migration_id,
+            old_owner: self.config.node_id,
+            old_epoch,
+            next_epoch,
+            offset,
+        });
+        Ok(FenceProof {
+            migration_id,
+            old_owner: self.config.node_id,
+            old_epoch,
+            next_epoch,
+            fence_offset: offset,
+            fence_digest: digest,
+            manifest_generation,
+        })
+    }
+
     /// Rebuilds producer/dedup state for one committed MESSAGE/PRODUCER_OUTCOME pair.
     fn recover_publication(&mut self, message: &Record, outcome: &Record) -> Result<()> {
         let principal = u128::from_be_bytes(outcome.payload[6..22].try_into().unwrap());

@@ -6,6 +6,7 @@ use rovqet_router::{OverflowPolicy, TopicConfig};
 use rovqet_transport::{Config, TransportStats, serve};
 mod cluster;
 mod q1;
+mod transfer;
 use std::{
     collections::{HashMap, HashSet},
     io,

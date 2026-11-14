@@ -556,6 +556,12 @@ mod tests {
                 .is_none()
         );
 
+        // Wait until this single voter has won its election: a proposal is only accepted
+        // by the leader.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while node.current_leader().await != Some(1) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
         node.propose(MetadataCommand::SetNode {
             node: 1,
             address: "127.0.0.1:1".into(),

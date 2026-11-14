@@ -212,17 +212,24 @@ async fn unknown_kinds_and_reserved_kinds_are_rejected_explicitly() {
         decode_error(&response.body),
         Some(RpcErrorCode::UnknownKind)
     );
-    // Reserved transfer and Q0 fan-out kinds are explicitly unsupported.
+    // The remote Q0 fan-out kind stays explicitly unsupported.
+    let response =
+        raw_round_trip(address, CLUSTER, 2, 1, RpcKind::RouteQ0Fanout.as_u16(), 12).await;
+    assert_eq!(
+        decode_error(&response.body),
+        Some(RpcErrorCode::Unsupported)
+    );
+    // The Q1 transfer kinds are implemented by the migration path: the transport no longer
+    // refuses them, the handler decides.
     for kind in [
         RpcKind::Q1TransferPrepare,
         RpcKind::Q1TransferChunk,
         RpcKind::Q1TransferFinalize,
-        RpcKind::RouteQ0Fanout,
     ] {
-        let response = raw_round_trip(address, CLUSTER, 2, 1, kind.as_u16(), 12).await;
-        assert_eq!(
-            decode_error(&response.body),
-            Some(RpcErrorCode::Unsupported)
+        let response = raw_round_trip(address, CLUSTER, 2, 1, kind.as_u16(), 13).await;
+        assert!(
+            decode_error(&response.body).is_none(),
+            "the transfer kinds must reach the handler"
         );
     }
     let _ = stop.send(true);

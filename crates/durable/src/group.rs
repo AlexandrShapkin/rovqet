@@ -474,6 +474,11 @@ impl State {
     }
     /// Validates a durable mutation against the installed ownership authority.
     pub(super) fn check_authority(&self) -> std::result::Result<(), Error> {
+        // A revoked owner never mutates again. This check does not depend on the
+        // in-memory authority: it survives a restart that lost it.
+        if self.fenced.is_some() {
+            return Err(Error::Fenced);
+        }
         match self.fence.check(self.config.node_id, None, Instant::now()) {
             Ok(()) => Ok(()),
             Err(FenceError::ExpiredLease) => Err(Error::FenceExpired),
@@ -858,12 +863,14 @@ impl State {
         if r.from.sequence > self.next {
             return Err(GroupError::InvalidRequest);
         }
+        // Fencing: a partition that is not the committed owner serves no consumer
+        // deliveries. The check runs before a generation is claimed, because claiming a
+        // generation writes a durable checkpoint: a revoked owner must not mutate at all.
+        self.check_authority()
+            .map_err(|_| GroupError::StaleGeneration)?;
         if r.generation == 0 {
             self.claim_generation(r.group_id)?;
         }
-        // Fencing: a partition that is not the committed owner serves no consumer deliveries.
-        self.check_authority()
-            .map_err(|_| GroupError::StaleGeneration)?;
         self.advance_clock();
         // Retry exhaustion and expired attempts can require a durable terminal transition
         // before selection. Gather candidates, then release the group borrow for IO.

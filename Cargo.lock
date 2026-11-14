@@ -1253,6 +1253,7 @@ dependencies = [
  "rovqet-core",
  "rovqet-scheduler",
  "rovqet-wal",
+ "sha2",
  "tokio",
 ]
 
@@ -1328,6 +1329,7 @@ dependencies = [
  "rovqet-wal",
  "serde_json",
  "sha2",
+ "tempfile",
  "tokio",
 ]
 

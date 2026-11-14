@@ -35,15 +35,113 @@ pub enum MetadataCommand {
         ownership_epoch: u64,
         lease_valid_for_ms: u64,
     },
-    /// Record migration intent. The migration protocol itself is a later milestone; the
-    /// committed schema exists so that later stages never need a new command family.
-    SetMigration {
+    /// Start a Q1 ownership migration.
+    ///
+    /// The current committed owner stays authoritative: this command only records the
+    /// intent and freezes the target identity.
+    BeginMigration {
         migration_id: u128,
         tenant_id: u64,
         topic_id: u64,
         partition_id: u32,
-        stage: u8,
+        source_node: MetaNodeId,
+        target_node: MetaNodeId,
+        /// The log incarnation that must be transferred unchanged.
+        source_incarnation: u128,
+        /// The ownership epoch the caller believes the partition currently has.
+        original_epoch: u64,
+        /// The ownership epoch the target will own after the activation.
+        next_epoch: u64,
+        /// Dependent partitions whose durable state the migration needs, such as the DLQ
+        /// partition of the same tenant and topic.
+        dependent_partitions: Vec<DependentPartition>,
     },
+    /// Advance a committed migration by exactly one stage.
+    AdvanceMigration {
+        migration_id: u128,
+        stage: MigrationStage,
+        /// Last committed source offset that was transferred and verified.
+        transfer_watermark: Option<u64>,
+        /// Identity of the verified manifest of the transferred inventory.
+        manifest_id: Option<String>,
+        /// Durable proof that the old owner revoked its write authority.
+        fence_proof: Option<FenceProof>,
+        /// The target published that it validated the complete transferred inventory.
+        target_ready: bool,
+    },
+}
+
+/// Ordered stages of a Q1 ownership migration.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub enum MigrationStage {
+    /// The migration is committed; the old owner is still the sole writer.
+    Prepare,
+    /// The committed history is copied and verified.
+    CatchUp,
+    /// The old owner durably revoked its write authority.
+    FenceOld,
+    /// The target owns the partition with the new ownership epoch.
+    ActivateNew,
+    /// The old copy may be released under an explicit retention policy.
+    Cleanup,
+}
+
+impl MigrationStage {
+    /// The one stage that may follow this one.
+    pub fn next(self) -> Option<MigrationStage> {
+        match self {
+            MigrationStage::Prepare => Some(MigrationStage::CatchUp),
+            MigrationStage::CatchUp => Some(MigrationStage::FenceOld),
+            MigrationStage::FenceOld => Some(MigrationStage::ActivateNew),
+            MigrationStage::ActivateNew => Some(MigrationStage::Cleanup),
+            MigrationStage::Cleanup => None,
+        }
+    }
+
+    /// The stable ordinal of the stage.
+    pub fn ordinal(self) -> u8 {
+        match self {
+            MigrationStage::Prepare => 0,
+            MigrationStage::CatchUp => 1,
+            MigrationStage::FenceOld => 2,
+            MigrationStage::ActivateNew => 3,
+            MigrationStage::Cleanup => 4,
+        }
+    }
+}
+
+/// Durable proof that the old owner revoked its write authority.
+///
+/// The proof is produced by the old owner itself and is bound to the migration and to the
+/// old ownership epoch, so it can never be replayed as an authorization for another
+/// migration.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FenceProof {
+    pub migration_id: u128,
+    /// The node that revoked its authority.
+    pub old_owner: MetaNodeId,
+    /// The ownership epoch that was revoked.
+    pub old_epoch: u64,
+    /// Durable offset of the fence record in the old owner's WAL.
+    pub fence_offset: u64,
+    /// Digest of the durable fence record.
+    pub fence_digest: String,
+    /// Manifest generation that contains the fence record.
+    pub manifest_generation: u64,
+}
+
+/// A partition whose durable state a migration depends on, such as a DLQ partition.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DependentPartition {
+    pub tenant_id: u64,
+    pub topic_id: u64,
+    pub partition_id: u32,
+    /// Durable class of the dependent partition.
+    pub durable_class: u8,
+    /// The log incarnation the dependency refers to.
+    pub incarnation: u128,
 }
 
 /// Applied command outcome.

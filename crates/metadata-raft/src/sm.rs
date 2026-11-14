@@ -6,7 +6,8 @@
 //! before they replace the live state.
 use crate::storage::crc32c;
 use crate::types::{
-    MetaNode, MetaNodeId, MetadataCommand, MetadataCommandResponse, MetadataRaftTypeConfig,
+    DependentPartition, FenceProof, MetaNode, MetaNodeId, MetadataCommand, MetadataCommandResponse,
+    MetadataRaftTypeConfig, MigrationStage,
 };
 use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 use openraft::{
@@ -40,14 +41,38 @@ pub struct TopicState {
     pub policy_revision: u64,
 }
 
-/// One committed migration intent.
+/// One committed migration record.
+///
+/// The record is the authoritative description of an ownership handover: it names the source
+/// and the target, the incarnation that must survive the transfer, the epochs on both sides
+/// and the evidence that each stage produced.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MigrationState {
     pub migration_id: u128,
     pub tenant_id: u64,
     pub topic_id: u64,
     pub partition_id: u32,
-    pub stage: u8,
+    pub stage: MigrationStage,
+    /// The node that owns the partition until the activation is committed.
+    pub source_node: MetaNodeId,
+    /// The node that will own the partition after the activation.
+    pub target_node: MetaNodeId,
+    /// The log incarnation that must be transferred unchanged.
+    pub source_incarnation: u128,
+    /// The ownership epoch the source held when the migration started.
+    pub original_epoch: u64,
+    /// The ownership epoch the target owns after the activation.
+    pub next_epoch: u64,
+    /// Last committed source offset that was transferred and verified.
+    pub transfer_watermark: Option<u64>,
+    /// Identity of the verified manifest of the transferred inventory.
+    pub manifest_id: Option<String>,
+    /// Durable proof that the old owner revoked its write authority.
+    pub fence_proof: Option<FenceProof>,
+    /// The target published that it validated the complete transferred inventory.
+    pub target_ready: bool,
+    /// Partitions whose durable state the migration depends on, such as a DLQ partition.
+    pub dependent_partitions: Vec<DependentPartition>,
 }
 
 /// Authoritative metadata state of the group.
@@ -59,6 +84,13 @@ pub struct MetadataState {
     pub topics: BTreeMap<u64, TopicState>,
     pub placements: Vec<PlacementState>,
     pub migrations: BTreeMap<u128, MigrationState>,
+}
+
+/// A deterministic rejection of a committed command.
+fn rejected(reason: &str) -> MetadataCommandResponse {
+    MetadataCommandResponse::Rejected {
+        reason: reason.to_string(),
+    }
 }
 
 impl MetadataState {
@@ -147,16 +179,74 @@ impl MetadataState {
                     revision: self.revision,
                 }
             }
-            MetadataCommand::SetMigration {
+            MetadataCommand::BeginMigration {
                 migration_id,
                 tenant_id,
                 topic_id,
                 partition_id,
-                stage,
+                source_node,
+                target_node,
+                source_incarnation,
+                original_epoch,
+                next_epoch,
+                dependent_partitions,
             } => {
-                if *migration_id == 0 || *stage > 8 {
-                    return MetadataCommandResponse::Rejected {
-                        reason: "invalid migration".into(),
+                if *migration_id == 0
+                    || *source_node == 0
+                    || *target_node == 0
+                    || *source_node == *target_node
+                {
+                    return rejected("invalid migration identity");
+                }
+                if *source_incarnation == 0
+                    || *original_epoch == 0
+                    || *next_epoch <= *original_epoch
+                {
+                    return rejected("invalid migration epochs");
+                }
+                if !self.nodes.contains_key(source_node) || !self.nodes.contains_key(target_node) {
+                    return rejected("unknown migration node");
+                }
+                let Some(placement) = self.placement(*tenant_id, *topic_id, *partition_id) else {
+                    return rejected("unknown partition");
+                };
+                if placement.owner != *source_node {
+                    return rejected("the source is not the committed owner");
+                }
+                if placement.ownership_epoch != *original_epoch {
+                    return rejected("stale expected ownership epoch");
+                }
+                // One migration per partition at a time.
+                for existing in self.migrations.values() {
+                    if existing.tenant_id != *tenant_id
+                        || existing.topic_id != *topic_id
+                        || existing.partition_id != *partition_id
+                        || existing.stage == MigrationStage::Cleanup
+                    {
+                        continue;
+                    }
+                    if existing.migration_id == *migration_id {
+                        // The same command again: idempotent, no new revision.
+                        return MetadataCommandResponse::Applied {
+                            revision: self.revision,
+                        };
+                    }
+                    return rejected("a migration for this partition is already active");
+                }
+                if let Some(existing) = self.migrations.get(migration_id) {
+                    if existing.tenant_id != *tenant_id
+                        || existing.topic_id != *topic_id
+                        || existing.partition_id != *partition_id
+                        || existing.source_node != *source_node
+                        || existing.target_node != *target_node
+                        || existing.source_incarnation != *source_incarnation
+                        || existing.original_epoch != *original_epoch
+                        || existing.next_epoch != *next_epoch
+                    {
+                        return rejected("conflicting migration id");
+                    }
+                    return MetadataCommandResponse::Applied {
+                        revision: self.revision,
                     };
                 }
                 self.migrations.insert(
@@ -166,7 +256,17 @@ impl MetadataState {
                         tenant_id: *tenant_id,
                         topic_id: *topic_id,
                         partition_id: *partition_id,
-                        stage: *stage,
+                        stage: MigrationStage::Prepare,
+                        source_node: *source_node,
+                        target_node: *target_node,
+                        source_incarnation: *source_incarnation,
+                        original_epoch: *original_epoch,
+                        next_epoch: *next_epoch,
+                        transfer_watermark: None,
+                        manifest_id: None,
+                        fence_proof: None,
+                        target_ready: false,
+                        dependent_partitions: dependent_partitions.clone(),
                     },
                 );
                 self.revision += 1;
@@ -174,6 +274,134 @@ impl MetadataState {
                     revision: self.revision,
                 }
             }
+            MetadataCommand::AdvanceMigration {
+                migration_id,
+                stage,
+                transfer_watermark,
+                manifest_id,
+                fence_proof,
+                target_ready,
+            } => {
+                let Some(current) = self.migrations.get(migration_id) else {
+                    return rejected("unknown migration");
+                };
+                if current.stage == *stage {
+                    // The same stage with the same evidence again: idempotent.
+                    if current.transfer_watermark == *transfer_watermark
+                        && current.manifest_id == *manifest_id
+                        && current.fence_proof == *fence_proof
+                        && current.target_ready == *target_ready
+                    {
+                        return MetadataCommandResponse::Applied {
+                            revision: self.revision,
+                        };
+                    }
+                    return rejected("conflicting migration evidence");
+                }
+                if current.stage.next() != Some(*stage) {
+                    return rejected("migration stages may not be skipped");
+                }
+                match stage {
+                    MigrationStage::Prepare => {
+                        return rejected("a migration never returns to prepare");
+                    }
+                    MigrationStage::CatchUp => {
+                        if transfer_watermark.is_none() {
+                            return rejected("catch up without a verified transfer watermark");
+                        }
+                        if manifest_id.is_none() {
+                            return rejected("catch up without a verified manifest");
+                        }
+                    }
+                    MigrationStage::FenceOld => {
+                        if current.transfer_watermark.is_none() {
+                            return rejected("fence without a verified transfer watermark");
+                        }
+                        let Some(proof) = fence_proof else {
+                            return rejected("fence without durable fence evidence");
+                        };
+                        if proof.migration_id != *migration_id
+                            || proof.old_owner != current.source_node
+                            || proof.old_epoch != current.original_epoch
+                        {
+                            return rejected("the fence evidence does not match the migration");
+                        }
+                    }
+                    MigrationStage::ActivateNew => {
+                        if current.fence_proof.is_none() {
+                            return rejected("activation without fence evidence");
+                        }
+                        if transfer_watermark.is_none() {
+                            return rejected("activation without verified transfer completion");
+                        }
+                        if !*target_ready {
+                            return rejected("activation without target readiness evidence");
+                        }
+                    }
+                    MigrationStage::Cleanup => {
+                        if current.fence_proof.is_none() {
+                            return rejected("cleanup without fence evidence");
+                        }
+                    }
+                }
+                let entry = self
+                    .migrations
+                    .get_mut(migration_id)
+                    .expect("the migration exists");
+                entry.stage = *stage;
+                if transfer_watermark.is_some() {
+                    entry.transfer_watermark = *transfer_watermark;
+                }
+                if manifest_id.is_some() {
+                    entry.manifest_id = manifest_id.clone();
+                }
+                if fence_proof.is_some() {
+                    entry.fence_proof = fence_proof.clone();
+                }
+                entry.target_ready = *target_ready;
+                if *stage == MigrationStage::ActivateNew {
+                    // The committed activation moves the placement to the new owner and the
+                    // new ownership epoch. Until this entry is committed the old owner stays
+                    // authoritative.
+                    let (tenant_id, topic_id, partition_id, target_node, next_epoch) = (
+                        entry.tenant_id,
+                        entry.topic_id,
+                        entry.partition_id,
+                        entry.target_node,
+                        entry.next_epoch,
+                    );
+                    self.set_placement_owner(
+                        tenant_id,
+                        topic_id,
+                        partition_id,
+                        target_node,
+                        next_epoch,
+                    );
+                }
+                self.revision += 1;
+                MetadataCommandResponse::Applied {
+                    revision: self.revision,
+                }
+            }
+        }
+    }
+
+    /// Moves a placement to a new owner with a new ownership epoch.
+    fn set_placement_owner(
+        &mut self,
+        tenant_id: u64,
+        topic_id: u64,
+        partition_id: u32,
+        owner: MetaNodeId,
+        ownership_epoch: u64,
+    ) {
+        if let Some(placement) = self.placements.iter_mut().find(|entry| {
+            entry.tenant_id == tenant_id
+                && entry.topic_id == topic_id
+                && entry.partition_id == partition_id
+        }) {
+            placement.owner = owner;
+            placement.ownership_epoch = ownership_epoch;
         }
     }
 

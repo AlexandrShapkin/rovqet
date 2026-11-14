@@ -59,6 +59,11 @@ async fn only_committed_metadata_becomes_authoritative() {
         "the data plane must start without any authority"
     );
 
+    // A proposal is only accepted by the leader: wait for the election.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while node.current_leader().await != Some(1) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
     node.propose(MetadataCommand::SetNode {
         node: 1,
         address: "127.0.0.1:1".into(),

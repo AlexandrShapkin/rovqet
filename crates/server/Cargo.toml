@@ -29,3 +29,4 @@ fault-injection = ["rovqet-durable/fault-injection"]
 
 [dev-dependencies]
 rovqet-sdk = { path = "../sdk" }
+tempfile = "3"

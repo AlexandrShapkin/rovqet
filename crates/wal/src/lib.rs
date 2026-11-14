@@ -65,6 +65,10 @@ pub enum RecordKind {
     /// B-06 durable retry metadata (attempt count, backoff reason). Additive kind; the
     /// v1 record/segment/manifest encoding is unchanged.
     Retry = 7,
+    /// C-02 durable revocation of a Q1 owner's write authority. Additive kind; the v1
+    /// record/segment/manifest encoding is unchanged. The payload carries the migration
+    /// identity and the ownership epoch that was revoked.
+    Fence = 8,
 }
 impl RecordKind {
     fn decode(v: u8) -> Result<Self> {
@@ -76,6 +80,7 @@ impl RecordKind {
             5 => Self::CursorCheckpoint,
             6 => Self::Tombstone,
             7 => Self::Retry,
+            8 => Self::Fence,
             _ => return Err(Error::Corruption("unknown record kind")),
         })
     }
