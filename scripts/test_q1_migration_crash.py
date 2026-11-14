@@ -215,6 +215,9 @@ def run_scenario(scenario: Scenario) -> dict:
             return result
         result["barrier_reached"] = True
         victim.kill()
+        # The restarted process must proceed: the barrier is a one-shot pause for the crash
+        # window, not a permanent block.
+        victim.env = {}
         victim.start()
         # The victim must come back on its original storage.
         if scenario.victim == "source":
@@ -263,6 +266,68 @@ def run_scenario(scenario: Scenario) -> dict:
             node.stop()
 
 
+def run_unreachable_successor() -> dict:
+    """The successor is unreachable while the source keeps serving.
+
+    The source is alive with a valid local authority and the metadata majority (source and
+    the third voter) keeps running, but the transfer and the activation path cannot reach the
+    successor. The migration must not advance and the source must keep serving; once the
+    successor returns, the handover completes.
+    """
+    root = Path(tempfile.mkdtemp(prefix="rovqet-crash-unreachable-"))
+    peer_ports = {1: free_port(), 2: free_port()}
+    raft_ports = {1: free_port(), 2: free_port(), 3: free_port()}
+    source = broker("source", 1, root / "source", peer_ports, raft_ports, True)
+    target = broker("target", 2, root / "target", peer_ports, raft_ports, False)
+    voter = Node(
+        "voter3",
+        [str(VOTER), "--id", "3", "--cluster-id", str(CLUSTER),
+         "--listen", f"127.0.0.1:{raft_ports[3]}", "--data-dir", str(root / "voter3"),
+         "--bootstrap", "false",
+         "--peer", f"1=127.0.0.1:{raft_ports[1]}",
+         "--peer", f"2=127.0.0.1:{raft_ports[2]}",
+         "--peer", f"3=127.0.0.1:{raft_ports[3]}"],
+        root,
+    )
+    result = {"scenario": "C7-unreachable-successor", "barrier": "-", "verdict": "INVALID",
+              "reasons": [], "barrier_reached": True}
+    try:
+        # The successor is not started at all: the direction to it is blocked.
+        source.start()
+        voter.start()
+        if source.wait_for("Q1 route active", 60) is None:
+            result["reasons"].append("the source never opened its route")
+            return result
+        published = publish(source, 0)
+        if published.returncode != 0:
+            result["reasons"].append("the source publication failed")
+            return result
+        (root / "source" / "raft" / "MIGRATE").write_text("2\n")
+        # The source keeps serving while the successor is unreachable.
+        time.sleep(5)
+        again = publish(source, 1)
+        if again.returncode != 0:
+            result["reasons"].append("the source stopped serving before any fence")
+            return result
+        if source.wait_for("Q1 route active", 1) is None:
+            result["reasons"].append("the source route disappeared")
+            return result
+        # No activation can have happened: the successor never ran.
+        if target.lines:
+            result["reasons"].append("the successor ran while it was unreachable")
+            return result
+        # The successor returns and the handover completes.
+        target.start()
+        if target.wait_for("Q1 route active", 120) is None:
+            result["reasons"].append("the handover did not complete once the successor returned")
+            return result
+        result["verdict"] = "PASS"
+        return result
+    finally:
+        for node in (source, target, voter):
+            node.stop()
+
+
 def main() -> int:
     if not SERVER.exists() or not VOTER.exists():
         print("build the brokers first", file=sys.stderr)
@@ -277,6 +342,15 @@ def main() -> int:
         executed += 1
         verdicts.append(result)
         print(f"===== {scenario.id}: {result['verdict']} {result['reasons']} =====", flush=True)
+    print("\n===== C7-unreachable-successor =====", flush=True)
+    unreachable = run_unreachable_successor()
+    executed += 1
+    verdicts.append(unreachable)
+    print(
+        f"===== C7-unreachable-successor: {unreachable['verdict']} "
+        f"{unreachable['reasons']} =====",
+        flush=True,
+    )
     journal = {
         "schema": "rovqet-migration-crash-v1",
         "executed": executed,

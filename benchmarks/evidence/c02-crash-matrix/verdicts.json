@@ -1,0 +1,56 @@
+{
+  "schema": "rovqet-migration-crash-v1",
+  "executed": 7,
+  "verdicts": [
+    {
+      "scenario": "C1-before-fence",
+      "barrier": "before_fence",
+      "verdict": "PASS",
+      "reasons": [],
+      "barrier_reached": true
+    },
+    {
+      "scenario": "C2-after-fence",
+      "barrier": "after_fence",
+      "verdict": "PASS",
+      "reasons": [],
+      "barrier_reached": true
+    },
+    {
+      "scenario": "C3-before-activate-commit",
+      "barrier": "before_activate_commit",
+      "verdict": "PASS",
+      "reasons": [],
+      "barrier_reached": true
+    },
+    {
+      "scenario": "C4-promotion-intent",
+      "barrier": "promotion_intent",
+      "verdict": "PASS",
+      "reasons": [],
+      "barrier_reached": true
+    },
+    {
+      "scenario": "C5-before-route-open",
+      "barrier": "before_route_open",
+      "verdict": "PASS",
+      "reasons": [],
+      "barrier_reached": true
+    },
+    {
+      "scenario": "C6-after-route-open",
+      "barrier": "after_route_open",
+      "verdict": "PASS",
+      "reasons": [],
+      "barrier_reached": true
+    },
+    {
+      "scenario": "C7-unreachable-successor",
+      "barrier": "-",
+      "verdict": "PASS",
+      "reasons": [],
+      "barrier_reached": true
+    }
+  ],
+  "broker_version": "rovqet 0.1.0 (wire v1; development profile)"
+}
