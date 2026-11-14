@@ -906,7 +906,7 @@
         "docs/architecture/09-cluster-control.md"
       ],
       "evidence": {
-        "commit": "43a6727",
+        "commit": "8c7dd54",
         "verification": "PARTIAL: the metadata Raft group, the committed ownership fencing, the committed migration state machine, the bounded transfer and the crash-safe promotion are implemented and verified, and the successor really opens the transferred WAL as its active Q1 partition. The remaining gaps are listed in remaining_work.",
         "test_command": [
           "cargo fmt --all -- --check",
@@ -931,7 +931,7 @@
           "python3 scripts/test_q1_faults.py",
           "git diff --check"
         ],
-        "observed_result": "The Rust suites pass with zero ignored tests. The migration campaign result is: PENDING: the multi-process campaign is still being brought to green. The independent oracle verdict of the campaign journal is recorded in evidence.migration_oracle.",
+        "observed_result": "The Rust suites pass with zero ignored tests. The migration campaign result is: PASS: python3 scripts/test_q1_migration.py runs seven scenarios against three metadata voters, a source broker, a target broker and external publisher and consumer processes, and the independent oracle accepts the journal. The independent oracle verdict of the campaign journal is recorded in evidence.migration_oracle.",
         "fencing_implemented": "The durable partition owns the fencing state, not only the routing layer. Partition::set_authority installs Authority {owner, epoch, lease} from committed control-plane metadata; the command is ordered with durable mutations in the actor. Publication, deduplicated retry, consumer FETCH, ACK, NACK and terminal disposition (quarantine and DLQ) all check the authority before starting and fail closed with a stale-epoch error when the local node is not the committed owner. The lease is bounded and counted from local installation, so an expired lease fails closed and a restart never extends it. An older epoch can never replace a newer authority. A mutation whose lease expires during its barrier is reported as an uncertain outcome, never a false COMMITTED_LOCAL. Standalone partitions (no installed authority) keep the previous single-node behaviour.",
         "fencing_evidence": "Actor tests prove: standalone partitions are unfenced; a foreign owner is fenced for publish, fetch, ack and nack; an expired lease fails closed; a newer authority fences the previous owner and an older epoch cannot replace it. Two real broker processes prove: a publication to the non-owner is forwarded once to the owner, the owner performs the durable commit and returns its own offset, the producer token retry returns the same offset without a second record, and an expired ownership lease stops the old owner from committing while its committed history stays readable.",
         "raft_library_decision": "openraft 0.9.26 selected deliberately (the architecture references 0.9.x; 0.10 changes the storage and network contracts). It is pinned exactly with the features serde and storage-v2. The v2 traits are used as published: RaftLogStorage with a LogFlushed completion callback, RaftLogReader, vote and committed-index persistence, RaftStateMachine with a snapshot builder, RaftNetwork (vote, append entries, install snapshot) and RaftNetworkFactory. Library types stay inside the dedicated crates/metadata-raft adapter; the public control-plane model does not depend on OpenRaft internals, and the Raft log index is unrelated to Q1 application offsets.",
