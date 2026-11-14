@@ -506,12 +506,51 @@ def reconcile_migration(records: list[dict], *, require_conclusion: bool = True)
                         f"activation watermark {activation_watermark}"
                     )
 
+    # A dependent DLQ partition must have a recorded proof: a terminal disposition that
+    # references a DLQ record needs a recoverable destination, and a missing or fabricated
+    # proof must never pass.
+    dependencies = [
+        record for record in records if record["event"] == "migration_dependency"
+    ]
+    proofs = [record for record in records if record["event"] == "dlq_proof"]
+    for dependency in dependencies:
+        if not any(
+            proof.get("migration_id") == dependency.get("migration_id")
+            and proof.get("partition") == dependency.get("partition")
+            for proof in proofs
+        ):
+            reasons.append(
+                "the dependent partition "
+                f"{dependency.get('partition')} has no recorded DLQ proof"
+            )
+    for proof in proofs:
+        if proof.get("verified") is not True:
+            reasons.append(
+                f"the DLQ proof of {proof.get('partition')} is not verified"
+            )
+
+    # A source or target commit outside the committed ownership window is a dual owner.
+    for record in commits:
+        node = record.get("node")
+        if node == source and fence_seq is not None and record["seq"] <= fence_seq:
+            continue
+        if node == target and activation_seq is not None and record["seq"] > activation_seq:
+            continue
+        if node in (source, target) and fence_seq is not None and activation_seq is not None:
+            if fence_seq < record["seq"] < activation_seq:
+                reasons.append(
+                    f"node {node} committed at seq {record['seq']} between the fence and "
+                    "the activation"
+                )
+
     counts = {
         "migration_id": str(migration_id),
         "stages": len(stages),
         "fences": len(fences),
         "activations": len(activations),
         "commits": len(commits),
+        "dependencies": len(dependencies),
+        "dlq_proofs": len(proofs),
     }
     verdict = FAIL if reasons else PASS
     return _result(verdict, reasons, counts)
