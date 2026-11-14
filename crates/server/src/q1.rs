@@ -479,6 +479,28 @@ impl Route {
     pub fn install_authority(&self, authority: Option<rovqet_durable::Authority>) {
         let _ = self.partition.set_authority(authority);
     }
+    /// Durably revokes the write authority of this partition.
+    ///
+    /// The proof exists only after the fence record is durable. The revocation is a record
+    /// of the Q1 WAL, so a restart of this node cannot restore the obsolete authority.
+    pub async fn fence_old_owner(
+        &self,
+        migration_id: u128,
+        old_epoch: u64,
+        next_epoch: u64,
+    ) -> Result<rovqet_durable::FenceProof, rovqet_durable::Error> {
+        self.partition
+            .fence_old_owner_async(migration_id, old_epoch, next_epoch)
+            .await
+    }
+    /// The directory of this partition.
+    pub fn directory(&self) -> &std::path::Path {
+        &self.options.directory
+    }
+    /// The committed position of the local log.
+    pub fn committed_count(&self) -> u64 {
+        self.partition.committed_count()
+    }
     pub fn shutdown(self) -> io::Result<()> {
         let Route { partition, dlq, .. } = self;
         partition

@@ -5,6 +5,7 @@ use rovqet_q0::Broker;
 use rovqet_router::{OverflowPolicy, TopicConfig};
 use rovqet_transport::{Config, TransportStats, serve};
 mod cluster;
+mod migration;
 mod q1;
 mod transfer;
 use std::{
@@ -30,6 +31,8 @@ struct Options {
     metrics_interval: Option<Duration>,
     q1: Option<q1::Options>,
     cluster: Option<cluster::ClusterOptions>,
+    /// The node this broker hands its partition over to.
+    migrate_to: Option<u64>,
 }
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
@@ -43,6 +46,7 @@ impl Options {
             metrics_interval: None,
             q1: None,
             cluster: None,
+            migrate_to: None,
         };
         let mut q1_values = HashMap::new();
         let mut seen = HashSet::new();
@@ -58,6 +62,7 @@ impl Options {
         let mut metadata_raft_peers: Vec<(u64, SocketAddr)> = Vec::new();
         let mut metadata_raft_bootstrap = false;
         let mut transfer_staging: Option<PathBuf> = None;
+        let mut migrate_to: Option<u64> = None;
         for pair in args.chunks(2) {
             if pair.len() != 2 {
                 return Err(invalid("expected unique --option value pairs; see --help"));
@@ -116,6 +121,13 @@ impl Options {
                 }
                 "--metadata-raft-dir" => metadata_raft_dir = Some(PathBuf::from(&pair[1])),
                 "--transfer-staging-dir" => transfer_staging = Some(PathBuf::from(&pair[1])),
+                "--migrate-to" => {
+                    migrate_to = Some(
+                        pair[1]
+                            .parse()
+                            .map_err(|_| invalid("invalid migration target node"))?,
+                    )
+                }
                 "--metadata-raft-listen" => {
                     metadata_raft_listen = Some(
                         pair[1]
@@ -258,6 +270,7 @@ impl Options {
                     metadata_raft: metadata_raft_options,
                     transfer_staging,
                 });
+                result.migrate_to = migrate_to;
             }
             (None, None) => {
                 if cluster_listen.is_some()
@@ -456,6 +469,34 @@ async fn main() -> io::Result<()> {
                     authority.map(|value| value.lease.as_millis()).unwrap_or(0)
                 );
             }
+        }
+        // The migration coordinator drives a committed handover of this partition. It only
+        // acts on a committed migration record, and it never activates a successor without
+        // a durable fence of the old owner.
+        if let (Some(raft), Some(route)) = (cluster.raft.clone(), &route) {
+            let driver = migration::MigrationDriver::new(
+                cluster.transport.clone(),
+                raft.clone(),
+                route.directory().to_path_buf(),
+                cluster.node.get(),
+            );
+            let target_request = options.migrate_to.and_then(|target| {
+                options.q1.as_ref().map(|q1| {
+                    (
+                        target,
+                        q1.partition.tenant_id,
+                        q1.partition.topic_id,
+                        q1.partition.partition_id,
+                        q1.incarnation,
+                    )
+                })
+            });
+            tokio::spawn(migration::run_coordinator(
+                driver,
+                route.clone(),
+                cluster.node.get(),
+                target_request,
+            ));
         }
         let listener = tokio::net::TcpListener::bind(cluster_options_listen(&options)).await?;
         let address = listener.local_addr()?;

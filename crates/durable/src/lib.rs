@@ -514,6 +514,14 @@ impl Partition {
     pub fn incarnation(&self) -> u128 {
         self.incarnation
     }
+    /// The number of committed records of this partition.
+    ///
+    /// It is the committed position of the local log and grows with every committed
+    /// record. A migration uses it as the transfer watermark.
+    pub fn committed_count(&self) -> u64 {
+        self.committed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Durably revokes the write authority of this partition.
     ///
     /// The returned proof exists only after the fence record is durable. A fenced

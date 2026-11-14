@@ -105,7 +105,11 @@ impl TransferStaging {
         if total > MAX_STAGED_BYTES {
             return Err(TransferError::TooLarge);
         }
-        let directory = root.join(format!("migration-{:032x}", request.migration_id));
+        let directory = root.join(format!(
+            "migration-{:032x}-inv-{}",
+            request.migration_id,
+            bytes_to_hex(&request.manifest_digest)
+        ));
         std::fs::create_dir_all(&directory)
             .map_err(|error| TransferError::Io(error.to_string()))?;
         let manifest = directory.join("staging.json");
@@ -173,8 +177,15 @@ impl TransferStaging {
     ///
     /// The declared inventory and the received chunks are read back from the staging
     /// directory, so an interrupted transfer resumes with the chunks that are durable.
-    pub fn reopen(root: &Path, migration_id: u128) -> Result<Self, TransferError> {
-        let directory = root.join(format!("migration-{migration_id:032x}"));
+    pub fn reopen(
+        root: &Path,
+        migration_id: u128,
+        inventory_digest: &[u8],
+    ) -> Result<Self, TransferError> {
+        let directory = root.join(format!(
+            "migration-{migration_id:032x}-inv-{}",
+            bytes_to_hex(inventory_digest)
+        ));
         let manifest = directory.join("staging.json");
         let text = std::fs::read_to_string(&manifest)
             .map_err(|error| TransferError::Io(error.to_string()))?;
@@ -389,7 +400,7 @@ impl TransferStaging {
 /// staged bytes are limited, and a chunk never carries a path.
 pub struct TransferManager {
     root: PathBuf,
-    areas: BTreeMap<u128, TransferStaging>,
+    areas: BTreeMap<(u128, String), TransferStaging>,
 }
 
 impl TransferManager {
@@ -408,12 +419,17 @@ impl TransferManager {
         &self.root
     }
 
-    fn area(&mut self, migration_id: u128) -> Result<&mut TransferStaging, TransferError> {
-        if !self.areas.contains_key(&migration_id) {
-            let area = TransferStaging::reopen(&self.root, migration_id)?;
-            self.areas.insert(migration_id, area);
+    fn area(
+        &mut self,
+        migration_id: u128,
+        inventory_digest: &[u8],
+    ) -> Result<&mut TransferStaging, TransferError> {
+        let key = (migration_id, bytes_to_hex(inventory_digest));
+        if !self.areas.contains_key(&key) {
+            let area = TransferStaging::reopen(&self.root, migration_id, inventory_digest)?;
+            self.areas.insert(key.clone(), area);
         }
-        Ok(self.areas.get_mut(&migration_id).expect("the area exists"))
+        Ok(self.areas.get_mut(&key).expect("the area exists"))
     }
 
     /// Accepts a transfer preparation.
@@ -423,7 +439,10 @@ impl TransferManager {
     ) -> Result<Q1TransferPrepareResponse, TransferError> {
         let area = TransferStaging::prepare(&self.root, request)?;
         let staging_id = request.migration_id;
-        self.areas.insert(request.migration_id, area);
+        self.areas.insert(
+            (request.migration_id, bytes_to_hex(&request.manifest_digest)),
+            area,
+        );
         Ok(Q1TransferPrepareResponse {
             accepted: true,
             staging_id,
@@ -436,7 +455,7 @@ impl TransferManager {
         &mut self,
         request: &Q1TransferChunkRequest,
     ) -> Result<Q1TransferChunkResponse, TransferError> {
-        let area = self.area(request.migration_id)?;
+        let area = self.area(request.migration_id, &request.inventory_digest)?;
         match area.accept_chunk(request) {
             Ok(ChunkOutcome::Stored) => Ok(Q1TransferChunkResponse {
                 accepted: true,
@@ -470,7 +489,7 @@ impl TransferManager {
         &mut self,
         request: &Q1TransferFinalizeRequest,
     ) -> Result<Q1TransferFinalizeResponse, TransferError> {
-        let area = self.area(request.migration_id)?;
+        let area = self.area(request.migration_id, &request.inventory_digest)?;
         match area.finalize(request) {
             Ok(FinalizeOutcome::Complete { .. }) => {
                 // Without the fence evidence the inventory is complete but the target is not
@@ -499,6 +518,22 @@ impl TransferManager {
             }),
         }
     }
+}
+
+/// The canonical digest of a transferred inventory.
+///
+/// It covers the file names, the sizes and the file digests, so two inventories are equal
+/// exactly when they describe the same durable history.
+pub fn inventory_digest(files: &[Q1TransferFile]) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    let mut sorted: Vec<&Q1TransferFile> = files.iter().collect();
+    sorted.sort_by(|left, right| left.name.cmp(&right.name));
+    for file in sorted {
+        hasher.update(file.name.as_bytes());
+        hasher.update(file.size.to_be_bytes());
+        hasher.update(&file.digest);
+    }
+    hasher.finalize().to_vec()
 }
 
 /// The hexadecimal form of a digest.
@@ -591,6 +626,7 @@ mod tests {
         let digest = sha256(&data);
         Q1TransferChunkRequest {
             migration_id,
+            inventory_digest: vec![9u8; 32],
             chunk_index: index,
             file_index,
             offset,
@@ -602,6 +638,7 @@ mod tests {
     fn finalize(migration_id: u128) -> Q1TransferFinalizeRequest {
         Q1TransferFinalizeRequest {
             migration_id,
+            inventory_digest: vec![9u8; 32],
             final_digest: vec![2u8; 32],
             last_committed_offset: 10,
             transfer_watermark: 10,

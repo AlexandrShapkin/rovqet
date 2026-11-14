@@ -788,7 +788,7 @@ mod transfer_tests {
             original_epoch: 5,
             next_epoch: 6,
             manifest_generation: 3,
-            manifest_digest: vec![1u8; 32],
+            manifest_digest: vec![8u8; 32],
             files: vec![Q1TransferFile {
                 name: "MANIFEST".into(),
                 size: payload.len() as u64,
@@ -812,6 +812,7 @@ mod transfer_tests {
 
         let chunk = Q1TransferChunkRequest {
             migration_id: MIGRATION,
+            inventory_digest: vec![8u8; 32],
             chunk_index: 0,
             file_index: 0,
             offset: 0,
@@ -873,6 +874,7 @@ mod transfer_tests {
         // Without the fence evidence the target only confirms the inventory.
         let finalize = Q1TransferFinalizeRequest {
             migration_id: MIGRATION,
+            inventory_digest: vec![8u8; 32],
             final_digest: digest.clone(),
             last_committed_offset: 10,
             transfer_watermark: 10,
@@ -939,5 +941,345 @@ mod transfer_tests {
         );
         let error = handler.handle(envelope).await;
         assert_eq!(error, Err(RpcErrorCode::Unsupported));
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    use crate::migration::{MigrationDriver, TRANSFER_CHUNK_BYTES};
+    use rovqet_core::{DurableOffset, PartitionRef, QoS};
+    use rovqet_metadata_raft::types::{MetadataCommand, MigrationStage};
+    use rovqet_metadata_raft::{MetadataNode, MetadataNodeConfig};
+    use std::time::Duration;
+
+    const CLUSTER: u128 = 990099;
+
+    fn free_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("port");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        port
+    }
+
+    fn directory(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "rovqet-migration-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&path).expect("directory");
+        path
+    }
+
+    fn partition() -> PartitionRef {
+        PartitionRef {
+            tenant_id: 1,
+            topic_id: 3,
+            partition_id: 0,
+        }
+    }
+
+    async fn metadata_node(
+        id: u64,
+        ports: [u16; 3],
+        path: PathBuf,
+        bootstrap: bool,
+    ) -> MetadataNode {
+        let peers: Vec<(u64, std::net::SocketAddr)> = (1..=3)
+            .map(|node| {
+                (
+                    node,
+                    format!("127.0.0.1:{}", ports[node as usize - 1])
+                        .parse()
+                        .expect("addr"),
+                )
+            })
+            .collect();
+        MetadataNode::start(MetadataNodeConfig {
+            id,
+            cluster_id: CLUSTER,
+            listen: format!("127.0.0.1:{}", ports[id as usize - 1])
+                .parse()
+                .expect("addr"),
+            peers,
+            data_directory: path,
+            bootstrap,
+            election_timeout_ms: 300,
+            heartbeat_interval_ms: 80,
+            max_payload_entries: 64,
+            snapshot_logs_since_last: 8,
+        })
+        .await
+        .expect("metadata node")
+    }
+
+    async fn serve(cluster: Arc<Cluster>, listen: SocketAddr) -> tokio::sync::watch::Sender<bool> {
+        let listener = tokio::net::TcpListener::bind(listen)
+            .await
+            .expect("listener");
+        let server = rovqet_control::transport::PeerServer::new(
+            listener,
+            cluster.trust.clone(),
+            Arc::new(ClusterHandler::new(cluster, None)),
+            Default::default(),
+        )
+        .expect("peer server");
+        let (stop, stop_rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(server.serve(stop_rx));
+        stop
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn a_committed_migration_fences_the_old_owner_and_activates_the_new_one() {
+        // The metadata group: three real voters, the source is the bootstrap node.
+        let raft_ports = [free_port(), free_port(), free_port()];
+        let mut raft_nodes = Vec::new();
+        for index in 0..3 {
+            raft_nodes.push(Arc::new(
+                metadata_node(
+                    index as u64 + 1,
+                    raft_ports,
+                    directory(&format!("raft{}", index + 1)),
+                    index == 0,
+                )
+                .await,
+            ));
+        }
+        let source_raft = raft_nodes[0].clone();
+        // Wait until the source won the election: only the leader may propose.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while source_raft.current_leader().await != Some(1) && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(source_raft.current_leader().await, Some(1));
+
+        // The source owns a Q1 partition with committed history.
+        let source_dir = directory("source-q1");
+        let route = Arc::new(
+            crate::q1::Route::open(crate::q1::Options {
+                directory: source_dir.clone(),
+                topic: "durable".into(),
+                node_id: 1,
+                partition: partition(),
+                incarnation: 42,
+                owner_epoch: 7,
+                dedup_window: Duration::from_secs(86400),
+                max_producers: 64,
+                max_outcomes: 64,
+                initialize_new_log: true,
+                terminal_policy: rovqet_durable::TerminalPolicy::Dlq,
+                max_attempts: 3,
+                retry_initial: Duration::from_millis(10),
+                retry_max: Duration::from_millis(100),
+                dlq: None,
+            })
+            .expect("the source route"),
+        );
+        route.install_authority(Some(
+            rovqet_durable::Authority::new(1, 7, Duration::from_secs(600)).expect("authority"),
+        ));
+        route
+            .publish_durable(&rovqet_control::rpc::RoutePublishRequest {
+                tenant_id: 1,
+                topic_id: 3,
+                partition_id: 0,
+                qos: 1,
+                ownership_epoch: 7,
+                producer_id: 11,
+                producer_epoch: 1,
+                producer_sequence: 0,
+                message_id: 777,
+                ttl_ms: 5000,
+                payload: b"committed before the migration".to_vec(),
+            })
+            .await
+            .expect("a publication before the migration");
+
+        // The committed metadata places the partition on the source.
+        for command in [
+            MetadataCommand::SetNode {
+                node: 1,
+                address: "127.0.0.1:1".into(),
+            },
+            MetadataCommand::SetNode {
+                node: 2,
+                address: "127.0.0.1:2".into(),
+            },
+            MetadataCommand::SetPlacement {
+                tenant_id: 1,
+                topic_id: 3,
+                partition_id: 0,
+                owner: 1,
+                ownership_epoch: 7,
+                lease_valid_for_ms: 600_000,
+            },
+        ] {
+            let response = source_raft
+                .propose(command)
+                .await
+                .expect("committed metadata");
+            assert!(
+                matches!(
+                    response,
+                    rovqet_metadata_raft::types::MetadataCommandResponse::Applied { .. }
+                ),
+                "the metadata command must be applied"
+            );
+        }
+
+        // The two brokers: the source and the target, with real peer sockets.
+        let source_port = free_port();
+        let target_port = free_port();
+        let source_address: SocketAddr = format!("127.0.0.1:{source_port}").parse().unwrap();
+        let target_address: SocketAddr = format!("127.0.0.1:{target_port}").parse().unwrap();
+        let source_staging = directory("source-transfer");
+        let target_staging = directory("target-transfer");
+        let source_cluster = Arc::new(
+            Cluster::new(&ClusterOptions {
+                cluster_id: CLUSTER,
+                node_id: 1,
+                listen: source_address,
+                peers: vec![(2, target_address)],
+                metadata: None,
+                metadata_raft: None,
+                transfer_staging: Some(source_staging.clone()),
+            })
+            .await
+            .expect("the source cluster"),
+        );
+        let target_cluster = Arc::new(
+            Cluster::new(&ClusterOptions {
+                cluster_id: CLUSTER,
+                node_id: 2,
+                listen: target_address,
+                peers: vec![(1, source_address)],
+                metadata: None,
+                metadata_raft: None,
+                transfer_staging: Some(target_staging.clone()),
+            })
+            .await
+            .expect("the target cluster"),
+        );
+        let _source_stop = serve(source_cluster.clone(), source_address).await;
+        let _target_stop = serve(target_cluster.clone(), target_address).await;
+
+        // The operator commits the migration.
+        let migration_id = crate::migration::migration_id(1, 3, 0, 42, 1, 2);
+        let response = source_raft
+            .propose(MetadataCommand::BeginMigration {
+                migration_id,
+                tenant_id: 1,
+                topic_id: 3,
+                partition_id: 0,
+                source_node: 1,
+                target_node: 2,
+                source_incarnation: 42,
+                original_epoch: 7,
+                next_epoch: 8,
+                dependent_partitions: Vec::new(),
+            })
+            .await
+            .expect("the migration must be committed");
+        assert!(
+            matches!(
+                response,
+                rovqet_metadata_raft::types::MetadataCommandResponse::Applied { .. }
+            ),
+            "the migration must be accepted by the metadata group"
+        );
+
+        // The source drives the stages.
+        let driver = MigrationDriver::new(
+            source_cluster.transport.clone(),
+            source_raft.clone(),
+            source_dir.clone(),
+            1,
+        );
+        tokio::spawn(crate::migration::run_coordinator(
+            driver,
+            route.clone(),
+            1,
+            None,
+        ));
+
+        // The migration completes: the committed placement moves to the target.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let mut activated = false;
+        while std::time::Instant::now() < deadline {
+            let state = source_raft.applied_state();
+            if let Some(placement) = state.placement(1, 3, 0) {
+                if placement.owner == 2 && placement.ownership_epoch == 8 {
+                    activated = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let state = source_raft.applied_state();
+        let record = state
+            .migrations
+            .get(&migration_id)
+            .expect("the migration record");
+        assert_eq!(
+            record.stage,
+            MigrationStage::ActivateNew,
+            "the migration must reach the activation"
+        );
+        assert!(
+            record.fence_proof.is_some(),
+            "the activation must carry the fence proof"
+        );
+        assert!(
+            record.transfer_watermark.is_some(),
+            "the activation must carry a verified transfer watermark"
+        );
+        assert!(activated, "the committed placement must move to the target");
+
+        // The old owner refuses to mutate: it was fenced durably.
+        let refused = route
+            .publish_durable(&rovqet_control::rpc::RoutePublishRequest {
+                tenant_id: 1,
+                topic_id: 3,
+                partition_id: 0,
+                qos: 1,
+                ownership_epoch: 7,
+                producer_id: 11,
+                producer_epoch: 1,
+                producer_sequence: 1,
+                message_id: 778,
+                ttl_ms: 5000,
+                payload: b"after the fence".to_vec(),
+            })
+            .await;
+        assert!(
+            refused.is_err(),
+            "the fenced old owner must not commit another publication"
+        );
+
+        // The target received the complete inventory.
+        let staged = target_staging;
+        let mut files = 0;
+        for entry in std::fs::read_dir(&staged).expect("staging root") {
+            let entry = entry.expect("entry");
+            let inventory = entry.path().join("staging.json");
+            if inventory.is_file() {
+                files += 1;
+            }
+        }
+        assert!(
+            files >= 1,
+            "the target must have staged the transferred history"
+        );
+        let _ = TRANSFER_CHUNK_BYTES;
+        let _ = DurableOffset {
+            log_incarnation: 42,
+            sequence: 0,
+        };
+        let _ = QoS::Q1;
     }
 }

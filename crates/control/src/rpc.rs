@@ -405,6 +405,9 @@ impl Q1TransferPrepareResponse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Q1TransferChunkRequest {
     pub migration_id: u128,
+    /// The identity of the inventory this chunk belongs to. A migration may transfer more
+    /// than one inventory: the final one contains the history after the fence.
+    pub inventory_digest: Vec<u8>,
     pub chunk_index: u64,
     /// Index into the file list of the prepare request. A chunk never carries a path.
     pub file_index: u32,
@@ -418,6 +421,7 @@ impl Q1TransferChunkRequest {
     pub fn encode(&self) -> Vec<u8> {
         let mut writer = BodyWriter::new();
         writer.u128(self.migration_id);
+        writer.bytes(&self.inventory_digest);
         writer.u64(self.chunk_index);
         writer.u32(self.file_index);
         writer.u64(self.offset);
@@ -429,6 +433,7 @@ impl Q1TransferChunkRequest {
     pub fn decode(body: &[u8]) -> Result<Self, BodyError> {
         let mut reader = BodyReader::new(body);
         let migration_id = reader.u128()?;
+        let inventory_digest = reader.bytes()?.to_vec();
         let chunk_index = reader.u64()?;
         let file_index = reader.u32()?;
         let offset = reader.u64()?;
@@ -442,6 +447,7 @@ impl Q1TransferChunkRequest {
         }
         Ok(Self {
             migration_id,
+            inventory_digest,
             chunk_index,
             file_index,
             offset,
@@ -499,6 +505,8 @@ impl Q1TransferChunkResponse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Q1TransferFinalizeRequest {
     pub migration_id: u128,
+    /// The identity of the inventory that is finalized.
+    pub inventory_digest: Vec<u8>,
     /// Digest over the complete transferred inventory.
     pub final_digest: Vec<u8>,
     /// Last committed offset of the source at the time of the finalize.
@@ -516,6 +524,7 @@ impl Q1TransferFinalizeRequest {
     pub fn encode(&self) -> Vec<u8> {
         let mut writer = BodyWriter::new();
         writer.u128(self.migration_id);
+        writer.bytes(&self.inventory_digest);
         writer.bytes(&self.final_digest);
         writer.u64(self.last_committed_offset);
         writer.u64(self.transfer_watermark);
@@ -532,6 +541,7 @@ impl Q1TransferFinalizeRequest {
     pub fn decode(body: &[u8]) -> Result<Self, BodyError> {
         let mut reader = BodyReader::new(body);
         let migration_id = reader.u128()?;
+        let inventory_digest = reader.bytes()?.to_vec();
         let final_digest = reader.bytes()?.to_vec();
         let last_committed_offset = reader.u64()?;
         let transfer_watermark = reader.u64()?;
@@ -550,6 +560,7 @@ impl Q1TransferFinalizeRequest {
         }
         Ok(Self {
             migration_id,
+            inventory_digest,
             final_digest,
             last_committed_offset,
             transfer_watermark,
@@ -1076,6 +1087,7 @@ mod tests {
     fn transfer_chunk_bodies_round_trip_and_bound_the_payload() {
         let request = Q1TransferChunkRequest {
             migration_id: 5,
+            inventory_digest: vec![7u8; 32],
             chunk_index: 3,
             file_index: 0,
             offset: 1024,
@@ -1111,6 +1123,7 @@ mod tests {
         let without_fence = Q1TransferFinalizeRequest {
             migration_id: 5,
             final_digest: vec![3u8; 32],
+            inventory_digest: vec![6u8; 32],
             last_committed_offset: 42,
             transfer_watermark: 40,
             manifest_generation: 3,
