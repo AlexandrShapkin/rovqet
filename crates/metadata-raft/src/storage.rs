@@ -592,18 +592,19 @@ impl FileLogReader {
         RB: std::ops::RangeBounds<u64>,
     {
         let mut entries = Vec::new();
-        let mut file = File::open(&self.path)
-            .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Read, error))?;
-        // `BTreeMap::range` yields the stored keys in ascending index order, and an empty
-        // result is allowed only for a range that holds no entry.
+        // The read lock is taken before the file is opened and held while the payloads are
+        // read: a rewrite replaces the log file under the write lock, so a reader must never
+        // hold a handle to the replaced file while the index already describes the new one.
         let index = self
             .index
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // `BTreeMap::range` yields the stored keys in ascending index order, and an empty
+        // result is allowed only for a range that holds no entry.
         let positions: Vec<EntryIndex> =
             index.range(range).map(|(_, position)| *position).collect();
-        // The read lock is held while the payloads are read: a rewrite replaces the log file
-        // under the write lock, so a reader must never see the new file with old offsets.
+        let mut file = File::open(&self.path)
+            .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Read, error))?;
         for position in positions {
             let payload = read_payload_from(&mut file, &position)
                 .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Read, error))?;

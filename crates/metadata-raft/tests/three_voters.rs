@@ -127,6 +127,28 @@ async fn start_group(ports: [u16; 3], directories: &[PathBuf]) -> Vec<MetadataNo
     nodes
 }
 
+/// Proposes a command until the group answers.
+///
+/// A proposal can fail while the leadership moves or while the answer is forwarded to the
+/// leader. The test needs a definite answer, not a transport failure.
+async fn propose_until_answered(
+    node: &MetadataNode,
+    command: MetadataCommand,
+) -> MetadataCommandResponse {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut last = String::new();
+    while std::time::Instant::now() < deadline {
+        match node.propose(command.clone()).await {
+            Ok(response) => return response,
+            Err(error) => {
+                last = format!("{error:?}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+    panic!("the metadata group did not answer the proposal: {last}");
+}
+
 async fn converged(nodes: &[MetadataNode], node: u64) -> bool {
     for candidate in nodes {
         if !candidate.applied_state().nodes.contains_key(&node) {
@@ -470,34 +492,36 @@ async fn revisions_are_monotonic_and_ownership_epochs_never_regress() {
     };
 
     // An older epoch for the same partition is rejected deterministically, by every voter.
-    let stale = leader_node
-        .propose(MetadataCommand::SetPlacement {
+    let stale = propose_until_answered(
+        leader_node,
+        MetadataCommand::SetPlacement {
             tenant_id: 1,
             topic_id: 3,
             partition_id: 0,
             owner: 1,
             ownership_epoch: 2,
             lease_valid_for_ms: 60_000,
-        })
-        .await
-        .expect("deterministic rejection");
+        },
+    )
+    .await;
     assert!(
         matches!(stale, MetadataCommandResponse::Rejected { .. }),
         "an ownership epoch must never regress: {stale:?}"
     );
 
     // A newer epoch is applied and the revision keeps increasing.
-    let newer = leader_node
-        .propose(MetadataCommand::SetPlacement {
+    let newer = propose_until_answered(
+        leader_node,
+        MetadataCommand::SetPlacement {
             tenant_id: 1,
             topic_id: 3,
             partition_id: 0,
             owner: 1,
             ownership_epoch: 4,
             lease_valid_for_ms: 60_000,
-        })
-        .await
-        .expect("committed placement");
+        },
+    )
+    .await;
     let MetadataCommandResponse::Applied {
         revision: after_newer,
     } = newer
