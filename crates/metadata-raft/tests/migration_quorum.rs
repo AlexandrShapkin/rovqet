@@ -188,6 +188,7 @@ async fn a_migration_survives_a_leader_crash_and_a_minority_cannot_advance_it() 
         manifest_id: Some("abcd".into()),
         fence_proof: None,
         target_ready: false,
+        dependencies: Vec::new(),
     });
     let result = tokio::time::timeout(Duration::from_secs(3), proposal).await;
     match result {

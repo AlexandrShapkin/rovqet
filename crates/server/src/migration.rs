@@ -596,6 +596,7 @@ pub async fn run_coordinator(
                         manifest_id: Some(crate::transfer::bytes_to_hex(&inventory)),
                         fence_proof: None,
                         target_ready: false,
+                        dependencies: Vec::new(),
                     };
                     if let Err(error) = driver.commit(command, Duration::from_secs(30)).await {
                         eprintln!("metadata migration catch up was not committed: {error}");
@@ -638,6 +639,7 @@ pub async fn run_coordinator(
                         manifest_id: record.manifest_id.clone(),
                         fence_proof: Some(proof.clone()),
                         target_ready: false,
+                        dependencies: Vec::new(),
                     };
                     crate::barrier::barrier("after_fence");
                     if let Err(error) = driver.commit(fence_command, Duration::from_secs(30)).await
@@ -708,6 +710,7 @@ pub async fn run_coordinator(
                         manifest_id: Some(crate::transfer::bytes_to_hex(&inventory)),
                         fence_proof: None,
                         target_ready: true,
+                        dependencies: Vec::new(),
                     };
                     crate::barrier::barrier("before_activate_commit");
                     if let Err(error) = driver.commit(activation, Duration::from_secs(30)).await {
@@ -1042,6 +1045,7 @@ mod dependency_tests {
             fence_proof: None,
             target_ready: true,
             dependent_partitions: dependent,
+            dependent_evidence: Vec::new(),
         }
     }
 

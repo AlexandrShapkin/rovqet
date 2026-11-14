@@ -68,7 +68,36 @@ pub enum MetadataCommand {
         fence_proof: Option<FenceProof>,
         /// The target published that it validated the complete transferred inventory.
         target_ready: bool,
+        /// The evidence of every dependent partition of the bundle. A source-only
+        /// migration carries none; a bundle must carry one entry per dependency.
+        dependencies: Vec<DependentEvidence>,
     },
+}
+
+/// The committed evidence of one dependent partition of a bundle.
+///
+/// A bundle moves the source and its dependent partitions (the local DLQ) as one
+/// authoritative activation: the source may not become active while a required dependency
+/// is incomplete.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DependentEvidence {
+    pub tenant_id: u64,
+    pub topic_id: u64,
+    pub partition_id: u32,
+    /// The incarnation that must be transferred unchanged.
+    pub incarnation: u128,
+    /// The ownership epoch the dependency held when the migration started.
+    pub original_epoch: u64,
+    /// The ownership epoch the target owns after the activation.
+    pub next_epoch: u64,
+    /// Last committed offset of the dependency that was transferred and verified.
+    pub transfer_watermark: Option<u64>,
+    /// Identity of the verified manifest of the transferred dependency inventory.
+    pub manifest_id: Option<String>,
+    /// Durable proof that the old owner revoked its write authority on the dependency.
+    pub fence_proof: Option<FenceProof>,
+    /// The target published that it validated the dependency inventory.
+    pub ready: bool,
 }
 
 /// Ordered stages of a Q1 ownership migration.

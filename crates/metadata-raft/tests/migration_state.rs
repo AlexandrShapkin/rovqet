@@ -2,7 +2,7 @@
 //! activation of a new ownership epoch.
 use rovqet_metadata_raft::sm::MetadataState;
 use rovqet_metadata_raft::types::{
-    DependentPartition, FenceProof, MetadataCommand, MetadataCommandResponse, MigrationStage,
+    FenceProof, MetadataCommand, MetadataCommandResponse, MigrationStage,
 };
 
 const MIGRATION: u128 = 0xfeed_0000_0000_0001;
@@ -36,13 +36,9 @@ fn begin(source: u64, target: u64, epoch: u64, next: u64) -> MetadataCommand {
         source_incarnation: 77,
         original_epoch: epoch,
         next_epoch: next,
-        dependent_partitions: vec![DependentPartition {
-            tenant_id: 1,
-            topic_id: 3,
-            partition_id: 9,
-            durable_class: 1,
-            incarnation: 88,
-        }],
+        // A source-only migration: the dependent-partition bundle is covered by
+        // `migration_bundle.rs`.
+        dependent_partitions: Vec::new(),
     }
 }
 
@@ -54,6 +50,7 @@ fn advance(stage: MigrationStage) -> MetadataCommand {
         manifest_id: Some("manifest-1".into()),
         fence_proof: None,
         target_ready: false,
+        dependencies: Vec::new(),
     }
 }
 
@@ -206,6 +203,7 @@ fn the_fence_needs_durable_evidence_that_matches_the_migration() {
         manifest_id: Some("manifest-1".into()),
         fence_proof: Some(foreign),
         target_ready: false,
+        dependencies: Vec::new(),
     };
     assert!(rejected(&state.apply(&wrong_owner)));
 
@@ -218,6 +216,7 @@ fn the_fence_needs_durable_evidence_that_matches_the_migration() {
         manifest_id: Some("manifest-1".into()),
         fence_proof: Some(foreign),
         target_ready: false,
+        dependencies: Vec::new(),
     };
     assert!(rejected(&state.apply(&wrong_migration)));
 }
@@ -241,6 +240,7 @@ fn the_activation_needs_a_fence_a_verified_transfer_and_target_readiness() {
         manifest_id: Some("manifest-1".into()),
         fence_proof: Some(fence_proof()),
         target_ready: false,
+        dependencies: Vec::new(),
     };
     assert!(!rejected(&state.apply(&fenced)));
 
@@ -257,6 +257,7 @@ fn the_activation_needs_a_fence_a_verified_transfer_and_target_readiness() {
         manifest_id: Some("manifest-2".into()),
         fence_proof: None,
         target_ready: true,
+        dependencies: Vec::new(),
     };
     assert!(
         rejected(&state.apply(&without_watermark)),
@@ -276,6 +277,7 @@ fn the_committed_activation_moves_the_placement_to_the_new_owner_and_epoch() {
         manifest_id: Some("manifest-1".into()),
         fence_proof: Some(fence_proof()),
         target_ready: false,
+        dependencies: Vec::new(),
     };
     assert!(!rejected(&state.apply(&fenced)));
 
@@ -291,6 +293,7 @@ fn the_committed_activation_moves_the_placement_to_the_new_owner_and_epoch() {
         manifest_id: Some("manifest-2".into()),
         fence_proof: None,
         target_ready: true,
+        dependencies: Vec::new(),
     };
     assert!(!rejected(&state.apply(&activation)));
     let placement = state.placement(1, 3, 0).expect("placement");
@@ -313,6 +316,7 @@ fn the_committed_record_keeps_the_evidence_of_every_stage() {
         manifest_id: Some("manifest-1".into()),
         fence_proof: Some(fence_proof()),
         target_ready: false,
+        dependencies: Vec::new(),
     };
     assert!(!rejected(&state.apply(&fenced)));
     let record = state.migrations.get(&MIGRATION).expect("migration record");
@@ -326,6 +330,5 @@ fn the_committed_record_keeps_the_evidence_of_every_stage() {
     assert_eq!(record.manifest_id.as_deref(), Some("manifest-1"));
     assert!(record.fence_proof.is_some());
     assert!(!record.target_ready);
-    assert_eq!(record.dependent_partitions.len(), 1);
-    assert_eq!(record.dependent_partitions[0].partition_id, 9);
+    assert!(record.dependent_partitions.is_empty());
 }

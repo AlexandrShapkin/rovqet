@@ -6,8 +6,8 @@
 //! before they replace the live state.
 use crate::storage::crc32c;
 use crate::types::{
-    DependentPartition, FenceProof, MetaNode, MetaNodeId, MetadataCommand, MetadataCommandResponse,
-    MetadataRaftTypeConfig, MigrationStage,
+    DependentEvidence, DependentPartition, FenceProof, MetaNode, MetaNodeId, MetadataCommand,
+    MetadataCommandResponse, MetadataRaftTypeConfig, MigrationStage,
 };
 use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 use openraft::{
@@ -73,6 +73,9 @@ pub struct MigrationState {
     pub target_ready: bool,
     /// Partitions whose durable state the migration depends on, such as a DLQ partition.
     pub dependent_partitions: Vec<DependentPartition>,
+    /// The committed evidence of each dependent partition. The source may not activate
+    /// while a required dependency is incomplete.
+    pub dependent_evidence: Vec<DependentEvidence>,
 }
 
 /// Authoritative metadata state of the group.
@@ -267,6 +270,7 @@ impl MetadataState {
                         fence_proof: None,
                         target_ready: false,
                         dependent_partitions: dependent_partitions.clone(),
+                        dependent_evidence: Vec::new(),
                     },
                 );
                 self.revision += 1;
@@ -281,6 +285,7 @@ impl MetadataState {
                 manifest_id,
                 fence_proof,
                 target_ready,
+                dependencies,
             } => {
                 let Some(current) = self.migrations.get(migration_id) else {
                     return rejected("unknown migration");
@@ -291,6 +296,7 @@ impl MetadataState {
                         && current.manifest_id == *manifest_id
                         && current.fence_proof == *fence_proof
                         && current.target_ready == *target_ready
+                        && current.dependent_evidence == *dependencies
                     {
                         return MetadataCommandResponse::Applied {
                             revision: self.revision,
@@ -326,6 +332,32 @@ impl MetadataState {
                         {
                             return rejected("the fence evidence does not match the migration");
                         }
+                        // A bundle must fence every dependent partition as well: the source
+                        // may not activate while a dependency can still be written.
+                        for dependency in &current.dependent_partitions {
+                            let Some(evidence) = dependencies.iter().find(|evidence| {
+                                evidence.tenant_id == dependency.tenant_id
+                                    && evidence.topic_id == dependency.topic_id
+                                    && evidence.partition_id == dependency.partition_id
+                            }) else {
+                                return rejected(
+                                    "the bundle is missing the evidence of a dependent partition",
+                                );
+                            };
+                            let Some(dependent_proof) = &evidence.fence_proof else {
+                                return rejected(
+                                    "the bundle is missing the fence of a dependent partition",
+                                );
+                            };
+                            if dependent_proof.migration_id != *migration_id
+                                || dependent_proof.old_owner != current.source_node
+                                || dependent_proof.old_epoch != evidence.original_epoch
+                            {
+                                return rejected(
+                                    "the fence evidence of a dependent partition does not match",
+                                );
+                            }
+                        }
                     }
                     MigrationStage::ActivateNew => {
                         if current.fence_proof.is_none() {
@@ -337,6 +369,45 @@ impl MetadataState {
                         if !*target_ready {
                             return rejected("activation without target readiness evidence");
                         }
+                        // Every dependency must be fenced, transferred and ready. The source
+                        // never activates alone while a dependency is incomplete.
+                        for dependency in &current.dependent_partitions {
+                            let Some(evidence) = dependencies.iter().find(|evidence| {
+                                evidence.tenant_id == dependency.tenant_id
+                                    && evidence.topic_id == dependency.topic_id
+                                    && evidence.partition_id == dependency.partition_id
+                            }) else {
+                                return rejected(
+                                    "activation without the evidence of a dependent partition",
+                                );
+                            };
+                            let committed = current.dependent_evidence.iter().any(|committed| {
+                                committed.partition_id == evidence.partition_id
+                                    && committed.topic_id == evidence.topic_id
+                                    && committed.tenant_id == evidence.tenant_id
+                                    && committed.fence_proof.is_some()
+                            });
+                            if !committed {
+                                return rejected(
+                                    "activation without the committed fence of a dependent partition",
+                                );
+                            }
+                            if evidence.fence_proof.is_none() {
+                                return rejected(
+                                    "activation without the fence of a dependent partition",
+                                );
+                            }
+                            if evidence.transfer_watermark.is_none() {
+                                return rejected(
+                                    "activation without the verified transfer of a dependent partition",
+                                );
+                            }
+                            if !evidence.ready {
+                                return rejected(
+                                    "activation without the readiness of a dependent partition",
+                                );
+                            }
+                        }
                     }
                     MigrationStage::Cleanup => {
                         if current.fence_proof.is_none() {
@@ -344,39 +415,52 @@ impl MetadataState {
                         }
                     }
                 }
-                let entry = self
-                    .migrations
-                    .get_mut(migration_id)
-                    .expect("the migration exists");
-                entry.stage = *stage;
-                if transfer_watermark.is_some() {
-                    entry.transfer_watermark = *transfer_watermark;
+                // The placement moves are collected first: the migration record is
+                // borrowed mutably while it is updated.
+                let mut moves: Vec<(u64, u64, u32, MetaNodeId, u64)> = Vec::new();
+                {
+                    let entry = self
+                        .migrations
+                        .get_mut(migration_id)
+                        .expect("the migration exists");
+                    entry.stage = *stage;
+                    if transfer_watermark.is_some() {
+                        entry.transfer_watermark = *transfer_watermark;
+                    }
+                    if manifest_id.is_some() {
+                        entry.manifest_id = manifest_id.clone();
+                    }
+                    if fence_proof.is_some() {
+                        entry.fence_proof = fence_proof.clone();
+                    }
+                    entry.target_ready = *target_ready;
+                    if !dependencies.is_empty() {
+                        entry.dependent_evidence = dependencies.clone();
+                    }
+                    if *stage == MigrationStage::ActivateNew {
+                        // The committed activation moves the placement of the source and of
+                        // every dependent partition in one step: there is never a placement
+                        // where the source has moved and a required dependency has not.
+                        moves.push((
+                            entry.tenant_id,
+                            entry.topic_id,
+                            entry.partition_id,
+                            entry.target_node,
+                            entry.next_epoch,
+                        ));
+                        for evidence in &entry.dependent_evidence {
+                            moves.push((
+                                evidence.tenant_id,
+                                evidence.topic_id,
+                                evidence.partition_id,
+                                entry.target_node,
+                                evidence.next_epoch,
+                            ));
+                        }
+                    }
                 }
-                if manifest_id.is_some() {
-                    entry.manifest_id = manifest_id.clone();
-                }
-                if fence_proof.is_some() {
-                    entry.fence_proof = fence_proof.clone();
-                }
-                entry.target_ready = *target_ready;
-                if *stage == MigrationStage::ActivateNew {
-                    // The committed activation moves the placement to the new owner and the
-                    // new ownership epoch. Until this entry is committed the old owner stays
-                    // authoritative.
-                    let (tenant_id, topic_id, partition_id, target_node, next_epoch) = (
-                        entry.tenant_id,
-                        entry.topic_id,
-                        entry.partition_id,
-                        entry.target_node,
-                        entry.next_epoch,
-                    );
-                    self.set_placement_owner(
-                        tenant_id,
-                        topic_id,
-                        partition_id,
-                        target_node,
-                        next_epoch,
-                    );
+                for (tenant_id, topic_id, partition_id, owner, epoch) in moves {
+                    self.set_placement_owner(tenant_id, topic_id, partition_id, owner, epoch);
                 }
                 self.revision += 1;
                 MetadataCommandResponse::Applied {

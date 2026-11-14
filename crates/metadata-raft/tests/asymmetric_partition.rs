@@ -184,6 +184,7 @@ async fn an_isolated_old_owner_blocks_the_activation() {
             manifest_id: Some("abcd".into()),
             fence_proof: None,
             target_ready: true,
+            dependencies: Vec::new(),
         },
     )
     .await;
@@ -221,6 +222,7 @@ async fn an_isolated_old_owner_blocks_the_activation() {
                 manifest_generation: 3,
             }),
             target_ready: false,
+            dependencies: Vec::new(),
         },
     )
     .await;
