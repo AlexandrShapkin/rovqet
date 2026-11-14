@@ -449,6 +449,52 @@ mod tests {
     }
 
     #[test]
+    fn a_promoted_inventory_that_is_not_valid_history_is_refused_by_the_recovery() {
+        // The promotion publishes bytes; the recovery validator decides whether they are
+        // durable history. A corrupt inventory must never become an active partition.
+        let files = [("MANIFEST", b"not a manifest".as_slice())];
+        let (_directory, staging) = staging_with(&files);
+        let target = tempfile::tempdir().expect("target");
+        promote(&staging, target.path(), &record(&files)).expect("promotion");
+        let config = rovqet_wal::Config {
+            partition: rovqet_core::PartitionRef {
+                tenant_id: 1,
+                topic_id: 3,
+                partition_id: 0,
+            },
+            incarnation: 42,
+            ..Default::default()
+        };
+        assert!(
+            rovqet_wal::Wal::open(target.path(), config).is_err(),
+            "a corrupt promoted inventory must be refused by the recovery"
+        );
+    }
+
+    #[test]
+    fn a_promoted_inventory_with_another_incarnation_is_refused() {
+        // The incarnation is part of the durable identity: a transfer of another incarnation
+        // must not be opened as this partition.
+        let files = [("MANIFEST", b"manifest".as_slice())];
+        let (_directory, staging) = staging_with(&files);
+        let target = tempfile::tempdir().expect("target");
+        promote(&staging, target.path(), &record(&files)).expect("promotion");
+        let config = rovqet_wal::Config {
+            partition: rovqet_core::PartitionRef {
+                tenant_id: 1,
+                topic_id: 3,
+                partition_id: 0,
+            },
+            incarnation: 99,
+            ..Default::default()
+        };
+        assert!(
+            rovqet_wal::Wal::open(target.path(), config).is_err(),
+            "an inventory of another incarnation must be refused"
+        );
+    }
+
+    #[test]
     fn a_promotion_refuses_an_inventory_that_differs_from_the_manifest() {
         let files = [("MANIFEST", b"manifest".as_slice())];
         let (_directory, staging) = staging_with(&files);
