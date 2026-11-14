@@ -882,27 +882,68 @@ pub fn dependencies_available(
     options: &crate::q1::Options,
     record: &rovqet_metadata_raft::sm::MigrationState,
 ) -> bool {
-    record.dependent_partitions.iter().all(|dependency| {
-        let Some(dlq) = &options.dlq else {
-            return false;
-        };
-        if dependency.tenant_id != dlq.partition.tenant_id
-            || dependency.topic_id != dlq.partition.topic_id
-            || dependency.partition_id != dlq.partition.partition_id
-        {
-            return false;
-        }
-        std::fs::canonicalize(&dlq.directory)
-            .map(|path| path.join("MANIFEST").is_file())
-            .unwrap_or(false)
-    })
+    record
+        .dependent_partitions
+        .iter()
+        .all(|dependency| dependency_recoverable(options, dependency))
+}
+
+/// True when one dependent partition is a recoverable Q1 history of exactly the expected
+/// identity and incarnation.
+///
+/// The check runs the real Q1 recovery on the destination: the WAL identity, the
+/// incarnation, the manifest, the segment inventory, the record checksums and the committed
+/// watermark are all validated. A file named `MANIFEST` is not proof of anything, and an
+/// unrelated or corrupt history must never satisfy a dependency.
+///
+/// The committed terminal references themselves are verified when the source is opened with
+/// this destination configured: the durable recovery checks every committed terminal
+/// disposition against the destination, and the successor stays inactive when that fails.
+pub fn dependency_recoverable(
+    options: &crate::q1::Options,
+    dependency: &rovqet_metadata_raft::types::DependentPartition,
+) -> bool {
+    let Some(dlq) = &options.dlq else {
+        return false;
+    };
+    if dependency.tenant_id != dlq.partition.tenant_id
+        || dependency.topic_id != dlq.partition.topic_id
+        || dependency.partition_id != dlq.partition.partition_id
+    {
+        return false;
+    }
+    if dependency.incarnation != dlq.incarnation {
+        return false;
+    }
+    // The durable class of a dependent Q1 partition is local durability.
+    if dependency.durable_class != 1 {
+        return false;
+    }
+    let config = rovqet_wal::Config {
+        partition: dlq.partition,
+        incarnation: dlq.incarnation,
+        ..Default::default()
+    };
+    // The recovery validates the identity, the incarnation, the manifest, the segment
+    // inventory, every checksum and the committed watermark, and it fails closed.
+    rovqet_wal::Wal::open(&dlq.directory, config).is_ok()
 }
 
 #[cfg(test)]
 mod dependency_tests {
     use super::*;
+    use rovqet_core::{PartitionRef, QoS};
+    use rovqet_durable::{Partition, PartitionConfig, PublishRequest};
     use rovqet_metadata_raft::sm::MigrationState;
     use rovqet_metadata_raft::types::DependentPartition;
+
+    fn dlq_partition() -> PartitionRef {
+        PartitionRef {
+            tenant_id: 1,
+            topic_id: 3,
+            partition_id: 9,
+        }
+    }
 
     fn options(
         directory: std::path::PathBuf,
@@ -912,7 +953,7 @@ mod dependency_tests {
             directory,
             topic: "durable".into(),
             node_id: 2,
-            partition: rovqet_core::PartitionRef {
+            partition: PartitionRef {
                 tenant_id: 1,
                 topic_id: 3,
                 partition_id: 0,
@@ -930,17 +971,53 @@ mod dependency_tests {
             dlq: dlq.map(|directory| crate::q1::DlqOptions {
                 directory,
                 topic: "durable-dlq".into(),
-                partition: rovqet_core::PartitionRef {
-                    tenant_id: 1,
-                    topic_id: 3,
-                    partition_id: 9,
-                },
+                partition: dlq_partition(),
                 incarnation: 43,
                 owner_epoch: 8,
                 max_outcomes: 64,
                 max_producers: 64,
             }),
         }
+    }
+
+    /// A genuinely committed DLQ history: a real Q1 partition with a durable message.
+    fn committed_dlq(directory: &std::path::Path) {
+        let partition = Partition::open(
+            directory,
+            rovqet_wal::Config {
+                partition: dlq_partition(),
+                incarnation: 43,
+                ..Default::default()
+            },
+            PartitionConfig {
+                partition: dlq_partition(),
+                ownership_epoch: 8,
+                node_id: 2,
+                queue_messages: 16,
+                queue_bytes: 1024 * 1024,
+                max_outcomes: 64,
+                max_producers: 64,
+                dedup_window: std::time::Duration::from_secs(86400),
+                group: rovqet_durable::GroupConfig::default(),
+            },
+        )
+        .expect("the DLQ partition opens");
+        partition
+            .try_publish(PublishRequest {
+                partition: dlq_partition(),
+                qos: QoS::Q1,
+                ownership_epoch: 8,
+                principal: 1,
+                producer_id: 7,
+                producer_epoch: 1,
+                sequence: 0,
+                message_id: 500,
+                payload: b"dlq disposition".to_vec(),
+            })
+            .expect("the DLQ publication is admitted")
+            .wait()
+            .expect("the DLQ publication commits");
+        partition.shutdown().expect("the DLQ partition shuts down");
     }
 
     fn record(dependent: Vec<DependentPartition>) -> MigrationState {
@@ -963,6 +1040,16 @@ mod dependency_tests {
         }
     }
 
+    fn dependency(incarnation: u128) -> DependentPartition {
+        DependentPartition {
+            tenant_id: 1,
+            topic_id: 3,
+            partition_id: 9,
+            durable_class: 1,
+            incarnation,
+        }
+    }
+
     #[test]
     fn a_migration_without_dependencies_needs_no_local_history() {
         let directory = tempfile::tempdir().expect("temp dir");
@@ -974,35 +1061,9 @@ mod dependency_tests {
     }
 
     #[test]
-    fn a_migration_with_an_unavailable_dependency_blocks_the_activation() {
-        let directory = tempfile::tempdir().expect("temp dir");
-        let configured = options(directory.path().to_path_buf(), None);
-        let dependent = vec![DependentPartition {
-            tenant_id: 1,
-            topic_id: 3,
-            partition_id: 9,
-            durable_class: 1,
-            incarnation: 43,
-        }];
-        assert!(
-            !dependencies_available(&configured, &record(dependent.clone())),
-            "a dependency without a local DLQ must block the activation"
-        );
-
-        // A DLQ directory without a manifest is not a recoverable destination either.
-        let dlq = tempfile::tempdir().expect("dlq");
-        let configured = options(
-            directory.path().to_path_buf(),
-            Some(dlq.path().to_path_buf()),
-        );
-        assert!(
-            !dependencies_available(&configured, &record(dependent)),
-            "an empty DLQ directory must block the activation"
-        );
-    }
-
-    #[test]
-    fn a_migration_with_an_available_dependency_may_activate() {
+    fn a_manifest_file_is_not_proof_of_a_recoverable_destination() {
+        // The previous implementation accepted this: a file named MANIFEST with arbitrary
+        // bytes. It must never satisfy a dependency.
         let directory = tempfile::tempdir().expect("temp dir");
         let dlq = tempfile::tempdir().expect("dlq");
         std::fs::write(dlq.path().join("MANIFEST"), b"manifest").expect("manifest");
@@ -1010,16 +1071,143 @@ mod dependency_tests {
             directory.path().to_path_buf(),
             Some(dlq.path().to_path_buf()),
         );
-        let dependent = vec![DependentPartition {
+        assert!(
+            !dependencies_available(&configured, &record(vec![dependency(43)])),
+            "an arbitrary MANIFEST file must not prove a recoverable destination"
+        );
+    }
+
+    #[test]
+    fn a_committed_dlq_history_satisfies_the_dependency() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let dlq = tempfile::tempdir().expect("dlq");
+        committed_dlq(dlq.path());
+        let configured = options(
+            directory.path().to_path_buf(),
+            Some(dlq.path().to_path_buf()),
+        );
+        assert!(
+            dependencies_available(&configured, &record(vec![dependency(43)])),
+            "a genuinely committed DLQ history satisfies the dependency"
+        );
+    }
+
+    #[test]
+    fn a_destination_of_another_incarnation_is_refused() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let dlq = tempfile::tempdir().expect("dlq");
+        committed_dlq(dlq.path());
+        let configured = options(
+            directory.path().to_path_buf(),
+            Some(dlq.path().to_path_buf()),
+        );
+        assert!(
+            !dependencies_available(&configured, &record(vec![dependency(99)])),
+            "a dependency of another incarnation must be refused"
+        );
+    }
+
+    #[test]
+    fn a_destination_of_another_partition_is_refused() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let dlq = tempfile::tempdir().expect("dlq");
+        committed_dlq(dlq.path());
+        let configured = options(
+            directory.path().to_path_buf(),
+            Some(dlq.path().to_path_buf()),
+        );
+        let mut foreign = dependency(43);
+        foreign.partition_id = 8;
+        assert!(
+            !dependencies_available(&configured, &record(vec![foreign])),
+            "a dependency of another partition must be refused"
+        );
+    }
+
+    #[test]
+    fn a_corrupt_destination_segment_is_refused() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let dlq = tempfile::tempdir().expect("dlq");
+        committed_dlq(dlq.path());
+        // Corrupt a byte inside the committed segment.
+        let segment = std::fs::read_dir(dlq.path())
+            .expect("dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().starts_with("segment-"))
+                    .unwrap_or(false)
+            })
+            .expect("a segment exists");
+        let mut bytes = std::fs::read(&segment).expect("segment");
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        std::fs::write(&segment, &bytes).expect("segment");
+        let configured = options(
+            directory.path().to_path_buf(),
+            Some(dlq.path().to_path_buf()),
+        );
+        assert!(
+            !dependencies_available(&configured, &record(vec![dependency(43)])),
+            "a corrupt destination segment must be refused"
+        );
+    }
+
+    #[test]
+    fn a_destination_without_its_manifest_is_refused() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let dlq = tempfile::tempdir().expect("dlq");
+        committed_dlq(dlq.path());
+        std::fs::remove_file(dlq.path().join("MANIFEST")).expect("remove manifest");
+        let configured = options(
+            directory.path().to_path_buf(),
+            Some(dlq.path().to_path_buf()),
+        );
+        assert!(
+            !dependencies_available(&configured, &record(vec![dependency(43)])),
+            "a destination without its manifest must be refused"
+        );
+    }
+
+    #[test]
+    fn a_destination_of_another_partition_history_is_refused() {
+        // A valid history of a different partition is not this dependency.
+        let directory = tempfile::tempdir().expect("temp dir");
+        let dlq = tempfile::tempdir().expect("dlq");
+        let other = PartitionRef {
             tenant_id: 1,
             topic_id: 3,
-            partition_id: 9,
-            durable_class: 1,
-            incarnation: 43,
-        }];
+            partition_id: 8,
+        };
+        let partition = Partition::open(
+            dlq.path(),
+            rovqet_wal::Config {
+                partition: other,
+                incarnation: 43,
+                ..Default::default()
+            },
+            PartitionConfig {
+                partition: other,
+                ownership_epoch: 8,
+                node_id: 2,
+                queue_messages: 16,
+                queue_bytes: 1024 * 1024,
+                max_outcomes: 64,
+                max_producers: 64,
+                dedup_window: std::time::Duration::from_secs(86400),
+                group: rovqet_durable::GroupConfig::default(),
+            },
+        )
+        .expect("the other partition opens");
+        partition.shutdown().expect("shutdown");
+        let configured = options(
+            directory.path().to_path_buf(),
+            Some(dlq.path().to_path_buf()),
+        );
         assert!(
-            dependencies_available(&configured, &record(dependent)),
-            "an independently available DLQ destination satisfies the dependency"
+            !dependencies_available(&configured, &record(vec![dependency(43)])),
+            "a valid history of another partition must be refused"
         );
     }
 }
