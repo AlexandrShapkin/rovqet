@@ -221,6 +221,9 @@ impl FileLogStorage {
     /// The entries are `(log_id.index, payload)` pairs and must form one contiguous run that
     /// starts directly after the purge point; anything else would leave a hole.
     fn rewrite(&mut self, entries: Vec<(u64, Vec<u8>)>) -> Result<(), StorageError<MetaNodeId>> {
+        // The write lock is held for the whole rewrite: a reader that holds the read lock
+        // must never observe the replaced file with the previous offsets.
+        let mut guard = self.index_write();
         let expected_start = self
             .purged
             .map(|log_id| log_id.index.saturating_add(1))
@@ -276,12 +279,13 @@ impl FileLogStorage {
             .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Write, error))?;
         sync_directory(&self.directory)
             .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Write, error))?;
+        *guard = index;
+        drop(guard);
         self.file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(self.log_path())
             .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Read, error))?;
-        *self.index_write() = index;
         Ok(())
     }
 
@@ -598,7 +602,8 @@ impl FileLogReader {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let positions: Vec<EntryIndex> =
             index.range(range).map(|(_, position)| *position).collect();
-        drop(index);
+        // The read lock is held while the payloads are read: a rewrite replaces the log file
+        // under the write lock, so a reader must never see the new file with old offsets.
         for position in positions {
             let payload = read_payload_from(&mut file, &position)
                 .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Read, error))?;

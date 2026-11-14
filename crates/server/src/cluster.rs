@@ -1208,11 +1208,9 @@ mod migration_tests {
             source_dir.clone(),
             1,
         );
+        let route_slot = std::sync::Arc::new(crate::q1::RouteSlot::new(Some(route.clone())));
         tokio::spawn(crate::migration::run_coordinator(
-            driver,
-            route.clone(),
-            1,
-            None,
+            driver, route_slot, 1, None,
         ));
 
         // The migration completes: the committed placement moves to the target.
@@ -1553,9 +1551,11 @@ mod successor_tests {
             source_directory.clone(),
             1,
         );
+        let coordinator_slot =
+            std::sync::Arc::new(crate::q1::RouteSlot::new(Some(source_route.clone())));
         tokio::spawn(crate::migration::run_coordinator(
             driver,
-            source_route.clone(),
+            coordinator_slot,
             1,
             None,
         ));

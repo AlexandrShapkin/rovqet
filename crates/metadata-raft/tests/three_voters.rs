@@ -269,7 +269,11 @@ async fn a_minority_cannot_commit_a_new_command() {
         Err(_elapsed) => {}
         Ok(Ok(response)) => panic!("a minority must not commit: {response:?}"),
         Ok(Err(error)) => assert!(
-            matches!(error, rovqet_metadata_raft::MetadataError::Raft(_)),
+            matches!(
+                error,
+                rovqet_metadata_raft::MetadataError::Raft(_)
+                    | rovqet_metadata_raft::MetadataError::Network(_)
+            ),
             "unexpected error {error:?}"
         ),
     }

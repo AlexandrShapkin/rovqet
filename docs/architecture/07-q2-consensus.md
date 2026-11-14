@@ -149,8 +149,36 @@ CLEANUP`, and every transition is committed by the metadata group.
   migration is refused or deferred; a local timer of the successor never proves that a
   remote owner stopped writing.
 
-The remaining C-02 work is the data-plane activation of the successor (opening the
-transferred history as the active owner), the multi-process migration acceptance campaign
-and the dependent DLQ proof; the fencing protocol that depends on committed metadata is
-implemented and tested, and committed metadata now reaches the data plane as the only source
-of ownership authority in Raft mode.
+## C-02 storage promotion and successor activation
+
+The storage lifecycle of a successor is explicit:
+`STAGING -> VERIFIED -> FENCE_CONFIRMED -> ACTIVATION_COMMITTED -> PROMOTED -> ACTIVE`.
+
+- **Only the active, validated route may serve committed Q1 operations.** A node without a
+  committed placement stays inactive. A node that the committed metadata names as the owner
+  opens its route; a successor of a committed migration never initializes an empty log as a
+  substitute for the transferred history.
+- **The route is replaceable at runtime.** The dispatch, the peer handler and the shutdown
+  read the current route from a handle, so a broker can go from inactive target to active
+  owner without a fabricated fresh log and without a stale session keeping mutation
+  authority.
+- **The promotion is crash-safe and recoverable.** The intent is journalled before the first
+  file moves, every file is published with a digest check, an already published file is
+  verified and skipped, the directory is synced and a durable record states that the
+  promotion completed. A partition directory that holds unrelated or already active storage
+  is refused, and the source storage is never touched. A crash before the promotion leaves
+  the successor unavailable; it never boots an empty partition.
+- **The transferred history keeps its identity.** The successor opens the promoted storage
+  with the existing Q1 recovery logic, so the original incarnation, the committed offsets,
+  the producer outcomes, the consumer groups, the sparse ACK sets, the retry metadata and
+  the terminal dispositions are recovered instead of being invented again.
+- **The dependent history is checked before the promotion.** A migration whose DLQ dependency
+  cannot be shown locally keeps the successor inactive: the existence of the dependency field
+  is never proof of durability, and a terminal disposition whose destination cannot be
+  recovered is never dropped to make the source open.
+- **A follower forwards its proposal.** A node that does not lead the group forwards a
+  proposal to the committed leader instead of pretending that it can commit on its own.
+
+The remaining C-02 work is the multi-process migration campaign against real broker
+processes with the independent oracle, the crash matrix around the promotion and the reopen,
+and the asymmetric-partition scenario.

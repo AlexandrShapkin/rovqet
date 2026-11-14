@@ -1,0 +1,134 @@
+{
+  "generated_at_utc": "2026-11-14T05:16:34Z",
+  "runs": [
+    {
+      "counts": {
+        "cursor": 2,
+        "dlq_publications": 1,
+        "dlq_records": 1,
+        "terminal": 1
+      },
+      "fault": "terminal-pending-after-sync",
+      "reasons": [],
+      "run": "dlq-terminal-pending-after-sync",
+      "verdict": "PASS"
+    },
+    {
+      "counts": {
+        "cursor": 2,
+        "dlq_publications": 1,
+        "dlq_records": 1,
+        "terminal": 1
+      },
+      "fault": "dlq-after-publish-before-terminal",
+      "reasons": [],
+      "run": "dlq-dlq-after-publish-before-terminal",
+      "verdict": "PASS"
+    },
+    {
+      "counts": {
+        "cursor": 2,
+        "dlq_publications": 1,
+        "dlq_records": 1,
+        "terminal": 1
+      },
+      "fault": "terminal-commit-after-sync-before-reply",
+      "reasons": [],
+      "run": "dlq-terminal-commit-after-sync-before-reply",
+      "verdict": "PASS"
+    },
+    {
+      "counts": {
+        "cursor": 2,
+        "dlq_publications": 1,
+        "dlq_records": 1,
+        "terminal": 1
+      },
+      "fault": "terminal-commit-after-append-before-sync",
+      "reasons": [],
+      "run": "dlq-terminal-commit-after-append-before-sync",
+      "verdict": "PASS"
+    },
+    {
+      "counts": {
+        "acknowledged": 0,
+        "application_offsets": 1,
+        "cursor": 0,
+        "redelivered": 0,
+        "uncertain_committed": 0
+      },
+      "reasons": [],
+      "run": "nack-exhaustion-none",
+      "verdict": "PASS"
+    },
+    {
+      "counts": {
+        "acknowledged": 0,
+        "application_offsets": 1,
+        "cursor": 0,
+        "redelivered": 0,
+        "uncertain_committed": 0
+      },
+      "reasons": [],
+      "run": "nack-backoff",
+      "verdict": "PASS"
+    },
+    {
+      "counts": {
+        "cursor": 9,
+        "dlq_publications": 0,
+        "dlq_records": 0,
+        "terminal": 1
+      },
+      "reasons": [],
+      "run": "quarantine",
+      "verdict": "PASS"
+    },
+    {
+      "counts": {
+        "cursor": 5,
+        "dlq_publications": 0,
+        "dlq_records": 0,
+        "terminal": 1
+      },
+      "fault": "terminal-pending-after-sync",
+      "reasons": [],
+      "run": "quarantine-pending-crash",
+      "verdict": "PASS"
+    },
+    {
+      "counts": {
+        "acknowledged": 0,
+        "application_offsets": 1,
+        "cursor": 0,
+        "redelivered": 1,
+        "uncertain_committed": 0
+      },
+      "fault": "terminal-pending-after-append-before-sync",
+      "reasons": [],
+      "run": "quarantine-before-fsync",
+      "verdict": "PASS"
+    },
+    {
+      "counts": {
+        "cursor": 8,
+        "dlq_publications": 1,
+        "dlq_records": 1,
+        "terminal": 1
+      },
+      "reasons": [],
+      "run": "dlq",
+      "verdict": "PASS"
+    },
+    {
+      "counts": {
+        "stale_extensions": 0
+      },
+      "reasons": [],
+      "run": "stale-generation",
+      "verdict": "PASS"
+    }
+  ],
+  "schema": "rovqet-q1-terminal-matrix-v1",
+  "source_sha": "1835d0cdce237ecc4ffe161ee79c39a389523ae9"
+}

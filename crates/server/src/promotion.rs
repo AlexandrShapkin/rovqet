@@ -120,14 +120,18 @@ pub fn promote(
     if !target.is_dir() {
         return Err(PromotionError::TargetMissing);
     }
-    // The target must not hold unrelated or already active storage.
+    // The target must not hold unrelated or already active storage. The files of this
+    // promotion may already be there: a repeated promotion verifies and skips them.
+    let planned: Vec<&str> = record.files.iter().map(|file| file.name.as_str()).collect();
     for entry in std::fs::read_dir(target).map_err(|error| PromotionError::Io(error.to_string()))? {
         let entry = entry.map_err(|error| PromotionError::Io(error.to_string()))?;
         let name = entry.file_name().to_string_lossy().to_string();
         if name == "SERVER.lock" || name == PROMOTION_RECORD {
             continue;
         }
-        return Err(PromotionError::TargetNotEmpty);
+        if !planned.contains(&name.as_str()) {
+            return Err(PromotionError::TargetNotEmpty);
+        }
     }
     // The staged inventory must match the plan.
     let manifest_path = staging.join("staging.json");
@@ -309,4 +313,156 @@ fn sync_directory(path: &Path) -> Result<(), PromotionError> {
     File::open(path)
         .and_then(|dir| dir.sync_all())
         .map_err(|error| PromotionError::Io(error.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transfer::bytes_to_hex;
+
+    fn staging_with(files: &[(&str, &[u8])]) -> (tempfile::TempDir, PathBuf) {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let staging = directory.path().join("staging");
+        std::fs::create_dir_all(&staging).expect("staging");
+        let manifest = serde_json::json!({
+            "migration_id": "1",
+            "files": files.iter().enumerate().map(|(index, (name, bytes))| {
+                serde_json::json!({
+                    "name": name,
+                    "size": bytes.len(),
+                    "digest": bytes_to_hex(&sha256(bytes)),
+                })
+            }).collect::<Vec<_>>(),
+        });
+        std::fs::write(
+            staging.join("staging.json"),
+            serde_json::to_vec(&manifest).expect("manifest"),
+        )
+        .expect("manifest");
+        for (index, (_, bytes)) in files.iter().enumerate() {
+            std::fs::write(staging.join(format!("part-{index:06}.bin")), bytes).expect("part");
+        }
+        (directory, staging)
+    }
+
+    fn record(files: &[(&str, &[u8])]) -> PromotionRecord {
+        PromotionRecord {
+            migration_id: 7,
+            inventory_digest: "abcd".into(),
+            incarnation: 42,
+            tenant_id: 1,
+            topic_id: 3,
+            partition_id: 0,
+            target_epoch: 8,
+            activation_revision: 12,
+            files: files
+                .iter()
+                .map(|(name, bytes)| PromotedFile {
+                    name: name.to_string(),
+                    size: bytes.len() as u64,
+                    digest: bytes_to_hex(&sha256(bytes)),
+                })
+                .collect(),
+            state: PromotionState::Promoting,
+        }
+    }
+
+    #[test]
+    fn a_promotion_publishes_the_verified_inventory() {
+        let files = [
+            ("MANIFEST", b"manifest bytes".as_slice()),
+            ("segment-000000.wal", b"wal"),
+        ];
+        let (_directory, staging) = staging_with(&files);
+        let target = tempfile::tempdir().expect("target");
+        let plan = record(&files);
+        promote(&staging, target.path(), &plan).expect("promotion");
+        assert_eq!(
+            std::fs::read(target.path().join("MANIFEST")).expect("manifest"),
+            b"manifest bytes"
+        );
+        assert_eq!(
+            std::fs::read(target.path().join("segment-000000.wal")).expect("segment"),
+            b"wal"
+        );
+        let stored = promotion_record(target.path())
+            .expect("record")
+            .expect("the promotion must be recorded");
+        assert_eq!(stored.state, PromotionState::Promoted);
+        assert_eq!(stored.migration_id, 7);
+        assert_eq!(stored.incarnation, 42);
+        assert_eq!(stored.target_epoch, 8);
+    }
+
+    #[test]
+    fn a_promotion_refuses_a_target_with_unrelated_storage() {
+        let files = [("MANIFEST", b"manifest".as_slice())];
+        let (_directory, staging) = staging_with(&files);
+        let target = tempfile::tempdir().expect("target");
+        std::fs::write(target.path().join("segment-000000.wal"), b"existing").expect("file");
+        assert_eq!(
+            promote(&staging, target.path(), &record(&files)),
+            Err(PromotionError::TargetNotEmpty),
+            "an unrelated or active directory must never be overwritten"
+        );
+    }
+
+    #[test]
+    fn a_promotion_is_idempotent_and_recovers_a_partial_publication() {
+        let files = [
+            ("MANIFEST", b"manifest".as_slice()),
+            ("segment-000000.wal", b"wal"),
+        ];
+        let (_directory, staging) = staging_with(&files);
+        let target = tempfile::tempdir().expect("target");
+        let plan = record(&files);
+        // A crash after the first file was published.
+        promote(&staging, target.path(), &plan).expect("promotion");
+        // The promotion is repeated: the published files are verified and skipped.
+        promote(&staging, target.path(), &plan).expect("repeated promotion");
+        assert_eq!(
+            std::fs::read(target.path().join("MANIFEST")).expect("manifest"),
+            b"manifest"
+        );
+        assert_eq!(
+            std::fs::read(target.path().join("segment-000000.wal")).expect("segment"),
+            b"wal"
+        );
+    }
+
+    #[test]
+    fn a_promotion_refuses_a_digest_mismatch() {
+        let files = [("MANIFEST", b"manifest".as_slice())];
+        let (_directory, staging) = staging_with(&files);
+        // The staged bytes no longer match the declared digest.
+        std::fs::write(staging.join("part-000000.bin"), b"tampered").expect("part");
+        let target = tempfile::tempdir().expect("target");
+        assert_eq!(
+            promote(&staging, target.path(), &record(&files)),
+            Err(PromotionError::DigestMismatch),
+            "a tampered file must never be promoted"
+        );
+        assert!(
+            !target.path().join("MANIFEST").exists(),
+            "a refused promotion must not publish anything"
+        );
+    }
+
+    #[test]
+    fn a_promotion_refuses_an_inventory_that_differs_from_the_manifest() {
+        let files = [("MANIFEST", b"manifest".as_slice())];
+        let (_directory, staging) = staging_with(&files);
+        let target = tempfile::tempdir().expect("target");
+        let mut plan = record(&files);
+        plan.files.push(PromotedFile {
+            name: "segment-000000.wal".into(),
+            size: 3,
+            digest: "00".into(),
+        });
+        assert_eq!(
+            promote(&staging, target.path(), &plan),
+            Err(PromotionError::InventoryMismatch),
+            "the promoted inventory must match the verified manifest"
+        );
+    }
 }

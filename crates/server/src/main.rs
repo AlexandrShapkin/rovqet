@@ -434,7 +434,7 @@ async fn main() -> io::Result<()> {
         .as_ref()
         .and_then(|cluster| cluster.raft.clone())
         .is_some();
-    let route = match q1_options.clone() {
+    let mut route = match q1_options.clone() {
         Some(q1) if !raft_mode => Some(Arc::new(
             tokio::task::spawn_blocking(move || q1::Route::open(q1))
                 .await
@@ -442,7 +442,9 @@ async fn main() -> io::Result<()> {
         )),
         _ => None,
     };
-    let route_slot = Arc::new(q1::RouteSlot::new(route.clone()));
+    // The slot owns the only reference: the shutdown releases it and waits for the last
+    // holder, so a retained route is reported instead of being dropped silently.
+    let route_slot = Arc::new(q1::RouteSlot::new(route.take()));
     let mut cluster_stop = None;
     if let Some(cluster) = &cluster {
         if let Some(q1) = &options.q1 {
@@ -483,11 +485,11 @@ async fn main() -> io::Result<()> {
         // The migration coordinator drives a committed handover of this partition. It only
         // acts on a committed migration record, and it never activates a successor without
         // a durable fence of the old owner.
-        if let (Some(raft), Some(route)) = (cluster.raft.clone(), route_slot.current()) {
+        if let (Some(raft), Some(q1)) = (cluster.raft.clone(), q1_options.clone()) {
             let driver = migration::MigrationDriver::new(
                 cluster.transport.clone(),
                 raft.clone(),
-                route.directory().to_path_buf(),
+                q1.directory.clone(),
                 cluster.node.get(),
             );
             let target_request = options.migrate_to.and_then(|target| {
@@ -498,12 +500,13 @@ async fn main() -> io::Result<()> {
                         q1.partition.topic_id,
                         q1.partition.partition_id,
                         q1.incarnation,
+                        q1.owner_epoch,
                     )
                 })
             });
             tokio::spawn(migration::run_coordinator(
                 driver,
-                route.clone(),
+                route_slot.clone(),
                 cluster.node.get(),
                 target_request,
             ));

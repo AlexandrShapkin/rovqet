@@ -21,6 +21,8 @@ const MAX_RPC_BYTES: usize = 8 * 1024 * 1024;
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum RaftRpc {
     Vote(VoteRequest<MetaNodeId>),
+    /// A client write that a follower forwards to the leader.
+    ClientWrite(crate::types::MetadataCommand),
     AppendEntries(AppendEntriesRequest<MetadataRaftTypeConfig>),
     InstallSnapshot {
         vote: openraft::Vote<MetaNodeId>,
@@ -35,6 +37,8 @@ pub enum RaftRpc {
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub enum RaftRpcResponse {
     Vote(VoteResponse<MetaNodeId>),
+    /// The answer to a forwarded client write.
+    ClientWrite(crate::types::MetadataCommandResponse),
     AppendEntries(AppendEntriesResponse<MetaNodeId>),
     InstallSnapshot(InstallSnapshotResponse<MetaNodeId>),
     Error(String),
@@ -204,6 +208,67 @@ impl RaftNetwork<MetadataRaftTypeConfig> for TcpRaftNetwork {
                 &std::io::Error::other("metadata RPC response mismatch"),
             ))),
         }
+    }
+}
+
+/// Sends one client write to the node that leads the group.
+///
+/// A follower cannot commit a proposal itself, and a caller that has no leader of its own
+/// must not invent one: the proposal is forwarded to the committed leader and the answer
+/// is returned verbatim.
+pub async fn forward_client_write(
+    address: SocketAddr,
+    command: crate::types::MetadataCommand,
+    timeout: Duration,
+) -> Result<crate::types::MetadataCommandResponse, std::io::Error> {
+    let call = async {
+        let mut stream = TcpStream::connect(address).await?;
+        let payload = serde_json::to_vec(&RaftRpc::ClientWrite(command))
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        if payload.len() > MAX_RPC_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "metadata RPC payload too large",
+            ));
+        }
+        let mut frame = Vec::with_capacity(payload.len() + 8);
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&crate::storage::crc32c(&payload).to_be_bytes());
+        frame.extend_from_slice(&payload);
+        stream.write_all(&frame).await?;
+        stream.flush().await?;
+        let mut header = [0u8; 8];
+        stream.read_exact(&mut header).await?;
+        let length = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
+        if length > MAX_RPC_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "metadata RPC response too large",
+            ));
+        }
+        let checksum = u32::from_be_bytes(header[4..].try_into().unwrap());
+        let mut body = vec![0u8; length];
+        stream.read_exact(&mut body).await?;
+        if crate::storage::crc32c(&body) != checksum {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "metadata RPC response checksum mismatch",
+            ));
+        }
+        match serde_json::from_slice::<RaftRpcResponse>(&body) {
+            Ok(RaftRpcResponse::ClientWrite(response)) => Ok(response),
+            Ok(RaftRpcResponse::Error(error)) => Err(std::io::Error::other(format!(
+                "the leader refused the write: {error}"
+            ))),
+            _ => Err(std::io::Error::other("unexpected metadata RPC response")),
+        }
+    };
+    match tokio::time::timeout(timeout, call).await {
+        Ok(result) => result,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "forwarded metadata write timed out",
+        )),
     }
 }
 

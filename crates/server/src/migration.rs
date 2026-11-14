@@ -287,13 +287,52 @@ impl MigrationDriver {
                     };
                 }
                 Err(error) => {
-                    last = format!("{error:?}");
+                    let message = format!("{error:?}");
+                    if message != last {
+                        last = message.clone();
+                        eprintln!("Q1 coordinator: the proposal was not accepted: {last}");
+                    }
                     tokio::time::sleep(Duration::from_millis(200)).await;
                 }
             }
         }
         Err(MigrationError::Metadata(last))
     }
+}
+
+/// Reports one committed migration transition on the diagnostic stream.
+///
+/// The line is machine readable so that an external oracle can compare the committed
+/// transitions with what the brokers actually did.
+pub fn report(event: &str, record: &rovqet_metadata_raft::sm::MigrationState, revision: u64) {
+    let fence = record.fence_proof.as_ref().map(|proof| {
+        serde_json::json!({
+            "migration_id": proof.migration_id.to_string(),
+            "old_owner": proof.old_owner,
+            "old_epoch": proof.old_epoch,
+            "fence_offset": proof.fence_offset,
+            "fence_digest": proof.fence_digest,
+            "manifest_generation": proof.manifest_generation,
+        })
+    });
+    eprintln!(
+        "MIGRATION {} {}",
+        event,
+        serde_json::json!({
+            "migration_id": record.migration_id.to_string(),
+            "stage": format!("{:?}", record.stage).to_lowercase(),
+            "source": record.source_node,
+            "target": record.target_node,
+            "original_epoch": record.original_epoch,
+            "next_epoch": record.next_epoch,
+            "incarnation": record.source_incarnation,
+            "transfer_watermark": record.transfer_watermark,
+            "manifest_id": record.manifest_id,
+            "target_ready": record.target_ready,
+            "fence": fence,
+            "metadata_revision": revision,
+        })
+    );
 }
 
 /// The stage that follows the given one, if any.
@@ -331,9 +370,9 @@ pub fn migration_id(
 /// the activation. A failure at any stage leaves the old owner authoritative.
 pub async fn run_coordinator(
     driver: MigrationDriver,
-    route: std::sync::Arc<crate::q1::Route>,
+    route_slot: std::sync::Arc<crate::q1::RouteSlot>,
     node: u64,
-    target_request: Option<(u64, u64, u64, u32, u128)>,
+    target_request: Option<(u64, u64, u64, u32, u128, u64)>,
 ) {
     let raft = driver.raft().clone();
     let mut updates = raft.committed_updates();
@@ -352,11 +391,41 @@ pub async fn run_coordinator(
                 .cloned()
             else {
                 // No migration is committed yet. The operator may have asked for one.
-                if let Some((target_node, tenant_id, topic_id, partition_id, incarnation)) =
+                if let Some((target_node, tenant_id, topic_id, partition_id, incarnation, epoch)) =
                     target_request
                 {
-                    // The request is repeated at a bounded rate: the metadata group may not
-                    // have a leader yet.
+                    // The operator asked for a handover of this partition. The partition
+                    // must be placed on this node first, and that placement is committed by
+                    // the metadata group like every other topology change.
+                    let placement = state
+                        .placements
+                        .iter()
+                        .find(|placement| {
+                            placement.tenant_id == tenant_id
+                                && placement.topic_id == topic_id
+                                && placement.partition_id == partition_id
+                        })
+                        .cloned();
+                    if placement.is_none() {
+                        let _ = driver
+                            .commit(
+                                MetadataCommand::SetPlacement {
+                                    tenant_id,
+                                    topic_id,
+                                    partition_id,
+                                    owner: node,
+                                    ownership_epoch: epoch,
+                                    lease_valid_for_ms: 600_000,
+                                },
+                                Duration::from_secs(30),
+                            )
+                            .await;
+                        // The migration may be proposed right away.
+                        last_request = None;
+                        return;
+                    }
+                    // The migration request is repeated at a bounded rate: the metadata
+                    // group may not have a leader yet.
                     let now = std::time::Instant::now();
                     if last_request
                         .map(|last| now.duration_since(last) < Duration::from_secs(5))
@@ -382,24 +451,12 @@ pub async fn run_coordinator(
                                 source_node: node,
                                 target_node,
                                 source_incarnation: incarnation,
-                                original_epoch: state
-                                    .placements
-                                    .iter()
-                                    .find(|placement| {
-                                        placement.tenant_id == tenant_id
-                                            && placement.topic_id == topic_id
-                                            && placement.partition_id == partition_id
-                                    })
+                                original_epoch: placement
+                                    .as_ref()
                                     .map(|placement| placement.ownership_epoch)
                                     .unwrap_or(0),
-                                next_epoch: state
-                                    .placements
-                                    .iter()
-                                    .find(|placement| {
-                                        placement.tenant_id == tenant_id
-                                            && placement.topic_id == topic_id
-                                            && placement.partition_id == partition_id
-                                    })
+                                next_epoch: placement
+                                    .as_ref()
                                     .map(|placement| placement.ownership_epoch + 1)
                                     .unwrap_or(0),
                                 dependent_partitions: Vec::new(),
@@ -411,6 +468,11 @@ pub async fn run_coordinator(
                 return;
             };
             let Some(target) = NodeId::new(record.target_node) else {
+                return;
+            };
+            // The route is opened by the activator once the committed metadata allows it.
+            // The transfer and the fence need it.
+            let Some(route) = route_slot.current() else {
                 return;
             };
             match record.stage {
@@ -478,6 +540,10 @@ pub async fn run_coordinator(
                     };
                     if let Err(error) = driver.commit(command, Duration::from_secs(30)).await {
                         eprintln!("metadata migration catch up was not committed: {error}");
+                    } else if let Some(updated) =
+                        raft.applied_state().migrations.get(&record.migration_id)
+                    {
+                        report("committed", updated, raft.applied_state().revision);
                     }
                 }
                 MigrationStage::CatchUp => {
@@ -516,7 +582,10 @@ pub async fn run_coordinator(
                     if let Err(error) = driver.commit(fence_command, Duration::from_secs(30)).await
                     {
                         eprintln!("metadata migration fence was not committed: {error}");
-                        return;
+                    } else if let Some(updated) =
+                        raft.applied_state().migrations.get(&record.migration_id)
+                    {
+                        report("committed", updated, raft.applied_state().revision);
                     }
                     // The log is final now: transfer the remaining history and verify it.
                     let transferred = match driver
@@ -581,6 +650,10 @@ pub async fn run_coordinator(
                     };
                     if let Err(error) = driver.commit(activation, Duration::from_secs(30)).await {
                         eprintln!("metadata migration activation was not committed: {error}");
+                    } else if let Some(updated) =
+                        raft.applied_state().migrations.get(&record.migration_id)
+                    {
+                        report("committed", updated, raft.applied_state().revision);
                     }
                 }
                 MigrationStage::FenceOld
@@ -627,24 +700,20 @@ pub async fn run_activator(
 ) {
     let mut updates = raft.committed_updates();
     loop {
-        {
+        // The current committed state is examined first, then the activator waits for the
+        // next committed change. The iteration always ends in the wait, so a state without
+        // a placement never spins.
+        let outcome = async {
             let state = raft.applied_state();
             let Some(placement) = state.placement(
                 options.partition.tenant_id,
                 options.partition.topic_id,
                 options.partition.partition_id,
             ) else {
-                // No committed placement: this node stays inactive.
-                if updates.changed().await.is_err() {
-                    return;
-                }
-                continue;
+                return None;
             };
             if placement.owner != node {
-                if updates.changed().await.is_err() {
-                    return;
-                }
-                continue;
+                return None;
             }
             // A committed migration that targets this node decides how the storage is
             // obtained.
@@ -666,10 +735,7 @@ pub async fn run_activator(
             if let Some(record) = &migration {
                 // The activation must be committed and the successor must be the target.
                 if record.stage != MigrationStage::ActivateNew {
-                    if updates.changed().await.is_err() {
-                        return;
-                    }
-                    continue;
+                    return None;
                 }
                 // The dependent partitions must be available: a terminal disposition that
                 // references a DLQ record needs a recoverable destination.
@@ -678,17 +744,11 @@ pub async fn run_activator(
                         "the dependent history of the migration is not available locally; \
                          the successor stays inactive"
                     );
-                    if updates.changed().await.is_err() {
-                        return;
-                    }
-                    continue;
+                    return None;
                 }
                 // The transferred storage is promoted before the route is opened.
                 let Some(staging_root) = staging_root.clone() else {
-                    if updates.changed().await.is_err() {
-                        return;
-                    }
-                    continue;
+                    return None;
                 };
                 let inventory = hex_to_bytes(record.manifest_id.as_deref().unwrap_or_default());
                 let staging =
@@ -711,10 +771,7 @@ pub async fn run_activator(
                     &plan,
                 ) {
                     eprintln!("the promoted storage was refused: {error}");
-                    if updates.changed().await.is_err() {
-                        return;
-                    }
-                    continue;
+                    return None;
                 }
                 // The transferred history keeps its incarnation.
                 route_options.incarnation = record.source_incarnation;
@@ -723,21 +780,29 @@ pub async fn run_activator(
             match crate::q1::Route::open(route_options) {
                 Ok(route) => {
                     let route = std::sync::Arc::new(route);
+                    eprintln!(
+                        "Q1 route active: partition={:?} epoch={} incarnation={}",
+                        partition, route.options.owner_epoch, route.options.incarnation
+                    );
                     if let Some(authority) = cluster.authority_for(&partition) {
                         route.install_authority(Some(authority));
                     }
-                    route_slot.install(route);
-                    return;
+                    Some(route)
                 }
                 Err(error) => {
                     // A failed reopen leaves the node inactive and reports the error.
                     eprintln!("the Q1 route stays inactive: {error}");
-                    if updates.changed().await.is_err() {
-                        return;
-                    }
-                    continue;
+                    None
                 }
             }
+        }
+        .await;
+        if let Some(route) = outcome {
+            route_slot.install(route);
+            return;
+        }
+        if updates.changed().await.is_err() {
+            return;
         }
     }
 }
@@ -764,4 +829,130 @@ pub fn dependencies_available(
             .map(|path| path.join("MANIFEST").is_file())
             .unwrap_or(false)
     })
+}
+
+#[cfg(test)]
+mod dependency_tests {
+    use super::*;
+    use rovqet_metadata_raft::sm::MigrationState;
+    use rovqet_metadata_raft::types::DependentPartition;
+
+    fn options(
+        directory: std::path::PathBuf,
+        dlq: Option<std::path::PathBuf>,
+    ) -> crate::q1::Options {
+        crate::q1::Options {
+            directory,
+            topic: "durable".into(),
+            node_id: 2,
+            partition: rovqet_core::PartitionRef {
+                tenant_id: 1,
+                topic_id: 3,
+                partition_id: 0,
+            },
+            incarnation: 42,
+            owner_epoch: 8,
+            dedup_window: std::time::Duration::from_secs(86400),
+            max_producers: 64,
+            max_outcomes: 64,
+            initialize_new_log: false,
+            terminal_policy: rovqet_durable::TerminalPolicy::Dlq,
+            max_attempts: 3,
+            retry_initial: std::time::Duration::from_millis(10),
+            retry_max: std::time::Duration::from_millis(100),
+            dlq: dlq.map(|directory| crate::q1::DlqOptions {
+                directory,
+                topic: "durable-dlq".into(),
+                partition: rovqet_core::PartitionRef {
+                    tenant_id: 1,
+                    topic_id: 3,
+                    partition_id: 9,
+                },
+                incarnation: 43,
+                owner_epoch: 8,
+                max_outcomes: 64,
+                max_producers: 64,
+            }),
+        }
+    }
+
+    fn record(dependent: Vec<DependentPartition>) -> MigrationState {
+        MigrationState {
+            migration_id: 7,
+            tenant_id: 1,
+            topic_id: 3,
+            partition_id: 0,
+            stage: MigrationStage::ActivateNew,
+            source_node: 1,
+            target_node: 2,
+            source_incarnation: 42,
+            original_epoch: 7,
+            next_epoch: 8,
+            transfer_watermark: Some(10),
+            manifest_id: Some("abcd".into()),
+            fence_proof: None,
+            target_ready: true,
+            dependent_partitions: dependent,
+        }
+    }
+
+    #[test]
+    fn a_migration_without_dependencies_needs_no_local_history() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let configured = options(directory.path().to_path_buf(), None);
+        assert!(
+            dependencies_available(&configured, &record(Vec::new())),
+            "a migration without dependent partitions is not blocked"
+        );
+    }
+
+    #[test]
+    fn a_migration_with_an_unavailable_dependency_blocks_the_activation() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let configured = options(directory.path().to_path_buf(), None);
+        let dependent = vec![DependentPartition {
+            tenant_id: 1,
+            topic_id: 3,
+            partition_id: 9,
+            durable_class: 1,
+            incarnation: 43,
+        }];
+        assert!(
+            !dependencies_available(&configured, &record(dependent.clone())),
+            "a dependency without a local DLQ must block the activation"
+        );
+
+        // A DLQ directory without a manifest is not a recoverable destination either.
+        let dlq = tempfile::tempdir().expect("dlq");
+        let configured = options(
+            directory.path().to_path_buf(),
+            Some(dlq.path().to_path_buf()),
+        );
+        assert!(
+            !dependencies_available(&configured, &record(dependent)),
+            "an empty DLQ directory must block the activation"
+        );
+    }
+
+    #[test]
+    fn a_migration_with_an_available_dependency_may_activate() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let dlq = tempfile::tempdir().expect("dlq");
+        std::fs::write(dlq.path().join("MANIFEST"), b"manifest").expect("manifest");
+        let configured = options(
+            directory.path().to_path_buf(),
+            Some(dlq.path().to_path_buf()),
+        );
+        let dependent = vec![DependentPartition {
+            tenant_id: 1,
+            topic_id: 3,
+            partition_id: 9,
+            durable_class: 1,
+            incarnation: 43,
+        }];
+        assert!(
+            dependencies_available(&configured, &record(dependent)),
+            "an independently available DLQ destination satisfies the dependency"
+        );
+    }
 }

@@ -63,6 +63,8 @@ pub struct MetadataNode {
     /// Notifies subscribers about committed metadata revisions.
     notify: tokio::sync::watch::Sender<u64>,
     state: Arc<std::sync::Mutex<MetadataState>>,
+    /// The voters of the group, used to forward a proposal to the leader.
+    peers: Vec<(MetaNodeId, SocketAddr)>,
     id: MetaNodeId,
     cluster_id: u128,
     shutdown: tokio::sync::watch::Sender<bool>,
@@ -151,6 +153,18 @@ impl MetadataNode {
                         let raft = server_raft.clone();
                         tokio::spawn(async move {
                             let response = match read_rpc(&mut stream).await {
+                                Ok(RaftRpc::ClientWrite(command)) => {
+                                    // A follower forwards the proposal to the leader of the
+                                    // group; the committed answer is returned verbatim.
+                                    match raft.client_write(command).await {
+                                        Ok(response) => {
+                                            RaftRpcResponse::ClientWrite(response.data)
+                                        }
+                                        Err(error) => {
+                                            RaftRpcResponse::Error(format!("{error:?}"))
+                                        }
+                                    }
+                                }
                                 Ok(RaftRpc::Vote(rpc)) => {
                                     match raft.vote(rpc).await {
                                         Ok(response) => RaftRpcResponse::Vote(response),
@@ -199,6 +213,7 @@ impl MetadataNode {
             raft,
             notify,
             state: shared,
+            peers: config.peers.clone(),
             id: config.id,
             cluster_id: config.cluster_id,
             shutdown,
@@ -276,12 +291,35 @@ impl MetadataNode {
         &self,
         command: MetadataCommand,
     ) -> Result<crate::types::MetadataCommandResponse, MetadataError> {
-        let response = self
-            .raft
-            .client_write(command)
-            .await
-            .map_err(|error| MetadataError::Raft(format!("{error:?}")))?;
-        Ok(response.data)
+        match self.raft.client_write(command.clone()).await {
+            Ok(response) => Ok(response.data),
+            Err(error) => {
+                // A follower forwards the proposal to the committed leader instead of
+                // pretending that it can commit on its own.
+                let Some(leader) = error.forward_to_leader() else {
+                    return Err(MetadataError::Raft(format!("{error:?}")));
+                };
+                let Some(target) = leader.leader_id else {
+                    return Err(MetadataError::Raft(format!("{error:?}")));
+                };
+                let Some((_, address)) = self
+                    .peers
+                    .iter()
+                    .find(|(node, _)| *node == target)
+                    .map(|(node, address)| (*node, *address))
+                else {
+                    return Err(MetadataError::Raft(format!("{error:?}")));
+                };
+                let response = crate::network::forward_client_write(
+                    address,
+                    command,
+                    std::time::Duration::from_secs(30),
+                )
+                .await
+                .map_err(|error| MetadataError::Network(format!("{error:?}")))?;
+                Ok(response)
+            }
+        }
     }
 
     /// Stops the node and releases its resources.
