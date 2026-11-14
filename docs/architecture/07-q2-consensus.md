@@ -115,7 +115,42 @@ The verified contract of that release, as implemented:
   carrying only the library's own vote, append-entries and snapshot messages. No second
   consensus or election algorithm exists in the adapter.
 
-The remaining C-02 work is the staged Q1 migration (`PREPARE -> CATCH_UP -> FENCE_OLD ->
-ACTIVATE_NEW -> CLEANUP`); the fencing protocol that depends on committed metadata is
+## C-02 ownership migration: committed contract
+
+The Q1 ownership handover is a committed state machine plus a bounded transfer plus a
+durable revocation. The stages are `PREPARE -> CATCH_UP -> FENCE_OLD -> ACTIVATE_NEW ->
+CLEANUP`, and every transition is committed by the metadata group.
+
+- **The committed record** names the migration id, the source and the target, the log
+  incarnation that must survive, the original and the next ownership epoch, the verified
+  transfer watermark, the manifest identity, the fence evidence, the target readiness and
+  the dependent partitions. The state machine rejects a stale expected epoch, a concurrent
+  migration of the same partition, a conflicting migration id, a skipped stage, a fence
+  whose evidence does not match the migration, an activation without fence evidence, an
+  activation without a verified transfer and an activation without target readiness. Only
+  the committed activation moves the placement to the new owner and the new epoch; until
+  then the old owner stays authoritative.
+- **The durable fence is a record of the Q1 WAL.** It is written by the actor that
+  serializes the durable mutations, it is synced before the proof is returned, and recovery
+  replays it. A restarted owner therefore cannot regain its mutation authority because its
+  in-memory authority is empty again. A fence is bound to its migration and to the revoked
+  epoch, so it can never be replayed as an authorization for another handover. The consumer
+  fetch path checks the revocation before it claims a generation, because claiming a
+  generation writes a durable checkpoint.
+- **The transfer is bounded.** The prepare request declares the inventory, a chunk carries
+  a file index and never a path, and the chunk, the file count and the staged bytes are all
+  bounded. A repeated chunk with the same identity and content is idempotent, the same
+  identity with different bytes is refused, a missing chunk keeps the finalize from
+  succeeding and a file that does not match its declared digest is refused. The transfer is
+  keyed by an inventory identity: the history that the fence made final is a second,
+  separately verified inventory and not a mutation of the first one.
+- **The lease-expiry fallback stays unsupported.** A handover needs a durable fence of the
+  actual old owner. When the old owner cannot be contacted or durably fenced, the
+  migration is refused or deferred; a local timer of the successor never proves that a
+  remote owner stopped writing.
+
+The remaining C-02 work is the data-plane activation of the successor (opening the
+transferred history as the active owner), the multi-process migration acceptance campaign
+and the dependent DLQ proof; the fencing protocol that depends on committed metadata is
 implemented and tested, and committed metadata now reaches the data plane as the only source
 of ownership authority in Raft mode.
