@@ -495,6 +495,43 @@ mod tests {
     }
 
     #[test]
+    fn a_promotion_refuses_a_missing_staging_area() {
+        let files = [("MANIFEST", b"manifest".as_slice())];
+        let target = tempfile::tempdir().expect("target");
+        let missing = target.path().join("no-such-staging");
+        assert!(
+            promote(&missing, target.path(), &record(&files)).is_err(),
+            "a missing staging area must not promote anything"
+        );
+        assert!(
+            !target.path().join("MANIFEST").exists(),
+            "a refused promotion must not publish anything"
+        );
+    }
+
+    #[test]
+    fn a_promoted_inventory_without_a_manifest_never_opens() {
+        // An inventory without the manifest is not durable history: the recovery refuses it.
+        let files = [("segment-000000.wal", b"segment".as_slice())];
+        let (_directory, staging) = staging_with(&files);
+        let target = tempfile::tempdir().expect("target");
+        promote(&staging, target.path(), &record(&files)).expect("promotion");
+        let config = rovqet_wal::Config {
+            partition: rovqet_core::PartitionRef {
+                tenant_id: 1,
+                topic_id: 3,
+                partition_id: 0,
+            },
+            incarnation: 42,
+            ..Default::default()
+        };
+        assert!(
+            rovqet_wal::Wal::open(target.path(), config).is_err(),
+            "an inventory without a manifest must not open as history"
+        );
+    }
+
+    #[test]
     fn a_promotion_refuses_an_inventory_that_differs_from_the_manifest() {
         let files = [("MANIFEST", b"manifest".as_slice())];
         let (_directory, staging) = staging_with(&files);
