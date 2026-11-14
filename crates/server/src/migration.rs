@@ -721,8 +721,16 @@ pub async fn run_coordinator(
             }
         }
         .await;
-        if updates.changed().await.is_err() {
-            return;
+        // A committed metadata change wakes the coordinator, but the operator trigger
+        // file is local: it must also be re-read when nothing else has changed yet
+        // (for example right after the placement commit that precedes the handover).
+        tokio::select! {
+            changed = updates.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
         }
     }
 }

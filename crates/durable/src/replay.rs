@@ -288,9 +288,12 @@ impl State {
                     | RecordKind::CursorCheckpoint
                     | RecordKind::Retry
                     | RecordKind::TerminalDisposition
-                    | RecordKind::Tombstone => {
+                    | RecordKind::Tombstone
+                    | RecordKind::Fence => {
                         // Durable metadata (including a publication outcome reached by a
-                        // continuation) is not an application message.
+                        // continuation) is not an application message. The durable fence
+                        // revocation travels with the transferred history: recovery has
+                        // already applied it to this node, and a read never delivers it.
                         cursor += 1;
                         continue;
                     }

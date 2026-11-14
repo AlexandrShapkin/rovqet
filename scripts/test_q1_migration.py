@@ -77,6 +77,9 @@ class Process:
         self._reader: threading.Thread | None = None
 
     def start(self) -> None:
+        # A restart must be observed from its own output: a stale line from the previous
+        # incarnation would satisfy wait_for before the new process has opened anything.
+        self.lines.clear()
         self.process = subprocess.Popen(
             self.argv,
             cwd=self.cwd,
@@ -197,11 +200,6 @@ class Broker(Process):
         assert result.returncode == 0, (result.stdout, result.stderr)
         return [line for line in result.stdout.splitlines() if line.startswith("READ_RECORD")]
 
-    @staticmethod
-    def record_offsets(lines: list[str]) -> list[int]:
-        """The application offsets of the read records: READ_RECORD <inc> <seq> <id> <hex>."""
-        return sorted(int(line.split()[2]) for line in lines)
-
     def consume(self, ack_count: int, match_offset: int | None = None):
         argv = [
             str(CONSUME), TOPIC_NAME, TENANT, TOPIC, PARTITION, INCARNATION, GROUP,
@@ -223,6 +221,7 @@ class MigrationCampaign(unittest.TestCase):
     target: Broker
     voter: Process
     acknowledged: dict[int, int] = {}
+    offsets: dict[int, int] = {}
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -267,7 +266,11 @@ class MigrationCampaign(unittest.TestCase):
     def tearDownClass(cls) -> None:
         for process in (cls.source, cls.target, cls.voter):
             process.stop()
-        shutil.rmtree(cls.root, ignore_errors=True)
+        if os.environ.get("ROVQET_KEEP_TMP"):
+            # Diagnostic aid: the campaign directory survives for inspection.
+            print(f"campaign directory kept: {cls.root}", flush=True)
+        else:
+            shutil.rmtree(cls.root, ignore_errors=True)
 
     def migration_lines(self, process: Process) -> list[dict]:
         events = []
@@ -279,6 +282,11 @@ class MigrationCampaign(unittest.TestCase):
                 except json.JSONDecodeError:
                     continue
         return events
+
+    @staticmethod
+    def record_offsets(lines: list[str]) -> list[int]:
+        """The application offsets of the read records: READ_RECORD <inc> <seq> <id> <hex>."""
+        return sorted(int(line.split()[2]) for line in lines)
 
     def test_1_the_source_owns_the_partition_and_commits_records(self) -> None:
         line = self.source.wait_for("Q1 route active", 60)
@@ -303,25 +311,26 @@ class MigrationCampaign(unittest.TestCase):
                 offset=offset, message_id=100 + sequence, incarnation=42, node=1,
             )
         self.assertEqual(len(set(offsets.values())), 3, "every publication needs its own offset")
-        self.offsets = offsets
+        # unittest creates a fresh instance per test, so the evidence lives on the class.
+        MigrationCampaign.offsets = offsets
 
     def test_2_a_consumer_group_acknowledges_out_of_order(self) -> None:
         # The second message is acknowledged alone: the sparse set must survive.
-        result = self.source.consume(ack_count=1, match_offset=self.offsets[1])
+        result = self.source.consume(ack_count=16, match_offset=self.offsets[1])
         self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
         self.assertIn("ACK_COMMITTED", result.stdout, result.stdout)
         self.journal.append(
             "consumer_ack", group=GROUP, offset=self.offsets[1], node=1,
         )
-        self.acknowledged[self.offsets[1]] = 1
+        MigrationCampaign.acknowledged[self.offsets[1]] = 1
         # The first message is acknowledged as well: the cursor may advance.
-        result = self.source.consume(ack_count=1, match_offset=self.offsets[0])
+        result = self.source.consume(ack_count=16, match_offset=self.offsets[0])
         self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
         self.assertIn("ACK_COMMITTED", result.stdout, result.stdout)
         self.journal.append(
             "consumer_ack", group=GROUP, offset=self.offsets[0], node=1,
         )
-        self.acknowledged[self.offsets[0]] = 1
+        MigrationCampaign.acknowledged[self.offsets[0]] = 1
 
     def test_3_the_migration_is_committed_and_the_successor_takes_over(self) -> None:
         # The operator asks the source to hand the partition over. Every stage is still
@@ -350,9 +359,22 @@ class MigrationCampaign(unittest.TestCase):
             original_epoch=activation["original_epoch"], next_epoch=activation["next_epoch"],
             metadata_revision=activation["metadata_revision"],
         )
+        # The broker's report line carries the compact stage spelling; the journal must
+        # use the stage names of the metadata state machine the oracle reconciles.
+        oracle_stage = {
+            "prepare": "prepare",
+            "catchup": "catch_up",
+            "catch_up": "catch_up",
+            "fenceold": "fence_old",
+            "fence_old": "fence_old",
+            "activatenew": "activate_new",
+            "activate_new": "activate_new",
+            "cleanup": "cleanup",
+        }
         for event in events:
             self.journal.append(
-                "migration_stage", migration_id=event["migration_id"], stage=event["stage"],
+                "migration_stage", migration_id=event["migration_id"],
+                stage=oracle_stage[event["stage"]],
                 metadata_revision=event["metadata_revision"],
                 transfer_watermark=event["transfer_watermark"],
                 manifest_id=event["manifest_id"], target_ready=event["target_ready"],
@@ -385,7 +407,8 @@ class MigrationCampaign(unittest.TestCase):
         self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
         committed = [line for line in result.stdout.splitlines() if "COMMITTED_LOCAL" in line]
         self.assertTrue(committed, f"the retry must resolve: {result.stdout}")
-        offset = int(committed[0].split("offset=")[1].split()[0])
+        # COMMITTED_LOCAL <incarnation> <sequence>: the same durable offset test_1 parsed.
+        offset = int(committed[0].split()[2])
         self.assertEqual(
             offset, self.offsets[0],
             "the retry must return the original offset without a duplicate",
