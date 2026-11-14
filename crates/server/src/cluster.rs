@@ -8,7 +8,9 @@ use rovqet_control::ids::{ClusterId, NodeId, PeerEndpoint, TrustContext};
 use rovqet_control::metadata::{MetadataSnapshot, MetadataStore, SnapshotFile};
 use rovqet_control::routing::{RouteDecision, decide};
 use rovqet_control::rpc::{
-    HealthResponse, OwnershipRequest, OwnershipResponse, RouteAckRequest, RouteAckResponse,
+    HealthResponse, OwnershipRequest, OwnershipResponse, Q1TransferChunkRequest,
+    Q1TransferChunkResponse, Q1TransferFinalizeRequest, Q1TransferFinalizeResponse,
+    Q1TransferPrepareRequest, Q1TransferPrepareResponse, RouteAckRequest, RouteAckResponse,
     RouteFetchRequest, RouteFetchResponse, RoutePublishRequest, RoutePublishResponse, RpcErrorCode,
     RpcKind,
 };
@@ -108,6 +110,9 @@ pub struct ClusterOptions {
     pub metadata: Option<PathBuf>,
     /// Raft-committed metadata authority. Mutually exclusive with the static fixture.
     pub metadata_raft: Option<MetadataRaftOptions>,
+    /// Directory of the incoming Q1 transfers. Without it the transfer kinds are answered
+    /// as unsupported.
+    pub transfer_staging: Option<PathBuf>,
 }
 
 pub struct Cluster {
@@ -118,6 +123,8 @@ pub struct Cluster {
     pub started: Instant,
     /// The metadata voter of this node, when Raft mode is active.
     pub raft: Option<Arc<rovqet_metadata_raft::MetadataNode>>,
+    /// The staging areas of the incoming Q1 transfers.
+    pub transfers: Option<Arc<tokio::sync::Mutex<crate::transfer::TransferManager>>>,
 }
 
 /// Rejects a configuration in which a static fixture could override committed metadata.
@@ -163,6 +170,11 @@ impl Cluster {
             Some(raft_options) => Some(start_metadata_raft(raft_options, &store).await?),
             None => None,
         };
+        let transfers = options.transfer_staging.as_ref().map(|root| {
+            Arc::new(tokio::sync::Mutex::new(
+                crate::transfer::TransferManager::new(root),
+            ))
+        });
         Ok(Self {
             trust,
             store,
@@ -170,6 +182,7 @@ impl Cluster {
             node,
             started: Instant::now(),
             raft,
+            transfers,
         })
     }
 
@@ -269,6 +282,45 @@ impl PeerHandler for ClusterHandler {
                     let snapshot = cluster.store.current().ok_or(RpcErrorCode::NoMetadata)?;
                     let file = SnapshotFile::from(snapshot.as_ref());
                     serde_json::to_vec(&file).map_err(|_| RpcErrorCode::Internal)
+                }
+                RpcKind::Q1TransferPrepare => {
+                    let Some(transfers) = &cluster.transfers else {
+                        return Err(RpcErrorCode::Unsupported);
+                    };
+                    let request = Q1TransferPrepareRequest::decode(&envelope.body)
+                        .map_err(|_| RpcErrorCode::Malformed)?;
+                    let response = transfers
+                        .lock()
+                        .await
+                        .prepare(&request)
+                        .map_err(|_| RpcErrorCode::Internal)?;
+                    Ok(response.encode())
+                }
+                RpcKind::Q1TransferChunk => {
+                    let Some(transfers) = &cluster.transfers else {
+                        return Err(RpcErrorCode::Unsupported);
+                    };
+                    let request = Q1TransferChunkRequest::decode(&envelope.body)
+                        .map_err(|_| RpcErrorCode::Malformed)?;
+                    let response = transfers
+                        .lock()
+                        .await
+                        .chunk(&request)
+                        .map_err(|_| RpcErrorCode::Internal)?;
+                    Ok(response.encode())
+                }
+                RpcKind::Q1TransferFinalize => {
+                    let Some(transfers) = &cluster.transfers else {
+                        return Err(RpcErrorCode::Unsupported);
+                    };
+                    let request = Q1TransferFinalizeRequest::decode(&envelope.body)
+                        .map_err(|_| RpcErrorCode::Malformed)?;
+                    let response = transfers
+                        .lock()
+                        .await
+                        .finalize(&request)
+                        .map_err(|_| RpcErrorCode::Internal)?;
+                    Ok(response.encode())
                 }
                 RpcKind::OwnershipInspect => {
                     let request = OwnershipRequest::decode(&envelope.body)
@@ -513,6 +565,7 @@ mod tests {
             peers: Vec::new(),
             metadata: Some(PathBuf::from("/tmp/does-not-matter.json")),
             metadata_raft: Some(raft_options(free_port(), directory("conflict"))),
+            transfer_staging: None,
         };
         let rejected = validate(&options);
         assert!(
@@ -537,6 +590,7 @@ mod tests {
             peers: Vec::new(),
             metadata: None,
             metadata_raft: Some(raft_options(port, path.clone())),
+            transfer_staging: None,
         };
         let cluster = Cluster::new(&options).await.expect("cluster");
         let node = cluster.raft_node().expect("the metadata voter");
@@ -620,5 +674,270 @@ mod tests {
             .expect("placement");
         assert!(!cluster.store.authority_expired(placement));
         let _ = std::fs::remove_dir_all(path);
+    }
+}
+
+#[cfg(test)]
+mod transfer_tests {
+    use super::*;
+    use crate::transfer::sha256;
+    use rovqet_control::TimeoutBudget;
+    use rovqet_control::rpc::{
+        Q1TransferChunkRequest, Q1TransferChunkResponse, Q1TransferFile, Q1TransferFinalizeRequest,
+        Q1TransferFinalizeResponse, Q1TransferPrepareRequest, Q1TransferPrepareResponse,
+        Q1TransferStatus,
+    };
+
+    const MIGRATION: u128 = 0xabcd_0000_0000_0007;
+
+    fn free_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("port");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        port
+    }
+
+    fn directory(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "rovqet-transfer-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&path).expect("directory");
+        path
+    }
+
+    fn options(
+        node_id: u64,
+        listen: SocketAddr,
+        peer: u64,
+        peer_address: SocketAddr,
+        staging: PathBuf,
+    ) -> ClusterOptions {
+        ClusterOptions {
+            cluster_id: 5150,
+            node_id,
+            listen,
+            peers: vec![(peer, peer_address)],
+            metadata: None,
+            metadata_raft: None,
+            transfer_staging: Some(staging),
+        }
+    }
+
+    async fn serve(cluster: Arc<Cluster>, listen: SocketAddr) -> tokio::sync::watch::Sender<bool> {
+        let listener = tokio::net::TcpListener::bind(listen)
+            .await
+            .expect("listener");
+        let server = rovqet_control::transport::PeerServer::new(
+            listener,
+            cluster.trust.clone(),
+            Arc::new(ClusterHandler::new(cluster, None)),
+            Default::default(),
+        )
+        .expect("peer server");
+        let (stop, stop_rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(server.serve(stop_rx));
+        stop
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_q1_transfer_reaches_the_target_over_real_tcp() {
+        let source_port = free_port();
+        let target_port = free_port();
+        let source_address: SocketAddr = format!("127.0.0.1:{source_port}").parse().unwrap();
+        let target_address: SocketAddr = format!("127.0.0.1:{target_port}").parse().unwrap();
+        let source = Arc::new(
+            Cluster::new(&options(
+                1,
+                source_address,
+                2,
+                target_address,
+                directory("source"),
+            ))
+            .await
+            .expect("source cluster"),
+        );
+        let target = Arc::new(
+            Cluster::new(&options(
+                2,
+                target_address,
+                1,
+                source_address,
+                directory("target"),
+            ))
+            .await
+            .expect("target cluster"),
+        );
+        let _source_stop = serve(source.clone(), source_address).await;
+        let _target_stop = serve(target.clone(), target_address).await;
+
+        let payload = b"q1 wal segment bytes".to_vec();
+        let digest = sha256(&payload);
+        let prepare = Q1TransferPrepareRequest {
+            migration_id: MIGRATION,
+            source_node: 1,
+            target_node: 2,
+            tenant_id: 1,
+            topic_id: 3,
+            partition_id: 0,
+            incarnation: 42,
+            original_epoch: 5,
+            next_epoch: 6,
+            manifest_generation: 3,
+            manifest_digest: vec![1u8; 32],
+            files: vec![Q1TransferFile {
+                name: "MANIFEST".into(),
+                size: payload.len() as u64,
+                digest: digest.clone(),
+            }],
+        };
+        let response = source
+            .transport
+            .call(
+                NodeId::new(2).unwrap(),
+                RpcKind::Q1TransferPrepare,
+                prepare.encode(),
+                TimeoutBudget::new(5000).unwrap(),
+                0,
+                0,
+            )
+            .await
+            .expect("the prepare must reach the target");
+        let response = Q1TransferPrepareResponse::decode(&response.body).expect("decode");
+        assert!(response.accepted, "the target must accept the preparation");
+
+        let chunk = Q1TransferChunkRequest {
+            migration_id: MIGRATION,
+            chunk_index: 0,
+            file_index: 0,
+            offset: 0,
+            data: payload.clone(),
+            digest: digest.clone(),
+        };
+        let response = source
+            .transport
+            .call(
+                NodeId::new(2).unwrap(),
+                RpcKind::Q1TransferChunk,
+                chunk.encode(),
+                TimeoutBudget::new(5000).unwrap(),
+                0,
+                0,
+            )
+            .await
+            .expect("the chunk must reach the target");
+        let response = Q1TransferChunkResponse::decode(&response.body).expect("decode");
+        assert!(response.accepted);
+        assert!(!response.duplicate, "the first chunk is not a duplicate");
+
+        // The same chunk again is idempotent.
+        let response = source
+            .transport
+            .call(
+                NodeId::new(2).unwrap(),
+                RpcKind::Q1TransferChunk,
+                chunk.encode(),
+                TimeoutBudget::new(5000).unwrap(),
+                0,
+                0,
+            )
+            .await
+            .expect("the repeated chunk must reach the target");
+        let response = Q1TransferChunkResponse::decode(&response.body).expect("decode");
+        assert!(response.accepted);
+        assert!(response.duplicate, "a repeated chunk must be idempotent");
+
+        // The same identity with different bytes is refused.
+        let mut conflicting = chunk.clone();
+        conflicting.data = b"q1 wal segment byteS".to_vec();
+        conflicting.digest = sha256(&conflicting.data);
+        let response = source
+            .transport
+            .call(
+                NodeId::new(2).unwrap(),
+                RpcKind::Q1TransferChunk,
+                conflicting.encode(),
+                TimeoutBudget::new(5000).unwrap(),
+                0,
+                0,
+            )
+            .await
+            .expect("the conflicting chunk must reach the target");
+        let response = Q1TransferChunkResponse::decode(&response.body).expect("decode");
+        assert!(!response.accepted, "a conflicting chunk must be refused");
+
+        // Without the fence evidence the target only confirms the inventory.
+        let finalize = Q1TransferFinalizeRequest {
+            migration_id: MIGRATION,
+            final_digest: digest.clone(),
+            last_committed_offset: 10,
+            transfer_watermark: 10,
+            manifest_generation: 3,
+            fence_offset: None,
+            fence_digest: None,
+            old_epoch: 5,
+        };
+        let response = source
+            .transport
+            .call(
+                NodeId::new(2).unwrap(),
+                RpcKind::Q1TransferFinalize,
+                finalize.encode(),
+                TimeoutBudget::new(5000).unwrap(),
+                0,
+                0,
+            )
+            .await
+            .expect("the finalize must reach the target");
+        let response = Q1TransferFinalizeResponse::decode(&response.body).expect("decode");
+        assert_eq!(response.status, Q1TransferStatus::ReadyForFence);
+
+        // With the fence evidence the target confirms the activation.
+        let finalize = Q1TransferFinalizeRequest {
+            fence_offset: Some(11),
+            fence_digest: Some(vec![2u8; 32]),
+            ..finalize
+        };
+        let response = source
+            .transport
+            .call(
+                NodeId::new(2).unwrap(),
+                RpcKind::Q1TransferFinalize,
+                finalize.encode(),
+                TimeoutBudget::new(5000).unwrap(),
+                0,
+                0,
+            )
+            .await
+            .expect("the finalize must reach the target");
+        let response = Q1TransferFinalizeResponse::decode(&response.body).expect("decode");
+        assert_eq!(response.status, Q1TransferStatus::ReadyForActivation);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_transfer_without_a_staging_area_is_unsupported() {
+        let port = free_port();
+        let address: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let mut options = options(1, address, 2, address, directory("unused"));
+        options.transfer_staging = None;
+        let cluster = Arc::new(Cluster::new(&options).await.expect("cluster"));
+        let handler = ClusterHandler::new(cluster, None);
+        let envelope = rovqet_control::wire::Envelope::new(
+            5150,
+            2,
+            1,
+            7,
+            RpcKind::Q1TransferPrepare.as_u16(),
+            0,
+            0,
+            1000,
+            Vec::new(),
+        );
+        let error = handler.handle(envelope).await;
+        assert_eq!(error, Err(RpcErrorCode::Unsupported));
     }
 }

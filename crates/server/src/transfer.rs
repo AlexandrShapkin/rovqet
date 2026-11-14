@@ -6,8 +6,10 @@
 //! against its declared digest before the transfer may be finalized, and the staged bytes
 //! stay on disk: nothing is buffered in memory.
 use rovqet_control::rpc::{
-    MAX_TRANSFER_CHUNK_BYTES, MAX_TRANSFER_FILES, Q1TransferChunkRequest, Q1TransferFile,
-    Q1TransferFinalizeRequest, Q1TransferPrepareRequest, validate_transfer_file_name,
+    MAX_TRANSFER_CHUNK_BYTES, MAX_TRANSFER_FILES, Q1TransferChunkRequest, Q1TransferChunkResponse,
+    Q1TransferFile, Q1TransferFinalizeRequest, Q1TransferFinalizeResponse,
+    Q1TransferPrepareRequest, Q1TransferPrepareResponse, Q1TransferStatus,
+    validate_transfer_file_name,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -137,14 +139,72 @@ impl TransferStaging {
                 .map_err(|error| TransferError::Io(error.to_string()))?;
             write_atomic(&manifest, &bytes)?;
         }
+        // The received chunks are persisted, so an interrupted transfer resumes with the
+        // chunks that are already durable.
+        let mut received: BTreeMap<(u32, u64), (u64, Vec<u8>)> = BTreeMap::new();
+        let journal = directory.join("chunks.jsonl");
+        if journal.exists() {
+            let text = std::fs::read_to_string(&journal)
+                .map_err(|error| TransferError::Io(error.to_string()))?;
+            for line in text.lines().filter(|line| !line.trim().is_empty()) {
+                let entry: serde_json::Value = serde_json::from_str(line)
+                    .map_err(|error| TransferError::Io(error.to_string()))?;
+                let file_index = entry["file_index"].as_u64().unwrap_or(0) as u32;
+                let offset = entry["offset"].as_u64().unwrap_or(0);
+                let length = entry["length"].as_u64().unwrap_or(0);
+                let digest = entry["digest"]
+                    .as_str()
+                    .map(hex_to_bytes)
+                    .unwrap_or_default();
+                received.insert((file_index, offset), (length, digest));
+            }
+        }
         Ok(Self {
             root: directory,
             migration_id: request.migration_id,
             files: request.files.clone(),
-            received: BTreeMap::new(),
+            received,
             written: vec![0u64; request.files.len()],
             total: 0,
         })
+    }
+
+    /// Reopens a staging area of a migration after a restart.
+    ///
+    /// The declared inventory and the received chunks are read back from the staging
+    /// directory, so an interrupted transfer resumes with the chunks that are durable.
+    pub fn reopen(root: &Path, migration_id: u128) -> Result<Self, TransferError> {
+        let directory = root.join(format!("migration-{migration_id:032x}"));
+        let manifest = directory.join("staging.json");
+        let text = std::fs::read_to_string(&manifest)
+            .map_err(|error| TransferError::Io(error.to_string()))?;
+        let document: serde_json::Value =
+            serde_json::from_str(&text).map_err(|error| TransferError::Io(error.to_string()))?;
+        let mut files = Vec::new();
+        for file in document["files"].as_array().cloned().unwrap_or_default() {
+            let name = file["name"].as_str().unwrap_or_default().to_string();
+            let size = file["size"].as_u64().unwrap_or(0);
+            let digest = file["digest"]
+                .as_str()
+                .map(hex_to_bytes)
+                .unwrap_or_default();
+            files.push(Q1TransferFile { name, size, digest });
+        }
+        let request = Q1TransferPrepareRequest {
+            migration_id,
+            source_node: 0,
+            target_node: 0,
+            tenant_id: 0,
+            topic_id: 0,
+            partition_id: 0,
+            incarnation: 0,
+            original_epoch: 0,
+            next_epoch: 0,
+            manifest_generation: 0,
+            manifest_digest: Vec::new(),
+            files,
+        };
+        Self::prepare(root, &request)
     }
 
     /// The migration this staging area belongs to.
@@ -215,6 +275,23 @@ impl TransferStaging {
         }
         self.received
             .insert(key, (request.data.len() as u64, request.digest.clone()));
+        // The chunk index is persisted, so a restart knows what is already durable.
+        let journal = self.root.join("chunks.jsonl");
+        let mut handle = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&journal)
+            .map_err(|error| TransferError::Io(error.to_string()))?;
+        let line = serde_json::json!({
+            "file_index": request.file_index,
+            "offset": request.offset,
+            "length": request.data.len(),
+            "digest": bytes_to_hex(&request.digest),
+        });
+        writeln!(handle, "{line}").map_err(|error| TransferError::Io(error.to_string()))?;
+        handle
+            .sync_all()
+            .map_err(|error| TransferError::Io(error.to_string()))?;
         Ok(ChunkOutcome::Stored)
     }
 
@@ -304,6 +381,147 @@ impl TransferStaging {
         }
         Ok(published)
     }
+}
+
+/// Owns the staging areas of the incoming transfers of this node.
+///
+/// Every transfer is bounded: the number of files, the size of a chunk and the total
+/// staged bytes are limited, and a chunk never carries a path.
+pub struct TransferManager {
+    root: PathBuf,
+    areas: BTreeMap<u128, TransferStaging>,
+}
+
+impl TransferManager {
+    /// Creates a manager with the given staging root.
+    pub fn new(root: impl AsRef<Path>) -> Self {
+        let root = root.as_ref().to_path_buf();
+        let _ = std::fs::create_dir_all(&root);
+        Self {
+            root,
+            areas: BTreeMap::new(),
+        }
+    }
+
+    /// The staging root.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn area(&mut self, migration_id: u128) -> Result<&mut TransferStaging, TransferError> {
+        if !self.areas.contains_key(&migration_id) {
+            let area = TransferStaging::reopen(&self.root, migration_id)?;
+            self.areas.insert(migration_id, area);
+        }
+        Ok(self.areas.get_mut(&migration_id).expect("the area exists"))
+    }
+
+    /// Accepts a transfer preparation.
+    pub fn prepare(
+        &mut self,
+        request: &Q1TransferPrepareRequest,
+    ) -> Result<Q1TransferPrepareResponse, TransferError> {
+        let area = TransferStaging::prepare(&self.root, request)?;
+        let staging_id = request.migration_id;
+        self.areas.insert(request.migration_id, area);
+        Ok(Q1TransferPrepareResponse {
+            accepted: true,
+            staging_id,
+            error: None,
+        })
+    }
+
+    /// Accepts one transfer chunk.
+    pub fn chunk(
+        &mut self,
+        request: &Q1TransferChunkRequest,
+    ) -> Result<Q1TransferChunkResponse, TransferError> {
+        let area = self.area(request.migration_id)?;
+        match area.accept_chunk(request) {
+            Ok(ChunkOutcome::Stored) => Ok(Q1TransferChunkResponse {
+                accepted: true,
+                duplicate: false,
+                error: None,
+            }),
+            Ok(ChunkOutcome::Duplicate) => Ok(Q1TransferChunkResponse {
+                accepted: true,
+                duplicate: true,
+                error: None,
+            }),
+            Err(error) => Ok(Q1TransferChunkResponse {
+                accepted: false,
+                duplicate: false,
+                error: Some(match error {
+                    TransferError::DigestMismatch | TransferError::Conflict => {
+                        rovqet_control::rpc::RpcErrorCode::Malformed
+                    }
+                    TransferError::OutOfRange | TransferError::UnknownFile => {
+                        rovqet_control::rpc::RpcErrorCode::Malformed
+                    }
+                    TransferError::TooLarge => rovqet_control::rpc::RpcErrorCode::Capacity,
+                    _ => rovqet_control::rpc::RpcErrorCode::Internal,
+                }),
+            }),
+        }
+    }
+
+    /// Verifies the complete transferred inventory.
+    pub fn finalize(
+        &mut self,
+        request: &Q1TransferFinalizeRequest,
+    ) -> Result<Q1TransferFinalizeResponse, TransferError> {
+        let area = self.area(request.migration_id)?;
+        match area.finalize(request) {
+            Ok(FinalizeOutcome::Complete { .. }) => {
+                // Without the fence evidence the inventory is complete but the target is not
+                // allowed to activate yet.
+                let status = if request.fence_offset.is_some() {
+                    Q1TransferStatus::ReadyForActivation
+                } else {
+                    Q1TransferStatus::ReadyForFence
+                };
+                Ok(Q1TransferFinalizeResponse {
+                    status,
+                    error: None,
+                })
+            }
+            Err(TransferError::Incomplete) => Ok(Q1TransferFinalizeResponse {
+                status: Q1TransferStatus::Mismatch,
+                error: Some(rovqet_control::rpc::RpcErrorCode::Malformed),
+            }),
+            Err(error) => Ok(Q1TransferFinalizeResponse {
+                status: Q1TransferStatus::Mismatch,
+                error: Some(match error {
+                    TransferError::Mismatch => rovqet_control::rpc::RpcErrorCode::Malformed,
+                    TransferError::TooLarge => rovqet_control::rpc::RpcErrorCode::Capacity,
+                    _ => rovqet_control::rpc::RpcErrorCode::Internal,
+                }),
+            }),
+        }
+    }
+}
+
+/// The hexadecimal form of a digest.
+pub fn bytes_to_hex(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push_str(&format!("{byte:02x}"));
+    }
+    encoded
+}
+
+/// Decodes a hexadecimal digest.
+pub fn hex_to_bytes(value: &str) -> Vec<u8> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len() / 2);
+    let mut index = 0;
+    while index + 1 < bytes.len() {
+        let high = (bytes[index] as char).to_digit(16).unwrap_or(0) as u8;
+        let low = (bytes[index + 1] as char).to_digit(16).unwrap_or(0) as u8;
+        decoded.push((high << 4) | low);
+        index += 2;
+    }
+    decoded
 }
 
 /// The digest of one buffer.

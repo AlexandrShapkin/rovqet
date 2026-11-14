@@ -57,6 +57,7 @@ impl Options {
         let mut metadata_raft_listen: Option<SocketAddr> = None;
         let mut metadata_raft_peers: Vec<(u64, SocketAddr)> = Vec::new();
         let mut metadata_raft_bootstrap = false;
+        let mut transfer_staging: Option<PathBuf> = None;
         for pair in args.chunks(2) {
             if pair.len() != 2 {
                 return Err(invalid("expected unique --option value pairs; see --help"));
@@ -114,6 +115,7 @@ impl Options {
                     }
                 }
                 "--metadata-raft-dir" => metadata_raft_dir = Some(PathBuf::from(&pair[1])),
+                "--transfer-staging-dir" => transfer_staging = Some(PathBuf::from(&pair[1])),
                 "--metadata-raft-listen" => {
                     metadata_raft_listen = Some(
                         pair[1]
@@ -254,6 +256,7 @@ impl Options {
                     peers: cluster_peers,
                     metadata: cluster_metadata,
                     metadata_raft: metadata_raft_options,
+                    transfer_staging,
                 });
             }
             (None, None) => {
