@@ -911,7 +911,7 @@
         "scripts/test_q1_migration_crash.py"
       ],
       "evidence": {
-        "commit": "PENDING",
+        "commit": "1705acf",
         "verification": "PARTIAL: the metadata Raft group, the committed migration state machine, the durable old-owner fence, the bounded transfer, the crash-safe promotion and the successor's activation are implemented and verified, the DLQ dependency now uses the real Q1 recovery, and the deterministic migration crash matrix executes against real processes. The coordinated source-plus-DLQ handover is not implemented, so C-02 stays IN_PROGRESS.",
         "test_command": [
           "cargo build -p rovqet-server --features fault-injection --locked",
