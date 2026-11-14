@@ -156,6 +156,7 @@ pub fn promote(
     let mut journal = record.clone();
     journal.state = PromotionState::Promoting;
     write_json_durable(&staging.join(PROMOTION_JOURNAL), &journal)?;
+    crate::barrier::barrier("promotion_intent");
 
     for (index, file) in record.files.iter().enumerate() {
         let staged = staging.join(format!("part-{index:06}.bin"));
@@ -182,6 +183,7 @@ pub fn promote(
             let _ = std::fs::remove_file(&staged);
         }
         sync_file(&published)?;
+        crate::barrier::barrier("promotion_first_file");
     }
     sync_directory(target)?;
 
@@ -190,6 +192,7 @@ pub fn promote(
     completed.state = PromotionState::Promoted;
     write_json_durable(&target.join(PROMOTION_RECORD), &completed)?;
     sync_directory(target)?;
+    crate::barrier::barrier("promotion_done");
     Ok(())
 }
 

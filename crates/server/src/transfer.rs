@@ -279,6 +279,7 @@ impl TransferStaging {
             .and_then(|_| handle.write_all(&request.data))
             .and_then(|()| handle.sync_all())
             .map_err(|error| TransferError::Io(error.to_string()))?;
+        crate::barrier::barrier("chunk_after_append");
         self.written[index] = self.written[index].max(end);
         self.total += request.data.len() as u64;
         if self.total > MAX_STAGED_BYTES {
@@ -303,6 +304,7 @@ impl TransferStaging {
         handle
             .sync_all()
             .map_err(|error| TransferError::Io(error.to_string()))?;
+        crate::barrier::barrier("chunk_after_sync");
         Ok(ChunkOutcome::Stored)
     }
 

@@ -608,6 +608,7 @@ pub async fn run_coordinator(
                 MigrationStage::CatchUp => {
                     // The old owner revokes its authority durably. Only then may the
                     // successor be activated.
+                    crate::barrier::barrier("before_fence");
                     let proof = match route
                         .fence_old_owner(
                             record.migration_id,
@@ -638,6 +639,7 @@ pub async fn run_coordinator(
                         fence_proof: Some(proof.clone()),
                         target_ready: false,
                     };
+                    crate::barrier::barrier("after_fence");
                     if let Err(error) = driver.commit(fence_command, Duration::from_secs(30)).await
                     {
                         eprintln!("metadata migration fence was not committed: {error}");
@@ -707,6 +709,7 @@ pub async fn run_coordinator(
                         fence_proof: None,
                         target_ready: true,
                     };
+                    crate::barrier::barrier("before_activate_commit");
                     if let Err(error) = driver.commit(activation, Duration::from_secs(30)).await {
                         eprintln!("metadata migration activation was not committed: {error}");
                     } else if let Some(updated) =
@@ -842,6 +845,7 @@ pub async fn run_activator(
                 }
                 // The transferred history keeps its incarnation.
                 route_options.incarnation = record.source_incarnation;
+                crate::barrier::barrier("before_route_open");
             }
             let partition = route_options.partition;
             match crate::q1::Route::open(route_options) {
@@ -851,6 +855,7 @@ pub async fn run_activator(
                         "Q1 route active: partition={:?} epoch={} incarnation={}",
                         partition, route.options.owner_epoch, route.options.incarnation
                     );
+                    crate::barrier::barrier("after_route_open");
                     if let Some(authority) = cluster.authority_for(&partition) {
                         route.install_authority(Some(authority));
                     }

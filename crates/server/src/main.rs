@@ -4,6 +4,7 @@ use rovqet_core::{Priority, QoS};
 use rovqet_q0::Broker;
 use rovqet_router::{OverflowPolicy, TopicConfig};
 use rovqet_transport::{Config, TransportStats, serve};
+mod barrier;
 mod cluster;
 mod migration;
 mod promotion;
