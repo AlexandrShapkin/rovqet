@@ -127,6 +127,8 @@ pub struct Cluster {
     pub transfers: Option<Arc<tokio::sync::Mutex<crate::transfer::TransferManager>>>,
     /// The endpoints of the metadata group, used to register the nodes of a handover.
     pub metadata_peers: Vec<(u64, SocketAddr)>,
+    /// The durable directory of the metadata voter of this node.
+    pub metadata_directory: Option<PathBuf>,
 }
 
 /// Rejects a configuration in which a static fixture could override committed metadata.
@@ -177,6 +179,10 @@ impl Cluster {
             .as_ref()
             .map(|raft| raft.peers.clone())
             .unwrap_or_default();
+        let metadata_directory = options
+            .metadata_raft
+            .as_ref()
+            .map(|raft| raft.data_directory.clone());
         let transfers = options.transfer_staging.as_ref().map(|root| {
             Arc::new(tokio::sync::Mutex::new(
                 crate::transfer::TransferManager::new(root),
@@ -191,6 +197,7 @@ impl Cluster {
             raft,
             transfers,
             metadata_peers,
+            metadata_directory,
         })
     }
 

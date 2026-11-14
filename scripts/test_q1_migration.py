@@ -143,6 +143,8 @@ class Broker(Process):
         # The listen addresses must be the ones every peer already knows.
         peer_port = peer_ports[node_id]
         raft_port = raft_ports[node_id]
+        # The broker opens an existing partition directory: it never creates one.
+        (root / "q1").mkdir(parents=True, exist_ok=True)
         argv = [
             str(SERVER),
             "--listen", f"127.0.0.1:{client_port}",
@@ -170,6 +172,7 @@ class Broker(Process):
         if migrate_to is not None:
             argv.extend(["--migrate-to", str(migrate_to)])
         super().__init__(name, argv, root)
+        self.metadata_dir = root / "raft"
         self.client_port = client_port
         self.peer_port = peer_port
         self.raft_port = raft_port
@@ -193,6 +196,11 @@ class Broker(Process):
         )
         assert result.returncode == 0, (result.stdout, result.stderr)
         return [line for line in result.stdout.splitlines() if line.startswith("READ_RECORD")]
+
+    @staticmethod
+    def record_offsets(lines: list[str]) -> list[int]:
+        """The application offsets of the read records: READ_RECORD <inc> <seq> <id> <hex>."""
+        return sorted(int(line.split()[2]) for line in lines)
 
     def consume(self, ack_count: int, match_offset: int | None = None):
         argv = [
@@ -287,7 +295,8 @@ class MigrationCampaign(unittest.TestCase):
                 line for line in result.stdout.splitlines() if "COMMITTED_LOCAL" in line
             ]
             self.assertTrue(committed, f"the publication must commit: {result.stdout}")
-            offset = int(committed[0].split("offset=")[1].split()[0])
+            # COMMITTED_LOCAL <incarnation> <sequence>
+            offset = int(committed[0].split()[2])
             offsets[sequence] = offset
             self.journal.append(
                 "publication_committed", producer=11, epoch=1, sequence=sequence,
@@ -315,6 +324,9 @@ class MigrationCampaign(unittest.TestCase):
         self.acknowledged[self.offsets[0]] = 1
 
     def test_3_the_migration_is_committed_and_the_successor_takes_over(self) -> None:
+        # The operator asks the source to hand the partition over. Every stage is still
+        # committed by the metadata group.
+        (self.source.metadata_dir / "MIGRATE").write_text("2\n")
         line = self.target.wait_for("Q1 route active", 180)
         self.assertIsNotNone(
             line,
@@ -322,11 +334,13 @@ class MigrationCampaign(unittest.TestCase):
         )
         events = self.migration_lines(self.source)
         self.assertTrue(events, "the source must report the committed transitions")
-        stages = [event["stage"] for event in events]
-        self.assertIn("catch_up", stages)
-        self.assertIn("fence_old", stages)
-        self.assertIn("activate_new", stages)
-        activation = [event for event in events if event["stage"] == "activate_new"][-1]
+        stages = [event["stage"].replace("_", "") for event in events]
+        self.assertIn("catchup", stages)
+        self.assertIn("fenceold", stages)
+        self.assertIn("activatenew", stages)
+        activation = [
+            event for event in events if event["stage"].replace("_", "") == "activatenew"
+        ][-1]
         self.assertTrue(activation["fence"], "the activation must carry the fence proof")
         self.assertTrue(activation["target_ready"], "the activation must carry the readiness")
         migration_id = activation["migration_id"]
@@ -362,10 +376,7 @@ class MigrationCampaign(unittest.TestCase):
     def test_4_the_successor_serves_the_transferred_history(self) -> None:
         history = self.target.read_history()
         self.assertTrue(history, "the successor must serve the transferred history")
-        offsets = sorted(
-            int(line.split("offset=")[1].split()[0])
-            for line in history
-        )
+        offsets = self.record_offsets(history)
         for sequence, offset in self.offsets.items():
             self.assertIn(offset, offsets, "the transferred offset must survive")
         # A producer retry with the original token returns the original offset.
@@ -404,7 +415,7 @@ class MigrationCampaign(unittest.TestCase):
             + "\n".join(self.target.lines),
         )
         history = self.target.read_history()
-        offsets = sorted(int(line.split("offset=")[1].split()[0]) for line in history)
+        offsets = self.record_offsets(history)
         for offset in self.offsets.values():
             self.assertIn(offset, offsets, "the transferred offset must survive the restart")
 

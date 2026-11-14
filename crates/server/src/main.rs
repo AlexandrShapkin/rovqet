@@ -501,6 +501,11 @@ async fn main() -> io::Result<()> {
                     incarnation: q1.incarnation,
                     epoch: q1.owner_epoch,
                     peers: cluster.metadata_peers.clone(),
+                    trigger_path: cluster
+                        .metadata_directory
+                        .clone()
+                        .unwrap_or_default()
+                        .join(migration::MIGRATE_TRIGGER),
                 })
             });
             tokio::spawn(migration::run_coordinator(

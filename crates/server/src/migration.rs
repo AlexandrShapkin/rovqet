@@ -112,6 +112,11 @@ impl MigrationDriver {
         &self.raft
     }
 
+    /// The durable directory of this partition.
+    pub fn directory(&self) -> &std::path::Path {
+        &self.directory
+    }
+
     /// Transfers the committed history of this partition to the target.
     ///
     /// The inventory is declared first, then every file is sent in bounded chunks. A chunk
@@ -348,7 +353,15 @@ pub struct OperatorRequest {
     pub epoch: u64,
     /// The endpoints of the metadata group, used to register the handover's nodes.
     pub peers: Vec<(u64, std::net::SocketAddr)>,
+    /// The local file that asks the source to start the committed handover.
+    pub trigger_path: std::path::PathBuf,
 }
+
+/// The name of the local operator trigger that starts a committed handover.
+///
+/// The trigger only asks the source to drive the migration; every stage is still committed
+/// by the metadata group.
+pub const MIGRATE_TRIGGER: &str = "MIGRATE";
 
 /// The stage that follows the given one, if any.
 pub fn next_stage(stage: MigrationStage) -> Option<MigrationStage> {
@@ -467,6 +480,19 @@ pub async fn run_coordinator(
                         return;
                     }
                     last_request = Some(now);
+                    // The handover starts when the operator asks for it locally: the source
+                    // first serves the partition with its committed authority, and only then
+                    // begins the transfer.
+                    let Ok(text) = std::fs::read_to_string(&request.trigger_path) else {
+                        return;
+                    };
+                    let Ok(target_node) = text.trim().parse::<u64>() else {
+                        return;
+                    };
+                    let request = OperatorRequest {
+                        target_node,
+                        ..request
+                    };
                     let _ = driver
                         .commit(
                             MetadataCommand::BeginMigration {
