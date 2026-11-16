@@ -5,8 +5,10 @@
     {
       "scenario": "C1-before-fence",
       "barrier": "before_fence",
-      "verdict": "PASS",
-      "reasons": [],
+      "verdict": "INVALID",
+      "reasons": [
+        "the source did not recover"
+      ],
       "barrier_reached": true
     },
     {

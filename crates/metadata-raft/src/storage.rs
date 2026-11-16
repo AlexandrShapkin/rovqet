@@ -126,7 +126,7 @@ impl FileLogStorage {
                 .and_then(|()| file.sync_all())
                 .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Write, error))?;
         }
-        let index = scan(&mut file)
+        let mut index = scan(&mut file)
             .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Read, error))?;
         let vote = read_json(&directory.join("vote.json"))
             .map_err(|error| storage_error(ErrorSubject::Vote, ErrorVerb::Read, error))?;
@@ -134,18 +134,25 @@ impl FileLogStorage {
             .map_err(|error| storage_error(ErrorSubject::Store, ErrorVerb::Read, error))?;
         let purged = read_json(&directory.join("purged.json"))
             .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Read, error))?;
-        // The first stored entry must directly follow the purge point. A disagreement means
-        // the file and the purge pointer describe different logs; fail closed.
+        // The purge writes the pointer durably before it rewrites the file, so a crash
+        // between the two leaves the pointer ahead of the file. The entries at or below the
+        // purge point were purged by design and are covered by the published snapshot, so
+        // they are dropped from the recovered index instead of failing the whole node. A
+        // first entry *after* the expected one is a real gap and still fails closed.
         if let Some((first, _)) = index.first_key_value() {
             let expected = purged
                 .map(|log_id: LogId<MetaNodeId>| log_id.index.saturating_add(1))
                 .unwrap_or(0);
-            if *first != expected {
+            if *first > expected {
                 return Err(storage_error(
                     ErrorSubject::Logs,
                     ErrorVerb::Read,
                     invalid_data("metadata log does not follow the purge point"),
                 ));
+            }
+            if *first < expected {
+                // `split_off` keeps everything at or after the key in its result.
+                index = index.split_off(&expected);
             }
         }
         Ok(Self {
@@ -886,6 +893,69 @@ mod tests {
             state.last_log_id,
             entries.last().map(|entry| entry.log_id),
             "the reader and the log state must agree"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_purge_pointer_ahead_of_the_file_recovers_instead_of_failing_the_node() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let mut storage = FileLogStorage::open(directory.path()).expect("open");
+        storage
+            .blocking_append((0..6).map(entry).collect::<Vec<_>>())
+            .await
+            .expect("append");
+        // A real purge persists the pointer and then rewrites the file.
+        RaftLogStorage::purge(&mut storage, log_id(2))
+            .await
+            .expect("purge");
+        drop(storage);
+        // A crash between the two steps leaves the pointer ahead of the file: the entries
+        // at or below the purge point were purged by design and are covered by the
+        // published snapshot, so the node must recover instead of refusing to start.
+        let purged_path = directory.path().join("purged.json");
+        std::fs::write(&purged_path, serde_json::to_vec(&Some(log_id(4))).unwrap())
+            .expect("purge pointer");
+        let mut reopened = FileLogStorage::open(directory.path()).expect("the log recovers");
+        let state = reopened.get_log_state().await.expect("state");
+        assert_eq!(
+            state.last_purged_log_id,
+            Some(log_id(4)),
+            "the durable purge point is authoritative"
+        );
+        assert_eq!(
+            state.last_log_id,
+            Some(log_id(5)),
+            "the entries after the purge point are kept"
+        );
+        let entries = reopened.try_get_log_entries(5..).await.expect("read");
+        assert_eq!(entries.len(), 1, "the stale entries are never served");
+        assert_eq!(entries[0].log_id, log_id(5));
+    }
+
+    #[tokio::test]
+    async fn a_missing_entry_after_the_purge_point_still_fails_closed() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let mut storage = FileLogStorage::open(directory.path()).expect("open");
+        storage
+            .blocking_append((0..6).map(entry).collect::<Vec<_>>())
+            .await
+            .expect("append");
+        RaftLogStorage::purge(&mut storage, log_id(2))
+            .await
+            .expect("purge");
+        drop(storage);
+        // The file now starts at 3. A purge pointer that claims only 0 was purged makes the
+        // first two entries disappear without a purge: that is a real gap, not a torn purge.
+        let purged_path = directory.path().join("purged.json");
+        std::fs::write(&purged_path, serde_json::to_vec(&Some(log_id(0))).unwrap())
+            .expect("purge pointer");
+        let error = match FileLogStorage::open(directory.path()) {
+            Ok(_) => panic!("a lost entry must fail closed"),
+            Err(error) => format!("{error}"),
+        };
+        assert!(
+            error.contains("does not follow the purge point"),
+            "the refusal must name the lost entry: {error}"
         );
     }
 }
