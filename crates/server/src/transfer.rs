@@ -7,7 +7,7 @@
 //! stay on disk: nothing is buffered in memory.
 use rovqet_control::rpc::{
     MAX_TRANSFER_CHUNK_BYTES, MAX_TRANSFER_FILES, Q1TransferChunkRequest, Q1TransferChunkResponse,
-    Q1TransferFile, Q1TransferFinalizeRequest, Q1TransferFinalizeResponse,
+    Q1TransferFile, Q1TransferFinalizeRequest, Q1TransferFinalizeResponse, Q1TransferMember,
     Q1TransferPrepareRequest, Q1TransferPrepareResponse, Q1TransferStatus,
     validate_transfer_file_name,
 };
@@ -27,6 +27,8 @@ pub enum TransferError {
     NotPrepared,
     /// The chunk belongs to another migration.
     MigrationMismatch,
+    /// The request belongs to another member of the same bundle.
+    MemberMismatch,
     /// The chunk refers to a file that was not declared.
     UnknownFile,
     /// The chunk lies outside the declared file.
@@ -79,6 +81,8 @@ pub enum FinalizeOutcome {
 pub struct TransferStaging {
     root: PathBuf,
     migration_id: u128,
+    /// The bundle member this inventory belongs to. A staging area never holds two members.
+    member: u8,
     files: Vec<Q1TransferFile>,
     /// Received chunks keyed by (file index, offset): the length and the digest.
     received: BTreeMap<(u32, u64), (u64, Vec<u8>)>,
@@ -88,13 +92,31 @@ pub struct TransferStaging {
 }
 
 impl TransferStaging {
-    /// Prepares (or reopens) the staging area of one migration.
+    /// The member-scoped staging directory of one inventory.
+    ///
+    /// The member is part of the path, so the source and the dependent inventory of one
+    /// migration never share a staging area even if their file lists are identical.
+    fn directory_of(root: &Path, migration_id: u128, member: u8, inventory: &[u8]) -> PathBuf {
+        let label = Q1TransferMember::from_u8(member)
+            .map(Q1TransferMember::label)
+            .unwrap_or("invalid");
+        root.join(format!(
+            "migration-{migration_id:032x}-{label}-inv-{}",
+            bytes_to_hex(inventory)
+        ))
+    }
+
+    /// Prepares (or reopens) the staging area of one migration member.
     ///
     /// A repeated prepare with the same inventory is idempotent; a prepare with a different
-    /// inventory is refused, so a migration id can never describe two inventories.
+    /// inventory or for another member is refused, so a staging area can never describe two
+    /// inventories.
     pub fn prepare(root: &Path, request: &Q1TransferPrepareRequest) -> Result<Self, TransferError> {
         if request.files.len() > MAX_TRANSFER_FILES {
             return Err(TransferError::TooLarge);
+        }
+        if Q1TransferMember::from_u8(request.member).is_none() {
+            return Err(TransferError::MemberMismatch);
         }
         for file in &request.files {
             if !validate_transfer_file_name(&file.name) {
@@ -105,40 +127,27 @@ impl TransferStaging {
         if total > MAX_STAGED_BYTES {
             return Err(TransferError::TooLarge);
         }
-        let directory = root.join(format!(
-            "migration-{:032x}-inv-{}",
+        let directory = Self::directory_of(
+            root,
             request.migration_id,
-            bytes_to_hex(&request.manifest_digest)
-        ));
+            request.member,
+            &request.manifest_digest,
+        );
         std::fs::create_dir_all(&directory)
             .map_err(|error| TransferError::Io(error.to_string()))?;
         let manifest = directory.join("staging.json");
         if manifest.exists() {
-            // The inventory of a migration id may not change.
+            // The inventory of a migration member may not change.
             let existing =
                 std::fs::read(&manifest).map_err(|error| TransferError::Io(error.to_string()))?;
             let existing: serde_json::Value = serde_json::from_slice(&existing)
                 .map_err(|error| TransferError::Io(error.to_string()))?;
-            let expected = serde_json::json!({
-                "migration_id": request.migration_id.to_string(),
-                "files": request.files.iter().map(|file| serde_json::json!({
-                    "name": file.name,
-                    "size": file.size,
-                    "digest": bytes_to_hex(&file.digest),
-                })).collect::<Vec<_>>(),
-            });
+            let expected = Self::document(request);
             if existing != expected {
                 return Err(TransferError::Conflict);
             }
         } else {
-            let document = serde_json::json!({
-                "migration_id": request.migration_id.to_string(),
-                "files": request.files.iter().map(|file| serde_json::json!({
-                    "name": file.name,
-                    "size": file.size,
-                    "digest": bytes_to_hex(&file.digest),
-                })).collect::<Vec<_>>(),
-            });
+            let document = Self::document(request);
             let bytes = serde_json::to_vec(&document)
                 .map_err(|error| TransferError::Io(error.to_string()))?;
             write_atomic(&manifest, &bytes)?;
@@ -166,6 +175,7 @@ impl TransferStaging {
         Ok(Self {
             root: directory,
             migration_id: request.migration_id,
+            member: request.member,
             files: request.files.clone(),
             received,
             written: vec![0u64; request.files.len()],
@@ -173,19 +183,29 @@ impl TransferStaging {
         })
     }
 
-    /// Reopens a staging area of a migration after a restart.
+    fn document(request: &Q1TransferPrepareRequest) -> serde_json::Value {
+        serde_json::json!({
+            "migration_id": request.migration_id.to_string(),
+            "member": request.member,
+            "files": request.files.iter().map(|file| serde_json::json!({
+                "name": file.name,
+                "size": file.size,
+                "digest": bytes_to_hex(&file.digest),
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    /// Reopens a staging area of a migration member after a restart.
     ///
     /// The declared inventory and the received chunks are read back from the staging
     /// directory, so an interrupted transfer resumes with the chunks that are durable.
     pub fn reopen(
         root: &Path,
         migration_id: u128,
+        member: u8,
         inventory_digest: &[u8],
     ) -> Result<Self, TransferError> {
-        let directory = root.join(format!(
-            "migration-{migration_id:032x}-inv-{}",
-            bytes_to_hex(inventory_digest)
-        ));
+        let directory = Self::directory_of(root, migration_id, member, inventory_digest);
         let manifest = directory.join("staging.json");
         let text = std::fs::read_to_string(&manifest)
             .map_err(|error| TransferError::Io(error.to_string()))?;
@@ -203,6 +223,7 @@ impl TransferStaging {
         }
         let request = Q1TransferPrepareRequest {
             migration_id,
+            member,
             source_node: 0,
             target_node: 0,
             tenant_id: 0,
@@ -212,7 +233,7 @@ impl TransferStaging {
             original_epoch: 0,
             next_epoch: 0,
             manifest_generation: 0,
-            manifest_digest: Vec::new(),
+            manifest_digest: inventory_digest.to_vec(),
             files,
         };
         Self::prepare(root, &request)
@@ -221,6 +242,11 @@ impl TransferStaging {
     /// The migration this staging area belongs to.
     pub fn migration_id(&self) -> u128 {
         self.migration_id
+    }
+
+    /// The bundle member this staging area holds.
+    pub fn member(&self) -> u8 {
+        self.member
     }
 
     /// The directory that holds the staged bytes.
@@ -243,6 +269,9 @@ impl TransferStaging {
     ) -> Result<ChunkOutcome, TransferError> {
         if request.migration_id != self.migration_id {
             return Err(TransferError::MigrationMismatch);
+        }
+        if request.member != self.member {
+            return Err(TransferError::MemberMismatch);
         }
         if request.data.len() > MAX_TRANSFER_CHUNK_BYTES {
             return Err(TransferError::TooLarge);
@@ -402,7 +431,7 @@ impl TransferStaging {
 /// staged bytes are limited, and a chunk never carries a path.
 pub struct TransferManager {
     root: PathBuf,
-    areas: BTreeMap<(u128, String), TransferStaging>,
+    areas: BTreeMap<(u128, u8, String), TransferStaging>,
 }
 
 impl TransferManager {
@@ -424,25 +453,35 @@ impl TransferManager {
     fn area(
         &mut self,
         migration_id: u128,
+        member: u8,
         inventory_digest: &[u8],
     ) -> Result<&mut TransferStaging, TransferError> {
-        let key = (migration_id, bytes_to_hex(inventory_digest));
+        let key = (migration_id, member, bytes_to_hex(inventory_digest));
         if !self.areas.contains_key(&key) {
-            let area = TransferStaging::reopen(&self.root, migration_id, inventory_digest)?;
+            let area = TransferStaging::reopen(&self.root, migration_id, member, inventory_digest)?;
             self.areas.insert(key.clone(), area);
         }
         Ok(self.areas.get_mut(&key).expect("the area exists"))
     }
 
-    /// Accepts a transfer preparation.
+    /// Accepts a transfer preparation of one bundle member.
     pub fn prepare(
         &mut self,
         request: &Q1TransferPrepareRequest,
     ) -> Result<Q1TransferPrepareResponse, TransferError> {
+        if Q1TransferMember::from_u8(request.member).is_none() {
+            return Err(TransferError::MemberMismatch);
+        }
         let area = TransferStaging::prepare(&self.root, request)?;
+        // The staging identity carries the member: two members of one migration never share
+        // a staging area, so their inventories cannot collide.
         let staging_id = request.migration_id;
         self.areas.insert(
-            (request.migration_id, bytes_to_hex(&request.manifest_digest)),
+            (
+                request.migration_id,
+                request.member,
+                bytes_to_hex(&request.manifest_digest),
+            ),
             area,
         );
         Ok(Q1TransferPrepareResponse {
@@ -452,12 +491,42 @@ impl TransferManager {
         })
     }
 
-    /// Accepts one transfer chunk.
+    /// Accepts one transfer chunk of one bundle member.
+    ///
+    /// A chunk of an unknown staging area is refused with a clean answer: the receiver
+    /// never accepts bytes it cannot attribute to a declared inventory of this member.
     pub fn chunk(
         &mut self,
         request: &Q1TransferChunkRequest,
     ) -> Result<Q1TransferChunkResponse, TransferError> {
-        let area = self.area(request.migration_id, &request.inventory_digest)?;
+        let key = (
+            request.migration_id,
+            request.member,
+            bytes_to_hex(&request.inventory_digest),
+        );
+        if !self.areas.contains_key(&key) {
+            match TransferStaging::reopen(
+                &self.root,
+                request.migration_id,
+                request.member,
+                &request.inventory_digest,
+            ) {
+                Ok(area) => {
+                    self.areas.insert(key.clone(), area);
+                }
+                Err(error) => {
+                    return Ok(Q1TransferChunkResponse {
+                        accepted: false,
+                        duplicate: false,
+                        error: Some(match error {
+                            TransferError::Io(_) => rovqet_control::rpc::RpcErrorCode::Internal,
+                            _ => rovqet_control::rpc::RpcErrorCode::Malformed,
+                        }),
+                    });
+                }
+            }
+        }
+        let area = self.areas.get_mut(&key).expect("the area exists");
         match area.accept_chunk(request) {
             Ok(ChunkOutcome::Stored) => Ok(Q1TransferChunkResponse {
                 accepted: true,
@@ -473,9 +542,10 @@ impl TransferManager {
                 accepted: false,
                 duplicate: false,
                 error: Some(match error {
-                    TransferError::DigestMismatch | TransferError::Conflict => {
-                        rovqet_control::rpc::RpcErrorCode::Malformed
-                    }
+                    TransferError::DigestMismatch
+                    | TransferError::Conflict
+                    | TransferError::MemberMismatch
+                    | TransferError::NotPrepared => rovqet_control::rpc::RpcErrorCode::Malformed,
                     TransferError::OutOfRange | TransferError::UnknownFile => {
                         rovqet_control::rpc::RpcErrorCode::Malformed
                     }
@@ -486,12 +556,33 @@ impl TransferManager {
         }
     }
 
-    /// Verifies the complete transferred inventory.
+    /// Verifies the complete transferred inventory of one bundle member.
     pub fn finalize(
         &mut self,
         request: &Q1TransferFinalizeRequest,
     ) -> Result<Q1TransferFinalizeResponse, TransferError> {
-        let area = self.area(request.migration_id, &request.inventory_digest)?;
+        if Q1TransferMember::from_u8(request.member).is_none() {
+            return Ok(Q1TransferFinalizeResponse {
+                status: Q1TransferStatus::Mismatch,
+                error: Some(rovqet_control::rpc::RpcErrorCode::Malformed),
+            });
+        }
+        let area = match self.area(
+            request.migration_id,
+            request.member,
+            &request.inventory_digest,
+        ) {
+            Ok(area) => area,
+            Err(error) => {
+                return Ok(Q1TransferFinalizeResponse {
+                    status: Q1TransferStatus::Mismatch,
+                    error: Some(match error {
+                        TransferError::Io(_) => rovqet_control::rpc::RpcErrorCode::Internal,
+                        _ => rovqet_control::rpc::RpcErrorCode::Malformed,
+                    }),
+                });
+            }
+        };
         match area.finalize(request) {
             Ok(FinalizeOutcome::Complete { .. }) => {
                 // Without the fence evidence the inventory is complete but the target is not
@@ -597,6 +688,7 @@ mod tests {
     fn prepare(migration_id: u128, files: Vec<(&str, u64, Vec<u8>)>) -> Q1TransferPrepareRequest {
         Q1TransferPrepareRequest {
             migration_id,
+            member: rovqet_control::rpc::Q1TransferMember::Source.as_u8(),
             source_node: 1,
             target_node: 2,
             tenant_id: 1,
@@ -606,7 +698,9 @@ mod tests {
             original_epoch: 5,
             next_epoch: 6,
             manifest_generation: 3,
-            manifest_digest: vec![1u8; 32],
+            // The inventory identity of the prepare is the identity every chunk and the
+            // finalize of that inventory refer to.
+            manifest_digest: vec![9u8; 32],
             files: files
                 .into_iter()
                 .map(|(name, size, digest)| Q1TransferFile {
@@ -628,6 +722,7 @@ mod tests {
         let digest = sha256(&data);
         Q1TransferChunkRequest {
             migration_id,
+            member: rovqet_control::rpc::Q1TransferMember::Source.as_u8(),
             inventory_digest: vec![9u8; 32],
             chunk_index: index,
             file_index,
@@ -640,6 +735,7 @@ mod tests {
     fn finalize(migration_id: u128) -> Q1TransferFinalizeRequest {
         Q1TransferFinalizeRequest {
             migration_id,
+            member: rovqet_control::rpc::Q1TransferMember::Source.as_u8(),
             inventory_digest: vec![9u8; 32],
             final_digest: vec![2u8; 32],
             last_committed_offset: 10,
@@ -811,5 +907,93 @@ mod tests {
             .accept_chunk(&chunk(1, 0, 0, 0, payload))
             .expect("chunk");
         assert_eq!(staging.finalize(&finalize(1)), Err(TransferError::Mismatch));
+    }
+
+    /// The two inventories of one bundle never share a staging identity.
+    #[test]
+    fn the_members_of_one_bundle_never_share_a_staging_area() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let payload = b"identical history bytes".to_vec();
+        let mut source = prepare(
+            7,
+            vec![("MANIFEST", payload.len() as u64, sha256(&payload))],
+        );
+        // The dependent inventory describes exactly the same files.
+        let mut dependent = source.clone();
+        dependent.member = Q1TransferMember::Dependent.as_u8();
+        let mut manager = TransferManager::new(root.path());
+        manager.prepare(&source).expect("source prepare");
+        manager.prepare(&dependent).expect("dependent prepare");
+        assert_ne!(
+            TransferStaging::directory_of(root.path(), 7, 0, &source.manifest_digest),
+            TransferStaging::directory_of(root.path(), 7, 1, &source.manifest_digest),
+            "the two members of one migration need distinct staging identities"
+        );
+        // The source chunk is accepted and the dependent chunk is stored separately.
+        let chunk_request = chunk(7, 0, 0, 0, payload.clone());
+        assert!(
+            manager.chunk(&chunk_request).expect("chunk").accepted,
+            "the source chunk is accepted"
+        );
+        let mut dependent_chunk = chunk_request.clone();
+        dependent_chunk.member = Q1TransferMember::Dependent.as_u8();
+        assert!(
+            manager.chunk(&dependent_chunk).expect("chunk").accepted,
+            "the dependent chunk is accepted in its own area"
+        );
+        // Both members finalize independently.
+        assert_eq!(
+            manager.finalize(&finalize(7)).expect("finalize").status,
+            Q1TransferStatus::ReadyForFence
+        );
+        let mut dependent_finalize = finalize(7);
+        dependent_finalize.member = Q1TransferMember::Dependent.as_u8();
+        assert_eq!(
+            manager
+                .finalize(&dependent_finalize)
+                .expect("finalize")
+                .status,
+            Q1TransferStatus::ReadyForFence
+        );
+    }
+
+    /// A chunk of the other member is refused, even with the right parent migration.
+    #[test]
+    fn a_chunk_of_the_other_bundle_member_is_refused() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let payload = b"q1 wal bytes".to_vec();
+        let request = prepare(
+            3,
+            vec![("seg-000000.wal", payload.len() as u64, sha256(&payload))],
+        );
+        let mut manager = TransferManager::new(root.path());
+        manager.prepare(&request).expect("prepare");
+        let mut wrong = chunk(3, 0, 0, 0, payload.clone());
+        wrong.member = Q1TransferMember::Dependent.as_u8();
+        let response = manager.chunk(&wrong).expect("chunk response");
+        assert!(
+            !response.accepted,
+            "a chunk of the dependent member must never enter the source staging area"
+        );
+        // The dependent member was never prepared, so its finalize is refused as well.
+        let mut dependent_finalize = finalize(3);
+        dependent_finalize.member = Q1TransferMember::Dependent.as_u8();
+        let response = manager
+            .finalize(&dependent_finalize)
+            .expect("a finalize of an unprepared member is refused cleanly");
+        assert_eq!(response.status, Q1TransferStatus::Mismatch);
+        assert!(response.error.is_some());
+        // A staging area refuses a prepare for another member of the same migration.
+        let mut staging = TransferStaging::prepare(root.path(), &request).expect("prepare");
+        assert_eq!(
+            staging
+                .accept_chunk(&{
+                    let mut chunk_request = chunk(3, 0, 0, 0, payload);
+                    chunk_request.member = Q1TransferMember::Dependent.as_u8();
+                    chunk_request
+                })
+                .unwrap_err(),
+            TransferError::MemberMismatch
+        );
     }
 }

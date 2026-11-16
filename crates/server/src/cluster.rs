@@ -536,6 +536,32 @@ pub fn forward_budget() -> rovqet_control::TimeoutBudget {
     rovqet_control::TimeoutBudget::new(5_000).expect("bounded budget")
 }
 
+/// The route options of the source of a source-only handover in this module's tests.
+#[cfg(test)]
+fn coordinator_options(directory: std::path::PathBuf) -> crate::q1::Options {
+    crate::q1::Options {
+        directory,
+        topic: "durable".into(),
+        node_id: 1,
+        partition: PartitionRef {
+            tenant_id: 1,
+            topic_id: 3,
+            partition_id: 0,
+        },
+        incarnation: 42,
+        owner_epoch: 7,
+        dedup_window: Duration::from_secs(86400),
+        max_producers: 64,
+        max_outcomes: 64,
+        initialize_new_log: false,
+        terminal_policy: rovqet_durable::TerminalPolicy::Dlq,
+        max_attempts: 3,
+        retry_initial: Duration::from_millis(10),
+        retry_max: Duration::from_millis(100),
+        dlq: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -701,8 +727,8 @@ mod transfer_tests {
     use rovqet_control::TimeoutBudget;
     use rovqet_control::rpc::{
         Q1TransferChunkRequest, Q1TransferChunkResponse, Q1TransferFile, Q1TransferFinalizeRequest,
-        Q1TransferFinalizeResponse, Q1TransferPrepareRequest, Q1TransferPrepareResponse,
-        Q1TransferStatus,
+        Q1TransferFinalizeResponse, Q1TransferMember, Q1TransferPrepareRequest,
+        Q1TransferPrepareResponse, Q1TransferStatus,
     };
 
     const MIGRATION: u128 = 0xabcd_0000_0000_0007;
@@ -799,6 +825,7 @@ mod transfer_tests {
         let digest = sha256(&payload);
         let prepare = Q1TransferPrepareRequest {
             migration_id: MIGRATION,
+            member: Q1TransferMember::Source.as_u8(),
             source_node: 1,
             target_node: 2,
             tenant_id: 1,
@@ -832,6 +859,7 @@ mod transfer_tests {
 
         let chunk = Q1TransferChunkRequest {
             migration_id: MIGRATION,
+            member: Q1TransferMember::Source.as_u8(),
             inventory_digest: vec![8u8; 32],
             chunk_index: 0,
             file_index: 0,
@@ -894,6 +922,7 @@ mod transfer_tests {
         // Without the fence evidence the target only confirms the inventory.
         let finalize = Q1TransferFinalizeRequest {
             migration_id: MIGRATION,
+            member: Q1TransferMember::Source.as_u8(),
             inventory_digest: vec![8u8; 32],
             final_digest: digest.clone(),
             last_committed_offset: 10,
@@ -1225,7 +1254,11 @@ mod migration_tests {
         );
         let route_slot = std::sync::Arc::new(crate::q1::RouteSlot::new(Some(route.clone())));
         tokio::spawn(crate::migration::run_coordinator(
-            driver, route_slot, 1, None,
+            driver,
+            route_slot,
+            coordinator_options(source_dir.clone()),
+            1,
+            None,
         ));
 
         // The migration completes: the committed placement moves to the target.
@@ -1571,6 +1604,7 @@ mod successor_tests {
         tokio::spawn(crate::migration::run_coordinator(
             driver,
             coordinator_slot,
+            coordinator_options(source_directory.clone()),
             1,
             None,
         ));

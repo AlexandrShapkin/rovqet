@@ -85,12 +85,80 @@ impl std::fmt::Display for PromotionError {
 
 impl std::error::Error for PromotionError {}
 
-/// The staging area of one migration.
-pub fn staging_area(staging_root: &Path, migration_id: u128, inventory_digest: &[u8]) -> PathBuf {
+/// The staging area of one member of one migration.
+///
+/// The member is part of the path: the source and the dependent inventory of one migration
+/// have distinct staging identities even when their file lists are identical.
+pub fn staging_area(
+    staging_root: &Path,
+    migration_id: u128,
+    member: rovqet_control::rpc::Q1TransferMember,
+    inventory_digest: &[u8],
+) -> PathBuf {
     staging_root.join(format!(
-        "migration-{migration_id:032x}-inv-{}",
+        "migration-{migration_id:032x}-{}-inv-{}",
+        member.label(),
         bytes_to_hex(inventory_digest)
     ))
+}
+
+/// The name of the durable readiness record of one coordinated bundle.
+pub const BUNDLE_READY_RECORD: &str = "BUNDLE_READY.json";
+
+/// The durable readiness state of a coordinated bundle promotion.
+///
+/// The two promotions happen in two independent directories and are never one atomic
+/// filesystem operation. This record states which of them completed, so a crash between the
+/// two is always recoverable and the source is never published before the dependent history
+/// is in place.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BundleReadiness {
+    pub migration_id: u128,
+    /// The committed metadata revision that authorized the bundle activation.
+    pub activation_revision: u64,
+    /// The ownership epoch both placements received.
+    pub target_epoch: u64,
+    /// The promoted dependent inventory.
+    pub dependent_inventory_digest: String,
+    /// The promoted dependent incarnation.
+    pub dependent_incarnation: u128,
+    /// The dependent partition.
+    pub dependent_partition: [u64; 3],
+    /// The dependent promotion completed.
+    pub dependent_promoted: bool,
+    /// The promoted source inventory.
+    pub source_inventory_digest: String,
+    /// The promoted source incarnation.
+    pub source_incarnation: u128,
+    /// The source partition.
+    pub source_partition: [u64; 3],
+    /// The source promotion completed.
+    pub source_promoted: bool,
+}
+
+impl BundleReadiness {
+    /// The file that holds the readiness record of one migration.
+    pub fn path(staging_root: &Path, migration_id: u128) -> PathBuf {
+        staging_root.join(format!(
+            "migration-{migration_id:032x}-{BUNDLE_READY_RECORD}"
+        ))
+    }
+
+    /// Reads the readiness record of one migration.
+    pub fn load(staging_root: &Path, migration_id: u128) -> Result<Option<Self>, PromotionError> {
+        match std::fs::read(Self::path(staging_root, migration_id)) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map(Some)
+                .map_err(|error| PromotionError::Journal(error.to_string())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(PromotionError::Io(error.to_string())),
+        }
+    }
+
+    /// Writes the readiness record durably.
+    pub fn store(&self, staging_root: &Path) -> Result<(), PromotionError> {
+        write_json_durable(&Self::path(staging_root, self.migration_id), self)
+    }
 }
 
 /// Reads the promotion record of a partition directory.

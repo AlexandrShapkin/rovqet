@@ -211,6 +211,42 @@ pub const MAX_TRANSFER_FILES: usize = 64;
 /// Largest accepted length of a transfer file name.
 pub const MAX_TRANSFER_FILE_NAME: usize = 128;
 
+/// The member of a bundle that one transferred inventory belongs to.
+///
+/// A coordinated migration transfers two independent Q1 histories, the source partition and
+/// its dependent partition (the local DLQ), under one parent migration identity. The member
+/// is part of every transfer request, so the staging area of the source can never receive a
+/// chunk of the dependent inventory and the two histories keep distinct storage identities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Q1TransferMember {
+    /// The source partition of the bundle.
+    Source = 0,
+    /// The dependent partition of the bundle, such as the local DLQ.
+    Dependent = 1,
+}
+
+impl Q1TransferMember {
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    pub fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Source),
+            1 => Some(Self::Dependent),
+            _ => None,
+        }
+    }
+
+    /// The member as it is written in a staging directory name.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Dependent => "dependent",
+        }
+    }
+}
+
 /// Rejects an absolute path, a traversal, a separator or a hidden name.
 ///
 /// The transfer never accepts a path from the network: only a plain file name inside the
@@ -286,6 +322,8 @@ impl Q1TransferFile {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Q1TransferPrepareRequest {
     pub migration_id: u128,
+    /// The bundle member this inventory belongs to (see [`Q1TransferMember`]).
+    pub member: u8,
     pub source_node: u64,
     pub target_node: u64,
     pub tenant_id: u64,
@@ -303,6 +341,7 @@ impl Q1TransferPrepareRequest {
     pub fn encode(&self) -> Vec<u8> {
         let mut writer = BodyWriter::new();
         writer.u128(self.migration_id);
+        writer.u8(self.member);
         writer.u64(self.source_node);
         writer.u64(self.target_node);
         writer.u64(self.tenant_id);
@@ -323,6 +362,10 @@ impl Q1TransferPrepareRequest {
     pub fn decode(body: &[u8]) -> Result<Self, BodyError> {
         let mut reader = BodyReader::new(body);
         let migration_id = reader.u128()?;
+        let member = reader.u8()?;
+        if Q1TransferMember::from_u8(member).is_none() {
+            return Err(BodyError::Malformed("transfer member"));
+        }
         let source_node = reader.u64()?;
         let target_node = reader.u64()?;
         let tenant_id = reader.u64()?;
@@ -346,6 +389,7 @@ impl Q1TransferPrepareRequest {
         }
         Ok(Self {
             migration_id,
+            member,
             source_node,
             target_node,
             tenant_id,
@@ -405,6 +449,8 @@ impl Q1TransferPrepareResponse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Q1TransferChunkRequest {
     pub migration_id: u128,
+    /// The bundle member this chunk belongs to. A chunk of another member is refused.
+    pub member: u8,
     /// The identity of the inventory this chunk belongs to. A migration may transfer more
     /// than one inventory: the final one contains the history after the fence.
     pub inventory_digest: Vec<u8>,
@@ -421,6 +467,7 @@ impl Q1TransferChunkRequest {
     pub fn encode(&self) -> Vec<u8> {
         let mut writer = BodyWriter::new();
         writer.u128(self.migration_id);
+        writer.u8(self.member);
         writer.bytes(&self.inventory_digest);
         writer.u64(self.chunk_index);
         writer.u32(self.file_index);
@@ -433,6 +480,10 @@ impl Q1TransferChunkRequest {
     pub fn decode(body: &[u8]) -> Result<Self, BodyError> {
         let mut reader = BodyReader::new(body);
         let migration_id = reader.u128()?;
+        let member = reader.u8()?;
+        if Q1TransferMember::from_u8(member).is_none() {
+            return Err(BodyError::Malformed("transfer member"));
+        }
         let inventory_digest = reader.bytes()?.to_vec();
         let chunk_index = reader.u64()?;
         let file_index = reader.u32()?;
@@ -447,6 +498,7 @@ impl Q1TransferChunkRequest {
         }
         Ok(Self {
             migration_id,
+            member,
             inventory_digest,
             chunk_index,
             file_index,
@@ -505,6 +557,8 @@ impl Q1TransferChunkResponse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Q1TransferFinalizeRequest {
     pub migration_id: u128,
+    /// The bundle member whose inventory is finalized.
+    pub member: u8,
     /// The identity of the inventory that is finalized.
     pub inventory_digest: Vec<u8>,
     /// Digest over the complete transferred inventory.
@@ -524,6 +578,7 @@ impl Q1TransferFinalizeRequest {
     pub fn encode(&self) -> Vec<u8> {
         let mut writer = BodyWriter::new();
         writer.u128(self.migration_id);
+        writer.u8(self.member);
         writer.bytes(&self.inventory_digest);
         writer.bytes(&self.final_digest);
         writer.u64(self.last_committed_offset);
@@ -541,6 +596,10 @@ impl Q1TransferFinalizeRequest {
     pub fn decode(body: &[u8]) -> Result<Self, BodyError> {
         let mut reader = BodyReader::new(body);
         let migration_id = reader.u128()?;
+        let member = reader.u8()?;
+        if Q1TransferMember::from_u8(member).is_none() {
+            return Err(BodyError::Malformed("transfer member"));
+        }
         let inventory_digest = reader.bytes()?.to_vec();
         let final_digest = reader.bytes()?.to_vec();
         let last_committed_offset = reader.u64()?;
@@ -560,6 +619,7 @@ impl Q1TransferFinalizeRequest {
         }
         Ok(Self {
             migration_id,
+            member,
             inventory_digest,
             final_digest,
             last_committed_offset,
@@ -1044,6 +1104,7 @@ mod tests {
     fn transfer_prepare_bodies_round_trip() {
         let request = Q1TransferPrepareRequest {
             migration_id: 0xfeed_0000_0000_0001,
+            member: Q1TransferMember::Dependent.as_u8(),
             source_node: 1,
             target_node: 2,
             tenant_id: 1,
@@ -1087,6 +1148,7 @@ mod tests {
     fn transfer_chunk_bodies_round_trip_and_bound_the_payload() {
         let request = Q1TransferChunkRequest {
             migration_id: 5,
+            member: Q1TransferMember::Source.as_u8(),
             inventory_digest: vec![7u8; 32],
             chunk_index: 3,
             file_index: 0,
@@ -1099,6 +1161,10 @@ mod tests {
             Q1TransferChunkRequest::decode(&encoded).expect("decode"),
             request
         );
+        // An unknown bundle member is refused by the decoder.
+        let mut unknown_member = request.clone();
+        unknown_member.member = 9;
+        assert!(Q1TransferChunkRequest::decode(&unknown_member.encode()).is_err());
         let oversized = Q1TransferChunkRequest {
             data: vec![0u8; MAX_TRANSFER_CHUNK_BYTES + 1],
             ..request
@@ -1122,6 +1188,7 @@ mod tests {
     fn transfer_finalize_bodies_round_trip_with_and_without_a_fence() {
         let without_fence = Q1TransferFinalizeRequest {
             migration_id: 5,
+            member: Q1TransferMember::Source.as_u8(),
             final_digest: vec![3u8; 32],
             inventory_digest: vec![6u8; 32],
             last_committed_offset: 42,

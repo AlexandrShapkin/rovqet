@@ -9,11 +9,13 @@ use rovqet_control::TimeoutBudget;
 use rovqet_control::ids::NodeId;
 use rovqet_control::rpc::{
     Q1TransferChunkRequest, Q1TransferChunkResponse, Q1TransferFile, Q1TransferFinalizeRequest,
-    Q1TransferFinalizeResponse, Q1TransferPrepareRequest, Q1TransferPrepareResponse,
-    Q1TransferStatus, RpcErrorCode, RpcKind,
+    Q1TransferFinalizeResponse, Q1TransferMember, Q1TransferPrepareRequest,
+    Q1TransferPrepareResponse, Q1TransferStatus, RpcErrorCode, RpcKind,
 };
 use rovqet_control::transport::PeerTransport;
+use rovqet_core::PartitionRef;
 use rovqet_metadata_raft::MetadataNode;
+use rovqet_metadata_raft::sm::{MigrationState, PlacementState};
 use rovqet_metadata_raft::types::{FenceProof, MetadataCommand, MigrationStage};
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -117,20 +119,24 @@ impl MigrationDriver {
         &self.directory
     }
 
-    /// Transfers the committed history of this partition to the target.
+    /// Transfers one inventory of one bundle member to the target.
     ///
-    /// The inventory is declared first, then every file is sent in bounded chunks. A chunk
-    /// that was already received is accepted idempotently by the target.
-    pub async fn transfer_history(
+    /// The member is part of every request, so the two inventories of a bundle can never
+    /// share a staging area on the receiver even when they describe identical files.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn transfer_member(
         &self,
         target: NodeId,
         migration_id: u128,
+        member: Q1TransferMember,
+        directory: &Path,
+        partition: rovqet_core::PartitionRef,
         incarnation: u128,
         original_epoch: u64,
         next_epoch: u64,
         manifest_generation: u64,
     ) -> Result<(Vec<InventoryFile>, Vec<u8>), MigrationError> {
-        let files = partition_inventory(&self.directory)?;
+        let files = partition_inventory(directory)?;
         let declared: Vec<Q1TransferFile> = files
             .iter()
             .map(|file| Q1TransferFile {
@@ -142,11 +148,12 @@ impl MigrationDriver {
         let inventory = crate::transfer::inventory_digest(&declared);
         let prepare = Q1TransferPrepareRequest {
             migration_id,
+            member: member.as_u8(),
             source_node: self.node,
             target_node: target.get(),
-            tenant_id: 0,
-            topic_id: 0,
-            partition_id: 0,
+            tenant_id: partition.tenant_id,
+            topic_id: partition.topic_id,
+            partition_id: partition.partition_id,
             incarnation,
             original_epoch,
             next_epoch,
@@ -175,7 +182,7 @@ impl MigrationDriver {
         }
 
         for (index, file) in files.iter().enumerate() {
-            let bytes = std::fs::read(self.directory.join(&file.name))
+            let bytes = std::fs::read(directory.join(&file.name))
                 .map_err(|error| MigrationError::Io(error.to_string()))?;
             let mut offset = 0usize;
             let mut chunk_index = 0u64;
@@ -184,6 +191,7 @@ impl MigrationDriver {
                 let data = bytes[offset..end].to_vec();
                 let chunk = Q1TransferChunkRequest {
                     migration_id,
+                    member: member.as_u8(),
                     inventory_digest: inventory.clone(),
                     chunk_index,
                     file_index: index as u32,
@@ -220,11 +228,13 @@ impl MigrationDriver {
         Ok((files, inventory))
     }
 
-    /// Asks the target to verify the transferred inventory.
+    /// Asks the target to verify the transferred inventory of one bundle member.
+    #[allow(clippy::too_many_arguments)]
     pub async fn finalize(
         &self,
         target: NodeId,
         migration_id: u128,
+        member: Q1TransferMember,
         inventory_digest: &[u8],
         final_digest: Vec<u8>,
         last_committed_offset: u64,
@@ -235,6 +245,7 @@ impl MigrationDriver {
     ) -> Result<Q1TransferStatus, MigrationError> {
         let request = Q1TransferFinalizeRequest {
             migration_id,
+            member: member.as_u8(),
             inventory_digest: inventory_digest.to_vec(),
             final_digest,
             last_committed_offset,
@@ -320,6 +331,31 @@ pub fn report(event: &str, record: &rovqet_metadata_raft::sm::MigrationState, re
             "manifest_generation": proof.manifest_generation,
         })
     });
+    let dependencies: Vec<serde_json::Value> = record
+        .dependent_evidence
+        .iter()
+        .map(|evidence| {
+            serde_json::json!({
+                "tenant_id": evidence.tenant_id,
+                "topic_id": evidence.topic_id,
+                "partition_id": evidence.partition_id,
+                "incarnation": evidence.incarnation.to_string(),
+                "original_epoch": evidence.original_epoch,
+                "next_epoch": evidence.next_epoch,
+                "transfer_watermark": evidence.transfer_watermark,
+                "manifest_id": evidence.manifest_id,
+                "fence": evidence.fence_proof.as_ref().map(|proof| serde_json::json!({
+                    "migration_id": proof.migration_id.to_string(),
+                    "old_owner": proof.old_owner,
+                    "old_epoch": proof.old_epoch,
+                    "fence_offset": proof.fence_offset,
+                    "fence_digest": proof.fence_digest,
+                    "manifest_generation": proof.manifest_generation,
+                })),
+                "ready": evidence.ready,
+            })
+        })
+        .collect();
     eprintln!(
         "MIGRATION {} {}",
         event,
@@ -335,6 +371,16 @@ pub fn report(event: &str, record: &rovqet_metadata_raft::sm::MigrationState, re
             "manifest_id": record.manifest_id,
             "target_ready": record.target_ready,
             "fence": fence,
+            "dependent_partitions": record.dependent_partitions.iter().map(|dependency| {
+                serde_json::json!({
+                    "tenant_id": dependency.tenant_id,
+                    "topic_id": dependency.topic_id,
+                    "partition_id": dependency.partition_id,
+                    "durable_class": dependency.durable_class,
+                    "incarnation": dependency.incarnation.to_string(),
+                })
+            }).collect::<Vec<_>>(),
+            "dependencies": dependencies,
             "metadata_revision": revision,
         })
     );
@@ -368,6 +414,286 @@ pub fn next_stage(stage: MigrationStage) -> Option<MigrationStage> {
     stage.next()
 }
 
+/// One verified member of a coordinated bundle.
+///
+/// A member carries the identity of the durable history it moves: the partition, the
+/// incarnation that must survive unchanged, the committed epoch it holds today, the epoch
+/// the successor owns after the activation, and the local directory of the history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BundleMember {
+    pub member: Q1TransferMember,
+    pub partition: PartitionRef,
+    pub incarnation: u128,
+    pub original_epoch: u64,
+    pub next_epoch: u64,
+    pub directory: std::path::PathBuf,
+}
+
+/// The two members of a coordinated handover.
+///
+/// A source-only migration has no dependent member: the source alone moves. Nothing else in
+/// the coordinator changes shape, so the source-only path keeps its committed semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bundle {
+    pub source: BundleMember,
+    pub dependent: Option<BundleMember>,
+}
+
+/// Resolves the committed dependency of a migration against the verified local configuration.
+///
+/// The resolved identity is never invented locally: the partition and incarnation come from
+/// the committed dependency record of the metadata group, the epochs come from the committed
+/// placements, and the local configuration must agree with both. A bundle whose dependency
+/// is not configured here, is not the committed dependency, or holds another incarnation or
+/// epoch is refused before a single byte moves.
+pub fn resolve_bundle(
+    record: &MigrationState,
+    placements: &[PlacementState],
+    route: &crate::q1::Route,
+    source_directory: &Path,
+) -> Result<Bundle, MigrationError> {
+    let source_placement = placement_of(
+        placements,
+        record.tenant_id,
+        record.topic_id,
+        record.partition_id,
+    )
+    .ok_or_else(|| {
+        MigrationError::Metadata("the source partition has no committed placement".into())
+    })?;
+    if source_placement.owner != record.source_node {
+        return Err(MigrationError::Metadata(
+            "the committed placement of the source is not this node".into(),
+        ));
+    }
+    if source_placement.ownership_epoch != record.original_epoch {
+        return Err(MigrationError::Metadata(
+            "the committed source epoch is not the epoch the migration froze".into(),
+        ));
+    }
+    let source = BundleMember {
+        member: Q1TransferMember::Source,
+        partition: PartitionRef {
+            tenant_id: record.tenant_id,
+            topic_id: record.topic_id,
+            partition_id: record.partition_id,
+        },
+        incarnation: record.source_incarnation,
+        original_epoch: record.original_epoch,
+        next_epoch: record.next_epoch,
+        directory: source_directory.to_path_buf(),
+    };
+    if record.dependent_partitions.is_empty() {
+        return Ok(Bundle {
+            source,
+            dependent: None,
+        });
+    }
+    let [dependency] = record.dependent_partitions.as_slice() else {
+        return Err(MigrationError::Metadata(
+            "a coordinated handover moves exactly one dependent partition".into(),
+        ));
+    };
+    let identity = route.dlq_identity().ok_or_else(|| {
+        MigrationError::Metadata(
+            "the committed dependency of the migration is not configured on this node".into(),
+        )
+    })?;
+    let expected = PartitionRef {
+        tenant_id: dependency.tenant_id,
+        topic_id: dependency.topic_id,
+        partition_id: dependency.partition_id,
+    };
+    if identity.partition != expected {
+        return Err(MigrationError::Metadata(format!(
+            "the configured dependent partition {:?} is not the committed dependency {expected:?}",
+            identity.partition
+        )));
+    }
+    if identity.incarnation != dependency.incarnation {
+        return Err(MigrationError::Metadata(format!(
+            "the configured dependent incarnation {} is not the committed incarnation {}",
+            identity.incarnation, dependency.incarnation
+        )));
+    }
+    if dependency.durable_class != 1 {
+        return Err(MigrationError::Metadata(
+            "the dependent partition of a Q1 bundle must be locally durable".into(),
+        ));
+    }
+    let dependent_placement = placement_of(
+        placements,
+        dependency.tenant_id,
+        dependency.topic_id,
+        dependency.partition_id,
+    )
+    .ok_or_else(|| {
+        MigrationError::Metadata(
+            "the dependent partition has no committed placement of its own".into(),
+        )
+    })?;
+    if dependent_placement.owner != record.source_node {
+        return Err(MigrationError::Metadata(
+            "the committed placement of the dependent partition is not this node".into(),
+        ));
+    }
+    if dependent_placement.ownership_epoch != identity.owner_epoch {
+        return Err(MigrationError::Metadata(format!(
+            "the configured dependent epoch {} is not the committed epoch {}",
+            identity.owner_epoch, dependent_placement.ownership_epoch
+        )));
+    }
+    let directory = route
+        .dlq_directory()
+        .map(std::path::Path::to_path_buf)
+        .ok_or_else(|| {
+            MigrationError::Metadata("the dependent partition has no local directory".into())
+        })?;
+    Ok(Bundle {
+        source,
+        dependent: Some(BundleMember {
+            member: Q1TransferMember::Dependent,
+            partition: expected,
+            incarnation: dependency.incarnation,
+            original_epoch: dependent_placement.ownership_epoch,
+            // The dependent partition moves to the next epoch of its own committed
+            // placement: never an epoch invented from the source side.
+            next_epoch: dependent_placement.ownership_epoch + 1,
+            directory,
+        }),
+    })
+}
+
+/// The committed placement of one partition.
+fn placement_of(
+    placements: &[PlacementState],
+    tenant_id: u64,
+    topic_id: u64,
+    partition_id: u32,
+) -> Option<&PlacementState> {
+    placements.iter().find(|placement| {
+        placement.tenant_id == tenant_id
+            && placement.topic_id == topic_id
+            && placement.partition_id == partition_id
+    })
+}
+
+/// Converts the durable fence proof of the old owner into committed evidence.
+fn committed_fence(proof: &rovqet_durable::FenceProof) -> FenceProof {
+    FenceProof {
+        migration_id: proof.migration_id,
+        old_owner: proof.old_owner,
+        old_epoch: proof.old_epoch,
+        fence_offset: proof.fence_offset,
+        fence_digest: proof.fence_digest.clone(),
+        manifest_generation: proof.manifest_generation,
+    }
+}
+
+/// Verifies that a returned fence proof really is the revocation of this handover.
+///
+/// A proof is only evidence when it is bound to the migration, to the old owner and to the
+/// epoch that was revoked. A proof of another migration, node or epoch is never accepted.
+fn verify_fence(
+    proof: &rovqet_durable::FenceProof,
+    migration_id: u128,
+    node: u64,
+    old_epoch: u64,
+) -> Result<(), MigrationError> {
+    if proof.migration_id != migration_id {
+        return Err(MigrationError::Metadata(
+            "the fence proof belongs to another migration".into(),
+        ));
+    }
+    if proof.old_owner != node {
+        return Err(MigrationError::Metadata(
+            "the fence proof was produced by another node".into(),
+        ));
+    }
+    if proof.old_epoch != old_epoch {
+        return Err(MigrationError::Metadata(
+            "the fence proof revoked another ownership epoch".into(),
+        ));
+    }
+    if proof.fence_digest.is_empty() {
+        return Err(MigrationError::Metadata(
+            "the fence proof carries no durable digest".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// One verified transferred inventory.
+#[derive(Debug, Clone)]
+struct TransferredInventory {
+    watermark: u64,
+    manifest_id: String,
+}
+
+/// Transfers one member of a bundle and lets the target verify the complete inventory.
+async fn transfer_member(
+    driver: &MigrationDriver,
+    target: NodeId,
+    record: &MigrationState,
+    member: &BundleMember,
+    manifest_generation: u64,
+    fence: Option<&FenceProof>,
+    watermark: u64,
+) -> Result<TransferredInventory, MigrationError> {
+    let (files, inventory) = driver
+        .transfer_member(
+            target,
+            record.migration_id,
+            member.member,
+            &member.directory,
+            member.partition,
+            member.incarnation,
+            member.original_epoch,
+            member.next_epoch,
+            manifest_generation,
+        )
+        .await?;
+    let digest = crate::transfer::inventory_digest(
+        &files
+            .iter()
+            .map(|file| Q1TransferFile {
+                name: file.name.clone(),
+                size: file.size,
+                digest: file.digest.clone(),
+            })
+            .collect::<Vec<_>>(),
+    );
+    let status = driver
+        .finalize(
+            target,
+            record.migration_id,
+            member.member,
+            &inventory,
+            digest,
+            watermark,
+            watermark,
+            manifest_generation,
+            fence,
+            member.original_epoch,
+        )
+        .await?;
+    let expected = if fence.is_some() {
+        Q1TransferStatus::ReadyForActivation
+    } else {
+        Q1TransferStatus::ReadyForFence
+    };
+    if status != expected {
+        return Err(MigrationError::Metadata(format!(
+            "the target did not verify the {:?} inventory: {status:?}",
+            member.member
+        )));
+    }
+    Ok(TransferredInventory {
+        watermark,
+        manifest_id: crate::transfer::bytes_to_hex(&inventory),
+    })
+}
+
 /// The stable identity of a migration.
 ///
 /// The identity is derived from the partition and the two nodes, so a restart of the
@@ -399,6 +725,7 @@ pub fn migration_id(
 pub async fn run_coordinator(
     driver: MigrationDriver,
     route_slot: std::sync::Arc<crate::q1::RouteSlot>,
+    options: crate::q1::Options,
     node: u64,
     target_request: Option<OperatorRequest>,
 ) {
@@ -480,6 +807,70 @@ pub async fn run_coordinator(
                         return;
                     }
                     last_request = Some(now);
+                    // A configured DLQ that the terminal policy actually uses is a dependent
+                    // partition of the bundle. It needs a committed placement of its own
+                    // before the migration can record its identity.
+                    let dependent = match &options.dlq {
+                        Some(dlq)
+                            if options.terminal_policy == rovqet_durable::TerminalPolicy::Dlq =>
+                        {
+                            let committed = placement_of(
+                                &state.placements,
+                                dlq.partition.tenant_id,
+                                dlq.partition.topic_id,
+                                dlq.partition.partition_id,
+                            );
+                            match committed {
+                                Some(placement)
+                                    if placement.owner == node
+                                        && placement.ownership_epoch == dlq.owner_epoch => {}
+                                Some(placement) => {
+                                    eprintln!(
+                                        "the committed DLQ placement is owner={} epoch={}, \
+                                         the configured dependency is owner={} epoch={}; \
+                                         the handover stays blocked",
+                                        placement.owner,
+                                        placement.ownership_epoch,
+                                        node,
+                                        dlq.owner_epoch
+                                    );
+                                    return;
+                                }
+                                None => {
+                                    // The placement of the dependency is committed exactly
+                                    // like the placement of the source: it is authoritative
+                                    // metadata, never a local assumption.
+                                    if driver
+                                        .commit(
+                                            MetadataCommand::SetPlacement {
+                                                tenant_id: dlq.partition.tenant_id,
+                                                topic_id: dlq.partition.topic_id,
+                                                partition_id: dlq.partition.partition_id,
+                                                owner: node,
+                                                ownership_epoch: dlq.owner_epoch,
+                                                lease_valid_for_ms: 600_000,
+                                            },
+                                            Duration::from_secs(30),
+                                        )
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                    last_request = None;
+                                    return;
+                                }
+                            }
+                            Some(rovqet_metadata_raft::types::DependentPartition {
+                                tenant_id: dlq.partition.tenant_id,
+                                topic_id: dlq.partition.topic_id,
+                                partition_id: dlq.partition.partition_id,
+                                durable_class: 1,
+                                incarnation: dlq.incarnation,
+                            })
+                        }
+                        _ => None,
+                    };
                     // The handover starts when the operator asks for it locally: the source
                     // first serves the partition with its committed authority, and only then
                     // begins the transfer.
@@ -518,7 +909,7 @@ pub async fn run_coordinator(
                                     .as_ref()
                                     .map(|placement| placement.ownership_epoch + 1)
                                     .unwrap_or(0),
-                                dependent_partitions: Vec::new(),
+                                dependent_partitions: dependent.into_iter().collect(),
                             },
                             Duration::from_secs(30),
                         )
@@ -536,189 +927,23 @@ pub async fn run_coordinator(
             };
             match record.stage {
                 MigrationStage::Prepare => {
-                    // Transfer the committed history and let the target verify it.
-                    let transferred = match driver
-                        .transfer_history(
-                            target,
-                            record.migration_id,
-                            record.source_incarnation,
-                            record.original_epoch,
-                            record.next_epoch,
-                            record.transfer_watermark.unwrap_or_default(),
-                        )
-                        .await
-                    {
-                        Ok(value) => value,
+                    match prepare_stage(&driver, &route, &state.placements, &record, target).await {
+                        Ok(()) => {}
                         Err(error) => {
-                            eprintln!("metadata migration transfer failed: {error}");
+                            eprintln!("metadata migration preparation failed: {error}");
                             return;
                         }
-                    };
-                    let (files, inventory) = transferred;
-                    let digest = crate::transfer::inventory_digest(
-                        &files
-                            .iter()
-                            .map(|file| Q1TransferFile {
-                                name: file.name.clone(),
-                                size: file.size,
-                                digest: file.digest.clone(),
-                            })
-                            .collect::<Vec<_>>(),
-                    );
-                    let watermark = route.committed_count();
-                    let status = match driver
-                        .finalize(
-                            target,
-                            record.migration_id,
-                            &inventory,
-                            digest,
-                            watermark,
-                            watermark,
-                            0,
-                            None,
-                            record.original_epoch,
-                        )
-                        .await
-                    {
-                        Ok(status) => status,
-                        Err(error) => {
-                            eprintln!("metadata migration finalize failed: {error}");
-                            return;
-                        }
-                    };
-                    if status != Q1TransferStatus::ReadyForFence {
-                        return;
-                    }
-                    let command = MetadataCommand::AdvanceMigration {
-                        migration_id: record.migration_id,
-                        stage: MigrationStage::CatchUp,
-                        transfer_watermark: Some(watermark),
-                        manifest_id: Some(crate::transfer::bytes_to_hex(&inventory)),
-                        fence_proof: None,
-                        target_ready: false,
-                        dependencies: Vec::new(),
-                    };
-                    if let Err(error) = driver.commit(command, Duration::from_secs(30)).await {
-                        eprintln!("metadata migration catch up was not committed: {error}");
-                    } else if let Some(updated) =
-                        raft.applied_state().migrations.get(&record.migration_id)
-                    {
-                        report("committed", updated, raft.applied_state().revision);
                     }
                 }
                 MigrationStage::CatchUp => {
-                    // The old owner revokes its authority durably. Only then may the
-                    // successor be activated.
-                    crate::barrier::barrier("before_fence");
-                    let proof = match route
-                        .fence_old_owner(
-                            record.migration_id,
-                            record.original_epoch,
-                            record.next_epoch,
-                        )
+                    match catch_up_stage(&driver, &route, &state.placements, &record, target, node)
                         .await
                     {
-                        Ok(proof) => proof,
+                        Ok(()) => {}
                         Err(error) => {
-                            eprintln!("metadata migration fence failed: {error:?}");
+                            eprintln!("metadata migration handover failed: {error}");
                             return;
                         }
-                    };
-                    let proof = rovqet_metadata_raft::types::FenceProof {
-                        migration_id: proof.migration_id,
-                        old_owner: proof.old_owner,
-                        old_epoch: proof.old_epoch,
-                        fence_offset: proof.fence_offset,
-                        fence_digest: proof.fence_digest.clone(),
-                        manifest_generation: proof.manifest_generation,
-                    };
-                    let fence_command = MetadataCommand::AdvanceMigration {
-                        migration_id: record.migration_id,
-                        stage: MigrationStage::FenceOld,
-                        transfer_watermark: record.transfer_watermark,
-                        manifest_id: record.manifest_id.clone(),
-                        fence_proof: Some(proof.clone()),
-                        target_ready: false,
-                        dependencies: Vec::new(),
-                    };
-                    crate::barrier::barrier("after_fence");
-                    if let Err(error) = driver.commit(fence_command, Duration::from_secs(30)).await
-                    {
-                        eprintln!("metadata migration fence was not committed: {error}");
-                    } else if let Some(updated) =
-                        raft.applied_state().migrations.get(&record.migration_id)
-                    {
-                        report("committed", updated, raft.applied_state().revision);
-                    }
-                    // The log is final now: transfer the remaining history and verify it.
-                    let transferred = match driver
-                        .transfer_history(
-                            target,
-                            record.migration_id,
-                            record.source_incarnation,
-                            record.original_epoch,
-                            record.next_epoch,
-                            proof.manifest_generation,
-                        )
-                        .await
-                    {
-                        Ok(value) => value,
-                        Err(error) => {
-                            eprintln!("metadata migration delta transfer failed: {error}");
-                            return;
-                        }
-                    };
-                    let (files, inventory) = transferred;
-                    let digest = crate::transfer::inventory_digest(
-                        &files
-                            .iter()
-                            .map(|file| Q1TransferFile {
-                                name: file.name.clone(),
-                                size: file.size,
-                                digest: file.digest.clone(),
-                            })
-                            .collect::<Vec<_>>(),
-                    );
-                    let watermark = route.committed_count();
-                    let status = match driver
-                        .finalize(
-                            target,
-                            record.migration_id,
-                            &inventory,
-                            digest,
-                            watermark,
-                            watermark,
-                            proof.manifest_generation,
-                            Some(&proof),
-                            record.original_epoch,
-                        )
-                        .await
-                    {
-                        Ok(status) => status,
-                        Err(error) => {
-                            eprintln!("metadata migration final finalize failed: {error}");
-                            return;
-                        }
-                    };
-                    if status != Q1TransferStatus::ReadyForActivation {
-                        return;
-                    }
-                    let activation = MetadataCommand::AdvanceMigration {
-                        migration_id: record.migration_id,
-                        stage: MigrationStage::ActivateNew,
-                        transfer_watermark: Some(watermark),
-                        manifest_id: Some(crate::transfer::bytes_to_hex(&inventory)),
-                        fence_proof: None,
-                        target_ready: true,
-                        dependencies: Vec::new(),
-                    };
-                    crate::barrier::barrier("before_activate_commit");
-                    if let Err(error) = driver.commit(activation, Duration::from_secs(30)).await {
-                        eprintln!("metadata migration activation was not committed: {error}");
-                    } else if let Some(updated) =
-                        raft.applied_state().migrations.get(&record.migration_id)
-                    {
-                        report("committed", updated, raft.applied_state().revision);
                     }
                 }
                 MigrationStage::FenceOld
@@ -739,6 +964,375 @@ pub async fn run_coordinator(
             _ = tokio::time::sleep(Duration::from_millis(200)) => {}
         }
     }
+}
+
+/// Reports one bundle member on the diagnostic stream.
+fn report_member(
+    event: &str,
+    migration_id: u128,
+    member: &BundleMember,
+    fields: serde_json::Value,
+) {
+    let mut object = serde_json::json!({
+        "migration_id": migration_id.to_string(),
+        "member": member.member.label(),
+        "tenant_id": member.partition.tenant_id,
+        "topic_id": member.partition.topic_id,
+        "partition_id": member.partition.partition_id,
+        "incarnation": member.incarnation.to_string(),
+        "original_epoch": member.original_epoch,
+        "next_epoch": member.next_epoch,
+    });
+    if let (Some(target), Some(source)) = (object.as_object_mut(), fields.as_object()) {
+        for (key, value) in source {
+            target.insert(key.clone(), value.clone());
+        }
+    }
+    eprintln!("MIGRATION {event} {object}");
+}
+
+/// The committed dependency evidence of one bundle member, if the bundle has one.
+fn dependent_evidence(
+    bundle: &Bundle,
+    fence: Option<FenceProof>,
+    transfer_watermark: Option<u64>,
+    manifest_id: Option<String>,
+    ready: bool,
+) -> Vec<rovqet_metadata_raft::types::DependentEvidence> {
+    bundle
+        .dependent
+        .iter()
+        .map(|member| rovqet_metadata_raft::types::DependentEvidence {
+            tenant_id: member.partition.tenant_id,
+            topic_id: member.partition.topic_id,
+            partition_id: member.partition.partition_id,
+            incarnation: member.incarnation,
+            original_epoch: member.original_epoch,
+            next_epoch: member.next_epoch,
+            transfer_watermark,
+            manifest_id: manifest_id.clone(),
+            fence_proof: fence.clone(),
+            ready,
+        })
+        .collect()
+}
+
+/// PREPARE: transfer both inventories and commit the verified preliminary evidence.
+async fn prepare_stage(
+    driver: &MigrationDriver,
+    route: &crate::q1::Route,
+    placements: &[PlacementState],
+    record: &MigrationState,
+    target: NodeId,
+) -> Result<(), MigrationError> {
+    let bundle = resolve_bundle(record, placements, route, driver.directory())?;
+    // The source inventory is declared, chunked and verified by the target.
+    let source_watermark = route.committed_count();
+    let source = transfer_member(
+        driver,
+        target,
+        record,
+        &bundle.source,
+        0,
+        None,
+        source_watermark,
+    )
+    .await?;
+    report_member(
+        "inventory",
+        record.migration_id,
+        &bundle.source,
+        serde_json::json!({
+            "phase": "catch_up",
+            "watermark": source.watermark,
+            "manifest_id": source.manifest_id,
+        }),
+    );
+    // The dependent inventory is a second, independently identified history. It shares the
+    // parent migration identity but never its staging identity.
+    let mut dependencies = Vec::new();
+    if let Some(dependent) = &bundle.dependent {
+        let watermark = route.dlq_committed_count().ok_or_else(|| {
+            MigrationError::Metadata("the dependent log has no committed position".into())
+        })?;
+        let transferred =
+            transfer_member(driver, target, record, dependent, 0, None, watermark).await?;
+        report_member(
+            "inventory",
+            record.migration_id,
+            dependent,
+            serde_json::json!({
+                "phase": "catch_up",
+                "watermark": transferred.watermark,
+                "manifest_id": transferred.manifest_id,
+            }),
+        );
+        dependencies = dependent_evidence(
+            &bundle,
+            None,
+            Some(transferred.watermark),
+            Some(transferred.manifest_id),
+            true,
+        );
+    }
+    let command = MetadataCommand::AdvanceMigration {
+        migration_id: record.migration_id,
+        stage: MigrationStage::CatchUp,
+        transfer_watermark: Some(source.watermark),
+        manifest_id: Some(source.manifest_id),
+        fence_proof: None,
+        target_ready: false,
+        dependencies,
+    };
+    driver.commit(command, Duration::from_secs(30)).await?;
+    if let Some(updated) = driver
+        .raft()
+        .applied_state()
+        .migrations
+        .get(&record.migration_id)
+    {
+        report("committed", updated, driver.raft().applied_state().revision);
+    }
+    Ok(())
+}
+
+/// CATCH_UP: quiesce, fence both members, commit the fences and activate on verified evidence.
+///
+/// The two durable fences are ordered deliberately:
+///
+/// 1. the terminal path of the source is quiesced, so no new disposition can cross to the
+///    dependent log;
+/// 2. the source is fenced durably, so the source cannot append anything at all;
+/// 3. the dependent is fenced durably, so no publication can reach it afterwards.
+///
+/// A failure between the two fences leaves the source fenced and the migration at CATCH_UP:
+/// the coordinator retries and the repeated fence returns the same durable proof.
+async fn catch_up_stage(
+    driver: &MigrationDriver,
+    route: &crate::q1::Route,
+    placements: &[PlacementState],
+    record: &MigrationState,
+    target: NodeId,
+    node: u64,
+) -> Result<(), MigrationError> {
+    let bundle = resolve_bundle(record, placements, route, driver.directory())?;
+    // 1. The bundle quiescence barrier.
+    crate::barrier::barrier("before_fence");
+    let quiesce = route
+        .quiesce_terminal()
+        .await
+        .map_err(|error| MigrationError::Io(format!("the quiescence barrier failed: {error:?}")))?;
+    eprintln!(
+        "MIGRATION quiesced {}",
+        serde_json::json!({
+            "migration_id": record.migration_id.to_string(),
+            "source_watermark": quiesce.watermark,
+            "pending_terminal": quiesce.pending,
+        })
+    );
+    // 2. The source revokes its authority durably.
+    let source_fence = route
+        .fence_old_owner(
+            record.migration_id,
+            record.original_epoch,
+            record.next_epoch,
+        )
+        .await
+        .map_err(|error| MigrationError::Io(format!("the source fence failed: {error:?}")))?;
+    verify_fence(
+        &source_fence,
+        record.migration_id,
+        node,
+        record.original_epoch,
+    )?;
+    let source_fence = committed_fence(&source_fence);
+    report_member(
+        "fence",
+        record.migration_id,
+        &bundle.source,
+        serde_json::json!({
+            "fence_offset": source_fence.fence_offset,
+            "fence_digest": source_fence.fence_digest,
+            "manifest_generation": source_fence.manifest_generation,
+        }),
+    );
+    // 3. The dependent revokes its authority durably. Without it the bundle never advances.
+    let dependent_fence = match &bundle.dependent {
+        Some(dependent) => {
+            let proof = route
+                .fence_dlq_old_owner(
+                    record.migration_id,
+                    dependent.original_epoch,
+                    dependent.next_epoch,
+                )
+                .await
+                .map_err(|error| {
+                    MigrationError::Io(format!("the dependent fence failed: {error:?}"))
+                })?;
+            verify_fence(&proof, record.migration_id, node, dependent.original_epoch)?;
+            let proof = committed_fence(&proof);
+            report_member(
+                "fence",
+                record.migration_id,
+                dependent,
+                serde_json::json!({
+                    "fence_offset": proof.fence_offset,
+                    "fence_digest": proof.fence_digest,
+                    "manifest_generation": proof.manifest_generation,
+                }),
+            );
+            Some(proof)
+        }
+        None => None,
+    };
+    // 4. Both fences are committed together. The dependent evidence keeps the preliminary
+    // transfer evidence that was already verified in the prepare stage.
+    let preliminary = record
+        .dependent_evidence
+        .first()
+        .map(|evidence| (evidence.transfer_watermark, evidence.manifest_id.clone()));
+    let fence_command = MetadataCommand::AdvanceMigration {
+        migration_id: record.migration_id,
+        stage: MigrationStage::FenceOld,
+        transfer_watermark: record.transfer_watermark,
+        manifest_id: record.manifest_id.clone(),
+        fence_proof: Some(source_fence.clone()),
+        target_ready: false,
+        dependencies: dependent_evidence(
+            &bundle,
+            dependent_fence.clone(),
+            preliminary.as_ref().and_then(|(watermark, _)| *watermark),
+            preliminary
+                .as_ref()
+                .and_then(|(_, manifest)| manifest.clone()),
+            true,
+        ),
+    };
+    crate::barrier::barrier("after_fence");
+    driver
+        .commit(fence_command, Duration::from_secs(30))
+        .await?;
+    if let Some(updated) = driver
+        .raft()
+        .applied_state()
+        .migrations
+        .get(&record.migration_id)
+    {
+        report("committed", updated, driver.raft().applied_state().revision);
+    }
+    // 5. Final catch up: the logs are final now, so both watermarks are stable.
+    let source_watermark = route.committed_count();
+    let source = transfer_member(
+        driver,
+        target,
+        record,
+        &bundle.source,
+        source_fence.manifest_generation,
+        Some(&source_fence),
+        source_watermark,
+    )
+    .await?;
+    report_member(
+        "inventory",
+        record.migration_id,
+        &bundle.source,
+        serde_json::json!({
+            "phase": "final",
+            "watermark": source.watermark,
+            "manifest_id": source.manifest_id,
+        }),
+    );
+    let mut dependencies = Vec::new();
+    if let Some(dependent) = &bundle.dependent {
+        let watermark = route.dlq_committed_count().ok_or_else(|| {
+            MigrationError::Metadata("the dependent log has no committed position".into())
+        })?;
+        let transferred = transfer_member(
+            driver,
+            target,
+            record,
+            dependent,
+            dependent_fence
+                .as_ref()
+                .map(|proof| proof.manifest_generation)
+                .unwrap_or_default(),
+            dependent_fence.as_ref(),
+            watermark,
+        )
+        .await?;
+        report_member(
+            "inventory",
+            record.migration_id,
+            dependent,
+            serde_json::json!({
+                "phase": "final",
+                "watermark": transferred.watermark,
+                "manifest_id": transferred.manifest_id,
+            }),
+        );
+        // 6. Every committed terminal disposition of DLQ kind must reference a destination
+        // record that exists with exactly the recorded identity. A manifest alone is never
+        // proof of a terminal destination.
+        let references = route
+            .terminal_references()
+            .await
+            .map_err(|error| MigrationError::Io(format!("the terminal audit failed: {error:?}")))?;
+        for reference in &references {
+            let verified = route
+                .verify_dlq_reference(reference)
+                .await
+                .map_err(|error| {
+                    MigrationError::Io(format!("the dependent destination failed: {error:?}"))
+                })?;
+            if !verified {
+                return Err(MigrationError::Metadata(format!(
+                    "the committed terminal disposition {} has no matching dependent record",
+                    reference.disposition_id
+                )));
+            }
+            eprintln!(
+                "MIGRATION terminal {}",
+                serde_json::json!({
+                    "migration_id": record.migration_id.to_string(),
+                    "disposition_id": reference.disposition_id.to_string(),
+                    "source_offset": reference.source_offset,
+                    "dlq_incarnation": reference.destination_incarnation.to_string(),
+                    "dlq_offset": reference.destination_offset,
+                    "original_message_id": reference.original_message_id.to_string(),
+                    "verified": true,
+                })
+            );
+        }
+        dependencies = dependent_evidence(
+            &bundle,
+            dependent_fence.clone(),
+            Some(transferred.watermark),
+            Some(transferred.manifest_id),
+            true,
+        );
+    }
+    // 7. One committed activation moves both placements. The source never activates while a
+    // dependency is incomplete.
+    let activation = MetadataCommand::AdvanceMigration {
+        migration_id: record.migration_id,
+        stage: MigrationStage::ActivateNew,
+        transfer_watermark: Some(source.watermark),
+        manifest_id: Some(source.manifest_id),
+        fence_proof: None,
+        target_ready: true,
+        dependencies,
+    };
+    crate::barrier::barrier("before_activate_commit");
+    driver.commit(activation, Duration::from_secs(30)).await?;
+    if let Some(updated) = driver
+        .raft()
+        .applied_state()
+        .migrations
+        .get(&record.migration_id)
+    {
+        report("committed", updated, driver.raft().applied_state().revision);
+    }
+    Ok(())
 }
 
 /// The storage lifecycle of a successor.
@@ -810,47 +1404,93 @@ pub async fn run_activator(
                 if record.stage != MigrationStage::ActivateNew {
                     return None;
                 }
-                // The dependent partitions must be available: a terminal disposition that
-                // references a DLQ record needs a recoverable destination.
-                if !dependencies_available(&route_options, record) {
-                    eprintln!(
-                        "the dependent history of the migration is not available locally; \
-                         the successor stays inactive"
-                    );
-                    return None;
-                }
-                // The transferred storage is promoted before the route is opened.
                 let Some(staging_root) = staging_root.clone() else {
                     return None;
                 };
-                let inventory = hex_to_bytes(record.manifest_id.as_deref().unwrap_or_default());
-                let staging =
-                    crate::promotion::staging_area(&staging_root, record.migration_id, &inventory);
-                let plan = crate::promotion::PromotionRecord {
-                    migration_id: record.migration_id,
-                    inventory_digest: bytes_to_hex(&inventory),
-                    incarnation: record.source_incarnation,
-                    tenant_id: options.partition.tenant_id,
-                    topic_id: options.partition.topic_id,
-                    partition_id: options.partition.partition_id,
-                    target_epoch: placement.ownership_epoch,
-                    activation_revision: state.revision,
-                    files: Vec::new(),
-                    state: crate::promotion::PromotionState::Promoted,
-                };
-                if let Err(error) = crate::promotion::promote_with_manifest(
-                    &staging,
-                    &route_options.directory,
-                    &plan,
-                ) {
-                    eprintln!("the promoted storage was refused: {error}");
-                    return None;
+                // A coordinated bundle promotes both histories before either route opens.
+                if !record.dependent_partitions.is_empty() {
+                    match promote_bundle(
+                        record,
+                        &route_options,
+                        &staging_root,
+                        state.revision,
+                        placement.ownership_epoch,
+                    ) {
+                        Ok(()) => {
+                            // The promoted dependent history must be recoverable before the
+                            // source may open against it.
+                            if !dependencies_available(&route_options, record) {
+                                eprintln!(
+                                    "the promoted dependent history of the bundle is not \
+                                     recoverable; the successor stays inactive"
+                                );
+                                return None;
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!("the bundle promotion was refused: {error}");
+                            return None;
+                        }
+                    }
+                    let evidence = record.dependent_evidence.first();
+                    if let Some(evidence) = evidence {
+                        route_options.incarnation = record.source_incarnation;
+                        if let Some(dlq) = route_options.dlq.as_mut() {
+                            if let Some(epoch) = evidence.next_epoch.checked_sub(0) {
+                                dlq.owner_epoch = epoch;
+                            }
+                        }
+                    }
+                    crate::barrier::barrier("before_route_open");
+                } else {
+                    // The dependent partitions must be available: a terminal disposition
+                    // that references a DLQ record needs a recoverable destination.
+                    if !dependencies_available(&route_options, record) {
+                        eprintln!(
+                            "the dependent history of the migration is not available locally; \
+                             the successor stays inactive"
+                        );
+                        return None;
+                    }
+                    // The transferred storage is promoted before the route is opened.
+                    let inventory = hex_to_bytes(record.manifest_id.as_deref().unwrap_or_default());
+                    if inventory.len() != 32 {
+                        eprintln!("the committed inventory identity of the migration is invalid");
+                        return None;
+                    }
+                    let staging = crate::promotion::staging_area(
+                        &staging_root,
+                        record.migration_id,
+                        Q1TransferMember::Source,
+                        &inventory,
+                    );
+                    let plan = crate::promotion::PromotionRecord {
+                        migration_id: record.migration_id,
+                        inventory_digest: bytes_to_hex(&inventory),
+                        incarnation: record.source_incarnation,
+                        tenant_id: options.partition.tenant_id,
+                        topic_id: options.partition.topic_id,
+                        partition_id: options.partition.partition_id,
+                        target_epoch: placement.ownership_epoch,
+                        activation_revision: state.revision,
+                        files: Vec::new(),
+                        state: crate::promotion::PromotionState::Promoted,
+                    };
+                    if let Err(error) = crate::promotion::promote_with_manifest(
+                        &staging,
+                        &route_options.directory,
+                        &plan,
+                    ) {
+                        eprintln!("the promoted storage was refused: {error}");
+                        return None;
+                    }
+                    // The transferred history keeps its incarnation.
+                    route_options.incarnation = record.source_incarnation;
+                    crate::barrier::barrier("before_route_open");
                 }
-                // The transferred history keeps its incarnation.
-                route_options.incarnation = record.source_incarnation;
-                crate::barrier::barrier("before_route_open");
             }
             let partition = route_options.partition;
+            let dlq_partition = route_options.dlq.as_ref().map(|dlq| dlq.partition);
             match crate::q1::Route::open(route_options) {
                 Ok(route) => {
                     let route = std::sync::Arc::new(route);
@@ -858,9 +1498,28 @@ pub async fn run_activator(
                         "Q1 route active: partition={:?} epoch={} incarnation={}",
                         partition, route.options.owner_epoch, route.options.incarnation
                     );
+                    if let Some(dlq_partition) = dlq_partition {
+                        eprintln!(
+                            "Q1 DLQ route active: partition={:?} epoch={} incarnation={}",
+                            dlq_partition,
+                            route
+                                .dlq_configured_authority()
+                                .map(|value| value.0)
+                                .unwrap_or(0),
+                            route
+                                .dlq_configured_authority()
+                                .map(|value| value.1)
+                                .unwrap_or(0)
+                        );
+                    }
                     crate::barrier::barrier("after_route_open");
+                    // The successor installs the committed authority of both partitions only
+                    // after both histories were recovered.
                     if let Some(authority) = cluster.authority_for(&partition) {
                         route.install_authority(Some(authority));
+                    }
+                    if let Some(dlq_partition) = dlq_partition {
+                        route.install_dlq_authority(cluster.authority_for(&dlq_partition));
                     }
                     Some(route)
                 }
@@ -880,6 +1539,221 @@ pub async fn run_activator(
             return;
         }
     }
+}
+
+/// Promotes both inventories of a committed bundle, dependent first.
+///
+/// The two promotions happen in two independent directories: this is deliberately not one
+/// atomic filesystem transaction. The order is what makes it safe: the dependent history is
+/// published and verified before the source is published, so a crash between the two leaves
+/// the source directory without its history and the successor inactive until the remaining
+/// promotion completes.
+fn promote_bundle(
+    record: &MigrationState,
+    options: &crate::q1::Options,
+    staging_root: &Path,
+    activation_revision: u64,
+    target_epoch: u64,
+) -> Result<(), String> {
+    if !record.target_ready {
+        return Err("the committed activation carries no target readiness".into());
+    }
+    let [dependency] = record.dependent_partitions.as_slice() else {
+        return Err("a coordinated handover moves exactly one dependent partition".into());
+    };
+    let Some(dlq) = &options.dlq else {
+        return Err("the committed dependency is not configured on this successor".into());
+    };
+    if dlq.partition.tenant_id != dependency.tenant_id
+        || dlq.partition.topic_id != dependency.topic_id
+        || dlq.partition.partition_id != dependency.partition_id
+    {
+        return Err("the configured dependent partition is not the committed dependency".into());
+    }
+    if dlq.incarnation != dependency.incarnation {
+        return Err("the configured dependent incarnation is not the committed dependency".into());
+    }
+    let Some(evidence) = record.dependent_evidence.iter().find(|evidence| {
+        evidence.tenant_id == dependency.tenant_id
+            && evidence.topic_id == dependency.topic_id
+            && evidence.partition_id == dependency.partition_id
+    }) else {
+        return Err("the committed activation carries no evidence of the dependency".into());
+    };
+    if !evidence.ready || evidence.fence_proof.is_none() || evidence.transfer_watermark.is_none() {
+        return Err("the committed evidence of the dependency is incomplete".into());
+    }
+    let fence = evidence
+        .fence_proof
+        .as_ref()
+        .expect("the fence was checked above");
+    if fence.migration_id != record.migration_id
+        || fence.old_owner != record.source_node
+        || fence.old_epoch != evidence.original_epoch
+    {
+        return Err("the committed fence of the dependency does not match the bundle".into());
+    }
+    let source_inventory = hex_to_bytes(record.manifest_id.as_deref().unwrap_or_default());
+    if source_inventory.len() != 32 {
+        return Err("the committed source inventory identity is invalid".into());
+    }
+    let dependent_inventory = hex_to_bytes(evidence.manifest_id.as_deref().unwrap_or_default());
+    if dependent_inventory.len() != 32 {
+        return Err("the committed dependent inventory identity is invalid".into());
+    }
+    if dependent_inventory == source_inventory {
+        return Err("the two members of the bundle carry the same inventory identity".into());
+    }
+    // The durable readiness record: it states which promotion completed, so an interrupted
+    // paired promotion is resumed instead of being guessed.
+    let mut readiness = crate::promotion::BundleReadiness::load(staging_root, record.migration_id)
+        .map_err(|error| format!("the bundle readiness record is unreadable: {error}"))?
+        .unwrap_or(crate::promotion::BundleReadiness {
+            migration_id: record.migration_id,
+            activation_revision,
+            target_epoch,
+            dependent_inventory_digest: bytes_to_hex(&dependent_inventory),
+            dependent_incarnation: evidence.incarnation,
+            dependent_partition: [
+                dependency.tenant_id,
+                dependency.topic_id,
+                u64::from(dependency.partition_id),
+            ],
+            dependent_promoted: false,
+            source_inventory_digest: bytes_to_hex(&source_inventory),
+            source_incarnation: record.source_incarnation,
+            source_partition: [
+                record.tenant_id,
+                record.topic_id,
+                u64::from(record.partition_id),
+            ],
+            source_promoted: false,
+        });
+    if readiness.dependent_inventory_digest != bytes_to_hex(&dependent_inventory)
+        || readiness.source_inventory_digest != bytes_to_hex(&source_inventory)
+        || readiness.dependent_incarnation != evidence.incarnation
+        || readiness.source_incarnation != record.source_incarnation
+    {
+        return Err("the durable bundle readiness belongs to another activation".into());
+    }
+    let dependent_staging = crate::promotion::staging_area(
+        staging_root,
+        record.migration_id,
+        Q1TransferMember::Dependent,
+        &dependent_inventory,
+    );
+    let source_staging = crate::promotion::staging_area(
+        staging_root,
+        record.migration_id,
+        Q1TransferMember::Source,
+        &source_inventory,
+    );
+    // 1. The dependent history is published first, into its own configured directory.
+    if !readiness.dependent_promoted {
+        std::fs::create_dir_all(&dlq.directory)
+            .map_err(|error| format!("the dependent directory is unavailable: {error}"))?;
+        let plan = crate::promotion::PromotionRecord {
+            migration_id: record.migration_id,
+            inventory_digest: readiness.dependent_inventory_digest.clone(),
+            incarnation: evidence.incarnation,
+            tenant_id: dependency.tenant_id,
+            topic_id: dependency.topic_id,
+            partition_id: dependency.partition_id,
+            target_epoch: evidence.next_epoch,
+            activation_revision,
+            files: Vec::new(),
+            state: crate::promotion::PromotionState::Promoted,
+        };
+        crate::promotion::promote_with_manifest(&dependent_staging, &dlq.directory, &plan)
+            .map_err(|error| format!("the dependent promotion was refused: {error}"))?;
+        crate::barrier::barrier("after_dependent_promotion");
+        readiness.dependent_promoted = true;
+        readiness
+            .store(staging_root)
+            .map_err(|error| format!("the bundle readiness record was not stored: {error}"))?;
+    }
+    verify_promotion(
+        &dlq.directory,
+        record.migration_id,
+        &evidence.incarnation,
+        dependency.tenant_id,
+        dependency.topic_id,
+        dependency.partition_id,
+    )?;
+    // 2. Only then the source history is published.
+    if !readiness.source_promoted {
+        crate::barrier::barrier("before_source_promotion");
+        let plan = crate::promotion::PromotionRecord {
+            migration_id: record.migration_id,
+            inventory_digest: readiness.source_inventory_digest.clone(),
+            incarnation: record.source_incarnation,
+            tenant_id: record.tenant_id,
+            topic_id: record.topic_id,
+            partition_id: record.partition_id,
+            target_epoch: record.next_epoch,
+            activation_revision,
+            files: Vec::new(),
+            state: crate::promotion::PromotionState::Promoted,
+        };
+        crate::promotion::promote_with_manifest(&source_staging, &options.directory, &plan)
+            .map_err(|error| format!("the source promotion was refused: {error}"))?;
+        crate::barrier::barrier("after_source_promotion");
+        readiness.source_promoted = true;
+        readiness
+            .store(staging_root)
+            .map_err(|error| format!("the bundle readiness record was not stored: {error}"))?;
+    }
+    verify_promotion(
+        &options.directory,
+        record.migration_id,
+        &record.source_incarnation,
+        record.tenant_id,
+        record.topic_id,
+        record.partition_id,
+    )?;
+    eprintln!(
+        "MIGRATION promoted {}",
+        serde_json::json!({
+            "migration_id": record.migration_id.to_string(),
+            "activation_revision": activation_revision,
+            "target_epoch": target_epoch,
+            "dependent_inventory_digest": bytes_to_hex(&dependent_inventory),
+            "dependent_incarnation": evidence.incarnation.to_string(),
+            "dependent_partition": readiness.dependent_partition,
+            "dependent_promoted": readiness.dependent_promoted,
+            "source_inventory_digest": bytes_to_hex(&source_inventory),
+            "source_incarnation": record.source_incarnation.to_string(),
+            "source_partition": readiness.source_partition,
+            "source_promoted": readiness.source_promoted,
+        })
+    );
+    Ok(())
+}
+
+/// Verifies one completed durable promotion record.
+fn verify_promotion(
+    directory: &Path,
+    migration_id: u128,
+    incarnation: &u128,
+    tenant_id: u64,
+    topic_id: u64,
+    partition_id: u32,
+) -> Result<(), String> {
+    let record = crate::promotion::promotion_record(directory)
+        .map_err(|error| format!("the promotion record is unreadable: {error}"))?
+        .ok_or_else(|| "the promotion record is missing".to_string())?;
+    if record.state != crate::promotion::PromotionState::Promoted {
+        return Err("the promotion did not complete".into());
+    }
+    if record.migration_id != migration_id
+        || record.incarnation != *incarnation
+        || record.tenant_id != tenant_id
+        || record.topic_id != topic_id
+        || record.partition_id != partition_id
+    {
+        return Err("the promotion record belongs to another activation".into());
+    }
+    Ok(())
 }
 
 /// True when every dependent partition of the migration is available locally.
@@ -1217,6 +2091,355 @@ mod dependency_tests {
         assert!(
             !dependencies_available(&configured, &record(vec![dependency(43)])),
             "a valid history of another partition must be refused"
+        );
+    }
+}
+
+#[cfg(test)]
+mod bundle_tests {
+    //! The negative cases of a coordinated bundle activation.
+    //!
+    //! Every unsafe configuration must leave the source route inactive on the target: a
+    //! bundle that cannot be promoted completely never opens the source partition.
+    use super::*;
+    use rovqet_core::PartitionRef;
+
+    const MIGRATION: u128 = 0x5151_5151_5151_5151;
+
+    fn source_partition() -> PartitionRef {
+        PartitionRef {
+            tenant_id: 1,
+            topic_id: 3,
+            partition_id: 0,
+        }
+    }
+
+    fn dependent_partition() -> PartitionRef {
+        PartitionRef {
+            tenant_id: 1,
+            topic_id: 7,
+            partition_id: 0,
+        }
+    }
+
+    fn options(
+        directory: std::path::PathBuf,
+        dlq: Option<std::path::PathBuf>,
+    ) -> crate::q1::Options {
+        crate::q1::Options {
+            directory,
+            topic: "durable".into(),
+            node_id: 2,
+            partition: source_partition(),
+            incarnation: 42,
+            owner_epoch: 8,
+            dedup_window: std::time::Duration::from_secs(86400),
+            max_producers: 64,
+            max_outcomes: 64,
+            initialize_new_log: false,
+            terminal_policy: rovqet_durable::TerminalPolicy::Dlq,
+            max_attempts: 1,
+            retry_initial: std::time::Duration::from_millis(10),
+            retry_max: std::time::Duration::from_millis(100),
+            dlq: dlq.map(|directory| crate::q1::DlqOptions {
+                directory,
+                topic: "durable-dlq".into(),
+                partition: dependent_partition(),
+                incarnation: 77,
+                owner_epoch: 8,
+                max_outcomes: 64,
+                max_producers: 64,
+            }),
+        }
+    }
+
+    /// A committed activation of a bundle with both members.
+    fn activation(
+        source_manifest: &str,
+        dependent_manifest: &str,
+        dependent_incarnation: u128,
+    ) -> MigrationState {
+        MigrationState {
+            migration_id: MIGRATION,
+            tenant_id: 1,
+            topic_id: 3,
+            partition_id: 0,
+            stage: MigrationStage::ActivateNew,
+            source_node: 1,
+            target_node: 2,
+            source_incarnation: 42,
+            original_epoch: 7,
+            next_epoch: 8,
+            transfer_watermark: Some(11),
+            manifest_id: Some(source_manifest.to_string()),
+            fence_proof: Some(FenceProof {
+                migration_id: MIGRATION,
+                old_owner: 1,
+                old_epoch: 7,
+                fence_offset: 11,
+                fence_digest: "aa".into(),
+                manifest_generation: 4,
+            }),
+            target_ready: true,
+            dependent_partitions: vec![rovqet_metadata_raft::types::DependentPartition {
+                tenant_id: 1,
+                topic_id: 7,
+                partition_id: 0,
+                durable_class: 1,
+                incarnation: dependent_incarnation,
+            }],
+            dependent_evidence: vec![rovqet_metadata_raft::types::DependentEvidence {
+                tenant_id: 1,
+                topic_id: 7,
+                partition_id: 0,
+                incarnation: dependent_incarnation,
+                original_epoch: 7,
+                next_epoch: 8,
+                transfer_watermark: Some(2),
+                manifest_id: Some(dependent_manifest.to_string()),
+                fence_proof: Some(FenceProof {
+                    migration_id: MIGRATION,
+                    old_owner: 1,
+                    old_epoch: 7,
+                    fence_offset: 2,
+                    fence_digest: "bb".into(),
+                    manifest_generation: 3,
+                }),
+                ready: true,
+            }],
+        }
+    }
+
+    /// Writes a staging area with the given files and returns its inventory identity.
+    fn staging(root: &Path, member: Q1TransferMember, files: &[(&str, &[u8])]) -> String {
+        let declared: Vec<Q1TransferFile> = files
+            .iter()
+            .map(|(name, bytes)| Q1TransferFile {
+                name: name.to_string(),
+                size: bytes.len() as u64,
+                digest: sha256(bytes),
+            })
+            .collect();
+        let digest = crate::transfer::inventory_digest(&declared);
+        let directory = crate::promotion::staging_area(root, MIGRATION, member, &digest);
+        std::fs::create_dir_all(&directory).expect("staging directory");
+        let document = serde_json::json!({
+            "migration_id": MIGRATION.to_string(),
+            "member": member.as_u8(),
+            "files": declared.iter().map(|file| serde_json::json!({
+                "name": file.name,
+                "size": file.size,
+                "digest": bytes_to_hex(&file.digest),
+            })).collect::<Vec<_>>(),
+        });
+        std::fs::write(
+            directory.join("staging.json"),
+            serde_json::to_vec(&document).expect("manifest"),
+        )
+        .expect("manifest");
+        for (index, (_, bytes)) in files.iter().enumerate() {
+            std::fs::write(directory.join(format!("part-{index:06}.bin")), bytes).expect("part");
+        }
+        bytes_to_hex(&digest)
+    }
+
+    fn directories() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let root = tempfile::tempdir().expect("temp dir");
+        let source = root.path().join("source");
+        let dlq = root.path().join("dlq");
+        std::fs::create_dir_all(&source).expect("source directory");
+        std::fs::create_dir_all(&dlq).expect("dlq directory");
+        (root, source, dlq)
+    }
+
+    #[test]
+    fn a_bundle_without_the_dependent_inventory_is_refused() {
+        let (root, source, dlq) = directories();
+        let staging_root = root.path().join("staging");
+        std::fs::create_dir_all(&staging_root).expect("staging root");
+        let source_manifest = staging(
+            &staging_root,
+            Q1TransferMember::Source,
+            &[("MANIFEST", b"source manifest")],
+        );
+        // The dependent staging area was never received.
+        let record = activation(&source_manifest, &"cd".repeat(32), 77);
+        let configured = options(source, Some(dlq));
+        let error = promote_bundle(&record, &configured, &staging_root, 9, 8)
+            .expect_err("the missing dependent inventory must be refused");
+        assert!(
+            error.contains("dependent promotion"),
+            "the refusal must name the missing promotion: {error}"
+        );
+        assert!(
+            !configured
+                .dlq
+                .as_ref()
+                .expect("dlq")
+                .directory
+                .join("MANIFEST")
+                .is_file(),
+            "a refused bundle must not publish the dependent history"
+        );
+    }
+
+    #[test]
+    fn a_bundle_with_a_foreign_dependent_incarnation_is_refused() {
+        let (root, source, dlq) = directories();
+        let staging_root = root.path().join("staging");
+        std::fs::create_dir_all(&staging_root).expect("staging root");
+        let source_manifest = staging(
+            &staging_root,
+            Q1TransferMember::Source,
+            &[("MANIFEST", b"source manifest")],
+        );
+        let dependent_manifest = staging(
+            &staging_root,
+            Q1TransferMember::Dependent,
+            &[("MANIFEST", b"dependent manifest")],
+        );
+        // The committed dependency carries another incarnation than the configured one.
+        let record = activation(&source_manifest, &dependent_manifest, 99);
+        let configured = options(source, Some(dlq));
+        let error = promote_bundle(&record, &configured, &staging_root, 9, 8)
+            .expect_err("a foreign dependent incarnation must be refused");
+        assert!(
+            error.contains("incarnation"),
+            "the refusal must name the incarnation: {error}"
+        );
+    }
+
+    #[test]
+    fn an_uncommitted_activation_is_refused() {
+        let (root, source, dlq) = directories();
+        let staging_root = root.path().join("staging");
+        std::fs::create_dir_all(&staging_root).expect("staging root");
+        let source_manifest = staging(
+            &staging_root,
+            Q1TransferMember::Source,
+            &[("MANIFEST", b"source manifest")],
+        );
+        let dependent_manifest = staging(
+            &staging_root,
+            Q1TransferMember::Dependent,
+            &[("MANIFEST", b"dependent manifest")],
+        );
+        let mut record = activation(&source_manifest, &dependent_manifest, 77);
+        record.target_ready = false;
+        let configured = options(source, Some(dlq));
+        let error = promote_bundle(&record, &configured, &staging_root, 9, 8)
+            .expect_err("an activation without readiness must be refused");
+        assert!(
+            error.contains("readiness"),
+            "the refusal must name the missing readiness: {error}"
+        );
+    }
+
+    #[test]
+    fn a_conflicting_destination_storage_is_refused() {
+        let (root, source, dlq) = directories();
+        let staging_root = root.path().join("staging");
+        std::fs::create_dir_all(&staging_root).expect("staging root");
+        let source_manifest = staging(
+            &staging_root,
+            Q1TransferMember::Source,
+            &[("MANIFEST", b"source manifest")],
+        );
+        let dependent_manifest = staging(
+            &staging_root,
+            Q1TransferMember::Dependent,
+            &[("MANIFEST", b"dependent manifest")],
+        );
+        // The destination holds unrelated storage.
+        std::fs::write(dlq.join("unrelated.blob"), b"foreign").expect("foreign file");
+        let record = activation(&source_manifest, &dependent_manifest, 77);
+        let configured = options(source, Some(dlq));
+        let error = promote_bundle(&record, &configured, &staging_root, 9, 8)
+            .expect_err("conflicting destination storage must be refused");
+        assert!(
+            error.contains("dependent promotion"),
+            "the refusal must name the dependent promotion: {error}"
+        );
+    }
+
+    #[test]
+    fn a_one_sided_promotion_leaves_the_source_unavailable() {
+        let (root, source, dlq) = directories();
+        let staging_root = root.path().join("staging");
+        std::fs::create_dir_all(&staging_root).expect("staging root");
+        let source_manifest = staging(
+            &staging_root,
+            Q1TransferMember::Source,
+            &[("MANIFEST", b"source manifest")],
+        );
+        let dependent_manifest = staging(
+            &staging_root,
+            Q1TransferMember::Dependent,
+            &[("MANIFEST", b"dependent manifest")],
+        );
+        let record = activation(&source_manifest, &dependent_manifest, 77);
+        let configured = options(source.clone(), Some(dlq.clone()));
+        // The dependent inventory is missing: the promotion stops after the dependent
+        // history was published, and the source stays without its history.
+        let mut incomplete = record.clone();
+        incomplete.dependent_evidence[0].manifest_id = Some("cd".repeat(32));
+        let error = promote_bundle(&incomplete, &configured, &staging_root, 9, 8)
+            .expect_err("the missing dependent inventory must stop the promotion");
+        assert!(error.contains("dependent promotion"), "{error}");
+        // The source directory never received a history.
+        assert!(
+            !source.join("MANIFEST").is_file(),
+            "a one-sided promotion must not publish the source history"
+        );
+        // The completed promotion publishes both histories.
+        promote_bundle(&record, &configured, &staging_root, 9, 8)
+            .expect("the repeated promotion completes the bundle");
+        assert!(source.join("MANIFEST").is_file());
+        assert!(dlq.join("MANIFEST").is_file());
+        let readiness = crate::promotion::BundleReadiness::load(&staging_root, MIGRATION)
+            .expect("readiness")
+            .expect("a readiness record");
+        assert!(readiness.dependent_promoted);
+        assert!(readiness.source_promoted);
+    }
+
+    #[test]
+    fn a_bundle_readiness_of_another_activation_is_refused() {
+        let (root, source, dlq) = directories();
+        let staging_root = root.path().join("staging");
+        std::fs::create_dir_all(&staging_root).expect("staging root");
+        let source_manifest = staging(
+            &staging_root,
+            Q1TransferMember::Source,
+            &[("MANIFEST", b"source manifest")],
+        );
+        let dependent_manifest = staging(
+            &staging_root,
+            Q1TransferMember::Dependent,
+            &[("MANIFEST", b"dependent manifest")],
+        );
+        let record = activation(&source_manifest, &dependent_manifest, 77);
+        let configured = options(source, Some(dlq));
+        // A readiness record of another inventory identity is never accepted.
+        let foreign = crate::promotion::BundleReadiness {
+            migration_id: MIGRATION,
+            activation_revision: 9,
+            target_epoch: 8,
+            dependent_inventory_digest: "00".repeat(32),
+            dependent_incarnation: 77,
+            dependent_partition: [1, 7, 0],
+            dependent_promoted: true,
+            source_inventory_digest: source_manifest.clone(),
+            source_incarnation: 42,
+            source_partition: [1, 3, 0],
+            source_promoted: false,
+        };
+        foreign.store(&staging_root).expect("readiness");
+        let error = promote_bundle(&record, &configured, &staging_root, 9, 8)
+            .expect_err("a foreign readiness record must be refused");
+        assert!(
+            error.contains("readiness"),
+            "the refusal must name the readiness record: {error}"
         );
     }
 }

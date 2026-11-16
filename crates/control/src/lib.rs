@@ -18,8 +18,8 @@ pub use ids::{
 pub use metadata::{MetadataSnapshot, MetadataStore, PartitionPlacement, SnapshotFile};
 pub use routing::{RouteDecision, decide};
 pub use rpc::{
-    HealthResponse, OwnershipRequest, OwnershipResponse, RouteAckRequest, RouteAckResponse,
-    RouteDelivery, RouteFetchRequest, RouteFetchResponse, RoutePublishRequest,
+    HealthResponse, OwnershipRequest, OwnershipResponse, Q1TransferMember, RouteAckRequest,
+    RouteAckResponse, RouteDelivery, RouteFetchRequest, RouteFetchResponse, RoutePublishRequest,
     RoutePublishResponse, RpcErrorCode, RpcKind,
 };
 pub use transport::{PeerTransport, TransportError, TransportLimits};

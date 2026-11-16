@@ -171,6 +171,32 @@ enum Command {
     Nack(terminal::NackCommand),
     SetAuthority(Option<Authority>),
     Fence(FenceCommand),
+    QuiesceTerminal(oneshot::Sender<Result<TerminalQuiesce>>),
+    TerminalAudit(oneshot::Sender<Result<Vec<TerminalReference>>>),
+}
+
+/// The outcome of the bundle quiescence barrier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalQuiesce {
+    /// The committed record count when the barrier was established. It is the final
+    /// transfer watermark of the partition: nothing after the barrier can be appended.
+    pub watermark: u64,
+    /// Terminal dispositions whose dependent publication has not been proven yet. They keep
+    /// their durable PENDING record and are resumed by a later recovery, never fabricated.
+    pub pending: usize,
+}
+
+/// One committed terminal disposition that references a destination record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalReference {
+    pub disposition_id: u128,
+    /// The incarnation of the destination log.
+    pub destination_incarnation: u128,
+    /// The committed offset of the destination record.
+    pub destination_offset: u64,
+    pub original_message_id: u128,
+    /// The source application offset the disposition closed.
+    pub source_offset: u64,
 }
 /// A request to durably revoke the write authority of this owner.
 struct FenceCommand {
@@ -413,6 +439,14 @@ impl Partition {
                                     );
                                     let _ = command.reply.send(result);
                                 }
+                                Ok(Command::QuiesceTerminal(reply)) => {
+                                    let result = state.quiesce_terminal();
+                                    let _ = reply.send(result);
+                                }
+                                Ok(Command::TerminalAudit(reply)) => {
+                                    let result = state.terminal_audit();
+                                    let _ = reply.send(result);
+                                }
                                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                                     state.complete_replays(&mut reads, true);
@@ -601,6 +635,42 @@ impl Partition {
             .join()
             .map_err(|_| Error::OutcomeUnknown)
     }
+
+    /// Closes the terminal path of this partition in front of a coordinated handover.
+    ///
+    /// The barrier is ordered with every durable mutation of the actor: every terminal
+    /// transaction that was admitted before the barrier has already completed or has left a
+    /// durable PENDING record, and no new terminal disposition (and therefore no new
+    /// dependent publication) can start afterwards. The pending dispositions are preserved:
+    /// they are neither completed, dropped nor fabricated here.
+    pub async fn quiesce_terminal(&self) -> Result<TerminalQuiesce> {
+        let sender = self.sender.as_ref().ok_or(Error::Unavailable)?;
+        let (tx, rx) = oneshot::channel();
+        sender
+            .try_send(Command::QuiesceTerminal(tx))
+            .map_err(|error| match error {
+                TrySendError::Full(_) => Error::Capacity,
+                TrySendError::Disconnected(_) => Error::Unavailable,
+            })?;
+        rx.await.unwrap_or(Err(Error::OutcomeUnknown))
+    }
+
+    /// The durable terminal references of this partition.
+    ///
+    /// Every committed terminal disposition of DLQ kind references one destination record.
+    /// The list is the durable identity of those references and is used to verify the
+    /// dependency before an activation and after a recovery.
+    pub async fn terminal_references(&self) -> Result<Vec<TerminalReference>> {
+        let sender = self.sender.as_ref().ok_or(Error::Unavailable)?;
+        let (tx, rx) = oneshot::channel();
+        sender
+            .try_send(Command::TerminalAudit(tx))
+            .map_err(|error| match error {
+                TrySendError::Full(_) => Error::Capacity,
+                TrySendError::Disconnected(_) => Error::Unavailable,
+            })?;
+        rx.await.unwrap_or(Err(Error::OutcomeUnknown))
+    }
 }
 /// Dropping the sole handle drains submitted operations and joins the blocking worker.
 impl Drop for Partition {
@@ -639,6 +709,10 @@ struct State {
     dlq: Option<Arc<dyn DlqPublisher>>,
     pending_terminal: HashMap<(u64, u64), terminal::PendingTerminal>,
     recovered_dlq_commits: Vec<(u128, u128, u64, u128)>,
+    /// The committed terminal references of DLQ kind, in durable order.
+    terminal_references: Vec<TerminalReference>,
+    /// The bundle quiescence barrier: no terminal disposition starts after it.
+    terminal_quiesced: bool,
     last_terminal_attempt: Option<Instant>,
     committed: Arc<std::sync::atomic::AtomicU64>,
     next: u64,
@@ -684,6 +758,8 @@ impl State {
             dlq,
             pending_terminal: HashMap::new(),
             recovered_dlq_commits: Vec::new(),
+            terminal_references: Vec::new(),
+            terminal_quiesced: false,
             last_terminal_attempt: None,
             committed,
             next: 0,
@@ -836,7 +912,27 @@ impl State {
         if self.unhealthy {
             return Err(Error::Unavailable);
         }
-        if self.fenced.is_some() {
+        if let Some(state) = &self.fenced {
+            // A repeated fence of the same handover is idempotent: the durable revocation
+            // already happened and the same proof is returned, so an interrupted
+            // coordination can retry the second fence of a bundle.
+            if state.migration_id == migration_id
+                && state.old_owner == self.config.node_id
+                && state.old_epoch == old_epoch
+                && state.next_epoch == next_epoch
+            {
+                let payload =
+                    encode_fence(migration_id, self.config.node_id, old_epoch, next_epoch);
+                return Ok(FenceProof {
+                    migration_id,
+                    old_owner: self.config.node_id,
+                    old_epoch,
+                    next_epoch,
+                    fence_offset: state.offset,
+                    fence_digest: fence_digest(&payload),
+                    manifest_generation: self.wal.generation(),
+                });
+            }
             return Err(Error::Fenced);
         }
         // Only the committed owner may revoke itself, and only for the epoch it holds.

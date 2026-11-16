@@ -454,6 +454,11 @@ async fn main() -> io::Result<()> {
             let authority = cluster.authority_for(&q1.partition);
             if let Some(route) = route_slot.current() {
                 route.install_authority(authority);
+                route.install_dlq_authority(
+                    q1.dlq
+                        .as_ref()
+                        .and_then(|dlq| cluster.authority_for(&dlq.partition)),
+                );
             }
             // In Raft mode the authority follows the committed metadata: it is installed
             // again whenever the committed revision changes. Nothing mints an epoch, extends
@@ -462,6 +467,7 @@ async fn main() -> io::Result<()> {
                 let cluster = cluster.clone();
                 let route_slot = route_slot.clone();
                 let partition = q1.partition;
+                let dlq_partition = q1.dlq.as_ref().map(|dlq| dlq.partition);
                 let mut updates = node.committed_updates();
                 tokio::spawn(async move {
                     loop {
@@ -470,6 +476,9 @@ async fn main() -> io::Result<()> {
                         }
                         if let Some(route) = route_slot.current() {
                             route.install_authority(cluster.authority_for(&partition));
+                            if let Some(dlq_partition) = dlq_partition {
+                                route.install_dlq_authority(cluster.authority_for(&dlq_partition));
+                            }
                         }
                     }
                 });
@@ -512,6 +521,7 @@ async fn main() -> io::Result<()> {
             tokio::spawn(migration::run_coordinator(
                 driver,
                 route_slot.clone(),
+                q1,
                 cluster.node.get(),
                 target_request,
             ));

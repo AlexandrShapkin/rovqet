@@ -27,6 +27,17 @@ pub struct DlqOptions {
     pub max_producers: usize,
     pub max_outcomes: usize,
 }
+
+/// The durable identity of the dependent partition of a route.
+///
+/// The identity is read from the verified configuration of the dependent actor, never
+/// invented: a migration commits exactly this partition, this incarnation and this epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DlqIdentity {
+    pub partition: PartitionRef,
+    pub incarnation: u128,
+    pub owner_epoch: u64,
+}
 #[derive(Debug, Clone)]
 pub struct Options {
     pub directory: PathBuf,
@@ -230,6 +241,43 @@ impl DlqRoute {
             partition: self.options.partition,
             incarnation: self.options.incarnation,
         }
+    }
+
+    /// Proves that one committed destination record exists with the expected identity.
+    ///
+    /// The asynchronous form never blocks a runtime worker: it is used by the migration
+    /// coordinator, which verifies the terminal references of the bundle from an async
+    /// task. The blocking trait method below stays available for the source actor, which
+    /// runs on its own thread.
+    async fn verify_async(
+        &self,
+        offset: rovqet_core::DurableOffset,
+        disposition_id: u128,
+        original_message_id: u128,
+    ) -> std::result::Result<bool, rovqet_durable::DlqError> {
+        let batch = self
+            .partition
+            .try_replay(rovqet_durable::ReplayRequest {
+                partition: self.options.partition,
+                from: offset,
+                max_messages: 1,
+                max_bytes: 64 * 1024,
+                wait: Duration::ZERO,
+            })
+            .map_err(|_| rovqet_durable::DlqError::Unavailable)?
+            .wait_async()
+            .await
+            .map_err(|_| rovqet_durable::DlqError::Unavailable)?;
+        let Some(message) = batch.messages.first() else {
+            return Ok(false);
+        };
+        if message.offset != offset || message.message_id != disposition_id {
+            return Ok(false);
+        }
+        let metadata = rovqet_durable::parse_dlq_payload(&message.payload)
+            .map_err(|_| rovqet_durable::DlqError::Corruption("DLQ payload"))?;
+        Ok(metadata.disposition_id == disposition_id
+            && metadata.original_message_id == original_message_id)
     }
 }
 impl rovqet_durable::DlqPublisher for DlqRoute {
@@ -509,6 +557,98 @@ impl Route {
     /// refuse durable mutations until a newer authority is installed.
     pub fn install_authority(&self, authority: Option<rovqet_durable::Authority>) {
         let _ = self.partition.set_authority(authority);
+    }
+    /// Installs the committed ownership authority of the dependent (DLQ) partition.
+    ///
+    /// The DLQ is a separate durability domain with its own actor: it keeps its own fence,
+    /// its own epoch and its own log. Installing the source authority never grants authority
+    /// over the DLQ.
+    pub fn install_dlq_authority(&self, authority: Option<rovqet_durable::Authority>) {
+        if let Some(dlq) = &self.dlq {
+            let _ = dlq.partition.set_authority(authority);
+        }
+    }
+    /// The durable identity of the dependent partition, when this route owns one.
+    pub fn dlq_identity(&self) -> Option<DlqIdentity> {
+        self.dlq.as_ref().map(|dlq| DlqIdentity {
+            partition: dlq.options.partition,
+            incarnation: dlq.options.incarnation,
+            owner_epoch: dlq.options.owner_epoch,
+        })
+    }
+    /// The durable directory of the dependent partition, when this route owns one.
+    pub fn dlq_directory(&self) -> Option<&std::path::Path> {
+        self.dlq.as_ref().map(|dlq| dlq.options.directory.as_path())
+    }
+    /// The committed position of the dependent log.
+    pub fn dlq_committed_count(&self) -> Option<u64> {
+        self.dlq.as_ref().map(|dlq| dlq.partition.committed_count())
+    }
+    /// The currently installed authority of the dependent partition.
+    ///
+    /// The dependent actor owns its fence state; this reports the configured epoch that the
+    /// coordinator validates against the committed dependency placement.
+    pub fn dlq_configured_authority(&self) -> Option<(u64, u128)> {
+        self.dlq
+            .as_ref()
+            .map(|dlq| (dlq.options.owner_epoch, dlq.options.incarnation))
+    }
+    /// Proves that one committed terminal reference exists in the dependent log with exactly
+    /// the recorded identity. This is the read-only half of the terminal contract.
+    pub async fn verify_dlq_reference(
+        &self,
+        reference: &rovqet_durable::TerminalReference,
+    ) -> Result<bool, rovqet_durable::Error> {
+        let Some(dlq) = &self.dlq else {
+            return Ok(false);
+        };
+        dlq.verify_async(
+            rovqet_core::DurableOffset {
+                log_incarnation: reference.destination_incarnation,
+                sequence: reference.destination_offset,
+            },
+            reference.disposition_id,
+            reference.original_message_id,
+        )
+        .await
+        .map_err(|_| rovqet_durable::Error::DlqUnavailable)
+    }
+    /// Establishes the bundle quiescence barrier of this route.
+    ///
+    /// The barrier is ordered with every durable mutation of the source actor, so an
+    /// admitted terminal transaction either completed or left its durable PENDING record.
+    /// After the barrier nothing crosses to the dependent log.
+    pub async fn quiesce_terminal(
+        &self,
+    ) -> Result<rovqet_durable::TerminalQuiesce, rovqet_durable::Error> {
+        self.partition.quiesce_terminal().await
+    }
+    /// The committed terminal references of this partition.
+    pub async fn terminal_references(
+        &self,
+    ) -> Result<Vec<rovqet_durable::TerminalReference>, rovqet_durable::Error> {
+        self.partition.terminal_references().await
+    }
+    /// Durably revokes the write authority of the dependent partition.
+    ///
+    /// The proof exists only after the fence record of the dependent log is durable, and it
+    /// is bound to the migration and to the dependent ownership epoch.
+    pub async fn fence_dlq_old_owner(
+        &self,
+        migration_id: u128,
+        old_epoch: u64,
+        next_epoch: u64,
+    ) -> Result<rovqet_durable::FenceProof, rovqet_durable::Error> {
+        let Some(dlq) = &self.dlq else {
+            return Err(rovqet_durable::Error::DlqUnavailable);
+        };
+        dlq.partition
+            .fence_old_owner_async(migration_id, old_epoch, next_epoch)
+            .await
+    }
+    /// The authority the dependent partition was opened with.
+    pub fn dlq_configured_epoch(&self) -> Option<u64> {
+        self.dlq.as_ref().map(|dlq| dlq.options.owner_epoch)
     }
     /// Durably revokes the write authority of this partition.
     ///
@@ -1227,6 +1367,9 @@ fn map_group_error(error: rovqet_durable::GroupError) -> ErrorCode {
             ErrorCode::ReplayNotAvailable
         }
         Unavailable | Storage(_) | Corruption(_) => ErrorCode::StorageUnavailable,
+        // A handover quiesced the terminal path: the offer is refused and stays with the
+        // consumer as undeliverable now, never silently closed.
+        Quiesced => ErrorCode::AckNotCommitted,
     }
 }
 fn map_error(error: DurableError) -> ErrorCode {

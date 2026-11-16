@@ -257,3 +257,113 @@ fn a_repeated_bundle_command_is_idempotent() {
         &state.apply(&advance(MigrationStage::CatchUp, vec![conflicting],))
     ));
 }
+
+#[test]
+fn a_dependency_of_another_owner_is_refused() {
+    // A bundle may only move a dependent partition that the same source owns: committing a
+    // foreign placement would steal an unrelated partition at the activation.
+    let mut state = state();
+    assert!(matches!(
+        state.apply(&placement(9, 2, 7)),
+        MetadataCommandResponse::Applied { .. }
+    ));
+    assert!(
+        rejected(&state.apply(&begin())),
+        "a dependency owned by another node must be refused"
+    );
+    assert_eq!(state.placement(1, 3, 9).expect("dlq").owner, 2);
+}
+
+#[test]
+fn a_dependency_without_a_committed_placement_is_refused() {
+    let mut state = MetadataState::default();
+    for command in [node(1), node(2), placement(0, 1, 7)] {
+        assert!(!rejected(&state.apply(&command)));
+    }
+    assert!(
+        rejected(&state.apply(&begin())),
+        "a dependency without a committed placement must be refused"
+    );
+    assert!(state.migrations.is_empty());
+}
+
+#[test]
+fn a_duplicated_dependency_is_refused() {
+    let mut state = state();
+    let mut command = begin();
+    if let MetadataCommand::BeginMigration {
+        dependent_partitions,
+        ..
+    } = &mut command
+    {
+        let first = dependent_partitions[0].clone();
+        dependent_partitions.push(first);
+    }
+    assert!(
+        rejected(&state.apply(&command)),
+        "the same dependent partition twice is not a bundle"
+    );
+}
+
+#[test]
+fn a_fence_of_a_foreign_dependent_incarnation_is_refused() {
+    let mut state = state();
+    assert!(!rejected(&state.apply(&begin())));
+    assert!(!rejected(&state.apply(&advance(
+        MigrationStage::CatchUp,
+        vec![evidence(true, true)],
+    ))));
+    let mut foreign = evidence(true, true);
+    foreign.incarnation = 44;
+    let response = state.apply(&advance(MigrationStage::FenceOld, vec![foreign]));
+    assert!(
+        rejected(&response),
+        "evidence of another dependent incarnation must be refused: {response:?}"
+    );
+    assert_eq!(state.placement(1, 3, 9).expect("dlq").owner, 1);
+}
+
+#[test]
+fn a_stale_dependent_ownership_epoch_is_refused() {
+    let mut state = state();
+    assert!(!rejected(&state.apply(&begin())));
+    assert!(!rejected(&state.apply(&advance(
+        MigrationStage::CatchUp,
+        vec![evidence(true, true)],
+    ))));
+    // The committed dependent epoch is 7: evidence of epoch 6 is stale, and evidence of
+    // epoch 8 is not the epoch the old owner holds.
+    for stale in [6u64, 8] {
+        let mut foreign = evidence(true, true);
+        foreign.original_epoch = stale;
+        foreign.fence_proof = Some(proof(stale));
+        assert!(
+            rejected(&state.apply(&advance(MigrationStage::FenceOld, vec![foreign]))),
+            "evidence of dependent epoch {stale} must be refused"
+        );
+    }
+    assert_eq!(state.placement(1, 3, 9).expect("dlq").owner, 1);
+}
+
+#[test]
+fn an_activation_without_the_dependent_manifest_is_refused() {
+    let mut state = state();
+    assert!(!rejected(&state.apply(&begin())));
+    assert!(!rejected(&state.apply(&advance(
+        MigrationStage::CatchUp,
+        vec![evidence(true, true)],
+    ))));
+    assert!(!rejected(&state.apply(&advance(
+        MigrationStage::FenceOld,
+        vec![evidence(true, true)],
+    ))));
+    let mut unverified = evidence(true, true);
+    unverified.manifest_id = None;
+    let response = state.apply(&advance(MigrationStage::ActivateNew, vec![unverified]));
+    assert!(
+        rejected(&response),
+        "an activation without the dependent manifest must be refused: {response:?}"
+    );
+    assert_eq!(state.placement(1, 3, 0).expect("source").owner, 1);
+    assert_eq!(state.placement(1, 3, 9).expect("dlq").owner, 1);
+}

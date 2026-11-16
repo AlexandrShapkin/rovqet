@@ -219,6 +219,47 @@ impl MetadataState {
                 if placement.ownership_epoch != *original_epoch {
                     return rejected("stale expected ownership epoch");
                 }
+                // A dependency is a real committed partition of its own: it needs an
+                // incarnation, a durable class, a distinct identity and a committed
+                // placement that the same source owns. A fabricated dependency would move
+                // an unrelated partition at the activation.
+                let mut seen: Vec<(u64, u64, u32)> = Vec::new();
+                for dependency in dependent_partitions {
+                    if dependency.incarnation == 0 {
+                        return rejected("a dependent partition needs an incarnation");
+                    }
+                    if dependency.durable_class != 1 {
+                        return rejected("a dependent partition must be locally durable");
+                    }
+                    if dependency.tenant_id == *tenant_id
+                        && dependency.topic_id == *topic_id
+                        && dependency.partition_id == *partition_id
+                    {
+                        return rejected("a partition cannot depend on itself");
+                    }
+                    if seen.contains(&(
+                        dependency.tenant_id,
+                        dependency.topic_id,
+                        dependency.partition_id,
+                    )) {
+                        return rejected("a dependent partition is declared twice");
+                    }
+                    seen.push((
+                        dependency.tenant_id,
+                        dependency.topic_id,
+                        dependency.partition_id,
+                    ));
+                    let Some(dependent) = self.placement(
+                        dependency.tenant_id,
+                        dependency.topic_id,
+                        dependency.partition_id,
+                    ) else {
+                        return rejected("the dependent partition has no committed placement");
+                    };
+                    if dependent.owner != *source_node {
+                        return rejected("the dependent partition is not owned by the source");
+                    }
+                }
                 // One migration per partition at a time.
                 for existing in self.migrations.values() {
                     if existing.tenant_id != *tenant_id
@@ -344,6 +385,35 @@ impl MetadataState {
                                     "the bundle is missing the evidence of a dependent partition",
                                 );
                             };
+                            if evidence.incarnation != dependency.incarnation {
+                                return rejected(
+                                    "the bundle evidence names another dependent incarnation",
+                                );
+                            }
+                            if evidence.next_epoch <= evidence.original_epoch {
+                                return rejected(
+                                    "the bundle evidence carries an invalid dependent epoch",
+                                );
+                            }
+                            let Some(committed) = self.placement(
+                                dependency.tenant_id,
+                                dependency.topic_id,
+                                dependency.partition_id,
+                            ) else {
+                                return rejected(
+                                    "the dependent partition lost its committed placement",
+                                );
+                            };
+                            if evidence.original_epoch != committed.ownership_epoch {
+                                return rejected(
+                                    "the bundle evidence carries a stale dependent epoch",
+                                );
+                            }
+                            if committed.owner != current.source_node {
+                                return rejected(
+                                    "the dependent partition is no longer owned by the source",
+                                );
+                            }
                             let Some(dependent_proof) = &evidence.fence_proof else {
                                 return rejected(
                                     "the bundle is missing the fence of a dependent partition",
@@ -392,6 +462,30 @@ impl MetadataState {
                                     "activation without the committed fence of a dependent partition",
                                 );
                             }
+                            if evidence.incarnation != dependency.incarnation {
+                                return rejected(
+                                    "activation with evidence of another dependent incarnation",
+                                );
+                            }
+                            if evidence.next_epoch <= evidence.original_epoch {
+                                return rejected(
+                                    "activation with an invalid dependent ownership epoch",
+                                );
+                            }
+                            let Some(placement) = self.placement(
+                                dependency.tenant_id,
+                                dependency.topic_id,
+                                dependency.partition_id,
+                            ) else {
+                                return rejected(
+                                    "activation of a dependent partition without a placement",
+                                );
+                            };
+                            if evidence.original_epoch != placement.ownership_epoch {
+                                return rejected(
+                                    "activation with a stale dependent ownership epoch",
+                                );
+                            }
                             if evidence.fence_proof.is_none() {
                                 return rejected(
                                     "activation without the fence of a dependent partition",
@@ -400,6 +494,11 @@ impl MetadataState {
                             if evidence.transfer_watermark.is_none() {
                                 return rejected(
                                     "activation without the verified transfer of a dependent partition",
+                                );
+                            }
+                            if evidence.manifest_id.is_none() {
+                                return rejected(
+                                    "activation without the verified manifest of a dependent partition",
                                 );
                             }
                             if !evidence.ready {

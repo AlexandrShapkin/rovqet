@@ -96,6 +96,8 @@ pub enum GroupError {
     Storage(rovqet_wal::Error),
     Corruption(&'static str),
     Unavailable,
+    /// The bundle quiescence barrier of a handover refuses new terminal operations.
+    Quiesced,
 }
 impl fmt::Display for GroupError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -674,6 +676,13 @@ impl State {
                                 terminal.dlq_offset,
                                 terminal.original_message_id,
                             ));
+                            self.terminal_references.push(TerminalReference {
+                                disposition_id: terminal.disposition_id,
+                                destination_incarnation: terminal.dlq_incarnation,
+                                destination_offset: terminal.dlq_offset,
+                                original_message_id: terminal.original_message_id,
+                                source_offset: terminal.source_offset,
+                            });
                         }
                         group.pending.remove(&terminal.source_offset);
                         group
@@ -1263,6 +1272,12 @@ impl State {
         if self.unhealthy {
             return Err(GroupError::Unavailable);
         }
+        // The bundle quiescence barrier: a handover in progress refuses new retry and
+        // terminal transitions, so the dependent destination cannot be written after the
+        // bundle fence.
+        if self.terminal_quiesced {
+            return Err(GroupError::Quiesced);
+        }
         // Fencing: retries and terminal transitions are fenced too.
         self.check_authority()
             .map_err(|_| GroupError::StaleGeneration)?;
@@ -1378,6 +1393,9 @@ impl State {
         // Fencing: a terminal disposition is a durable mutation as well.
         self.check_authority()
             .map_err(|_| GroupError::StaleGeneration)?;
+        if self.terminal_quiesced {
+            return Err(GroupError::Quiesced);
+        }
         let kind = match self.config.group.terminal_policy {
             TerminalPolicy::None => return Err(GroupError::InvalidRequest),
             TerminalPolicy::Quarantine => TerminalKind::Quarantine,
@@ -1567,6 +1585,15 @@ impl State {
             dlq_offset,
         };
         self.append_terminal_record(record, true)?;
+        if pending.kind == TerminalKind::Dlq {
+            self.terminal_references.push(TerminalReference {
+                disposition_id: pending.disposition_id,
+                destination_incarnation: dlq_incarnation,
+                destination_offset: dlq_offset,
+                original_message_id: pending.original_message_id,
+                source_offset: offset,
+            });
+        }
         let group = self.groups.get_mut(&group_id).unwrap();
         group.pending.remove(&offset);
         group.retries.remove(&offset);
@@ -1581,6 +1608,11 @@ impl State {
     }
     pub(super) fn resume_pending_terminal(&mut self) {
         if self.pending_terminal.is_empty() || self.unhealthy {
+            return;
+        }
+        // A quiesced or fenced owner never publishes a dependent record again: the pending
+        // disposition keeps its durable PENDING record for the successor's recovery.
+        if self.terminal_quiesced || self.fenced.is_some() {
             return;
         }
         let now = Instant::now();
@@ -1601,6 +1633,12 @@ impl State {
         }
     }
     pub(super) fn reconcile_recovered_terminal(&mut self) -> Result<()> {
+        // A fenced owner must not complete a pending disposition after the handover: the
+        // dependent destination already belongs to the successor. The pending record is
+        // preserved and the successor resumes it against its own destination.
+        if self.fenced.is_some() || self.terminal_quiesced {
+            return self.verify_recovered_dlq_commits();
+        }
         let pending: Vec<(u64, u64, PendingTerminal)> = self
             .pending_terminal
             .iter()
@@ -1616,6 +1654,12 @@ impl State {
                     _ => Error::Corruption("terminal recovery"),
                 })?;
         }
+        self.verify_recovered_dlq_commits()
+    }
+
+    /// Proves that every committed DLQ terminal reference of the recovered history exists in
+    /// the destination exactly as it was recorded.
+    fn verify_recovered_dlq_commits(&self) -> Result<()> {
         if self.recovered_dlq_commits.is_empty() {
             return Ok(());
         }
@@ -1636,5 +1680,27 @@ impl State {
             }
         }
         Ok(())
+    }
+
+    /// Establishes the bundle quiescence barrier in front of a coordinated handover.
+    ///
+    /// The barrier is a command of the serialized actor, so every durable terminal
+    /// transaction that was admitted before it has already run to completion (or left its
+    /// durable PENDING record) and every one after it is refused. The watermark is the
+    /// committed position at the barrier and cannot move afterwards.
+    pub(super) fn quiesce_terminal(&mut self) -> Result<TerminalQuiesce> {
+        if self.unhealthy {
+            return Err(Error::Unavailable);
+        }
+        self.terminal_quiesced = true;
+        Ok(TerminalQuiesce {
+            watermark: self.next,
+            pending: self.pending_terminal.len(),
+        })
+    }
+
+    /// The durable terminal references of this partition.
+    pub(super) fn terminal_audit(&self) -> Result<Vec<TerminalReference>> {
+        Ok(self.terminal_references.clone())
     }
 }
