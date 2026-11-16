@@ -1,6 +1,6 @@
 {
   "schema": "rovqet-migration-crash-v1",
-  "executed": 7,
+  "executed": 8,
   "verdicts": [
     {
       "scenario": "C1-before-fence",
@@ -40,6 +40,13 @@
     {
       "scenario": "C6-after-route-open",
       "barrier": "after_route_open",
+      "verdict": "PASS",
+      "reasons": [],
+      "barrier_reached": true
+    },
+    {
+      "scenario": "C8-bundle-after-dependent-promotion",
+      "barrier": "after_dependent_promotion",
       "verdict": "PASS",
       "reasons": [],
       "barrier_reached": true

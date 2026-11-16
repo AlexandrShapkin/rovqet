@@ -10,6 +10,7 @@ truncated line or missing required observation is INVALID; it is never a pass.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -20,6 +21,11 @@ FAIL = "FAIL"
 INVALID = "INVALID"
 NOT_RUN = "NOT_RUN"
 SCHEMA = "rovqet-q1-oracle-v1"
+
+
+def digest_hex(value: bytes) -> str:
+    """The payload digest used by every observation of this oracle."""
+    return hashlib.sha256(value).hexdigest()
 
 
 class JournalError(Exception):
@@ -554,3 +560,305 @@ def reconcile_migration(records: list[dict], *, require_conclusion: bool = True)
     }
     verdict = FAIL if reasons else PASS
     return _result(verdict, reasons, counts)
+
+
+def reconcile_bundle(records: list[dict], *, require_conclusion: bool = True) -> dict:
+    """Reconciles a coordinated source-plus-DLQ handover journal.
+
+    The journal is written by the parent harness from externally received results only: the
+    publisher's committed offsets, the consumer's terminal outcomes, the externally read
+    source and DLQ records before and after the handover, and the committed transitions the
+    brokers reported. A contradiction is INVALID, a broken safety invariant is FAIL and a
+    journal without bundle evidence is NOT_RUN. Nothing is inferred from a clock or from a
+    broker's own claim that a stage completed.
+    """
+    reasons: list[str] = []
+    if require_conclusion and (not records or records[-1]["event"] != "conclusion"):
+        return _result(INVALID, ["missing conclusion"], {})
+
+    begins = [r for r in records if r["event"] == "migration_begin"]
+    stages = [r for r in records if r["event"] == "migration_stage"]
+    activations = [r for r in records if r["event"] == "activation"]
+    fences = [r for r in records if r["event"] == "fence_confirmed"]
+    inventories = [r for r in records if r["event"] == "bundle_inventory"]
+    promotions = [r for r in records if r["event"] == "bundle_promotion"]
+    quiesced = [r for r in records if r["event"] == "bundle_quiesced"]
+    proofs = [r for r in records if r["event"] == "dlq_proof"]
+    publications = [r for r in records if r["event"] == "dlq_publication"]
+    terminals = [r for r in records if r["event"] == "terminal_committed"]
+    recovered = [r for r in records if r["event"] == "recovered_record"]
+    commits = [r for r in records if r["event"] == "publication_committed"]
+    successor = [r for r in records if r["event"] == "successor_active"]
+    restarts = [r for r in records if r["event"] == "successor_restarted"]
+
+    if not begins and not activations:
+        return _result(NOT_RUN, ["no bundle migration evidence"], {})
+
+    identifiers = {
+        str(r.get("migration_id"))
+        for r in begins + stages + fences + activations + inventories
+        + promotions + proofs + quiesced
+        if r.get("migration_id") is not None
+    }
+    if not identifiers:
+        reasons.append("bundle evidence without a migration id")
+    if len(identifiers) > 1:
+        reasons.append(f"conflicting migration ids: {sorted(identifiers)}")
+    migration_id = next(iter(identifiers), None)
+
+    # 1. The parent identifier must be bound to both partitions.
+    if begins:
+        begin = begins[0]
+        if not begin.get("dependent_partition"):
+            reasons.append("the bundle has no dependent partition identity")
+        if begin.get("dependent_incarnation") in (None, 0):
+            reasons.append("the bundle has no dependent incarnation")
+        if begin.get("incarnation") in (None, 0):
+            reasons.append("the bundle has no source incarnation")
+        if begin.get("dependent_partition") == begin.get("partition"):
+            reasons.append("the dependency is the source partition itself")
+
+    # 2. The committed stages may neither skip nor move backwards.
+    order: list[tuple[int, str]] = []
+    for record in stages:
+        stage = record.get("stage")
+        if stage not in MIGRATION_STAGES:
+            reasons.append(f"unknown migration stage {stage}")
+            continue
+        order.append((MIGRATION_STAGES.index(stage), stage))
+    for previous, current in zip(order, order[1:]):
+        if current[0] < previous[0]:
+            reasons.append(f"migration stage moved back from {previous[1]} to {current[1]}")
+        elif current[0] > previous[0] + 1:
+            reasons.append(f"migration stage jumped from {previous[1]} to {current[1]}")
+    if order and order[-1][1] != "activate_new":
+        reasons.append(f"the migration never activated: last stage {order[-1][1]}")
+
+    # 3. Both members must be fenced durably before the activation.
+    fence_members = {fence.get("member") for fence in fences}
+    if activations and fence_members != {"source", "dependent"}:
+        reasons.append(
+            f"the activation needs the fence of both members, observed {sorted(fence_members)}"
+        )
+    for fence in fences:
+        if fence.get("node") != (begins[0]["source"] if begins else fence.get("node")):
+            reasons.append(f"the {fence.get('member')} fence was not produced by the source")
+        if fence.get("fence_digest") in (None, ""):
+            reasons.append(f"the {fence.get('member')} fence has no durable digest")
+        if fence.get("fence_offset") is None:
+            reasons.append(f"the {fence.get('member')} fence has no durable offset")
+    if activations and fences:
+        activation_seq = activations[0]["seq"]
+        for fence in fences:
+            if fence["seq"] > activation_seq:
+                reasons.append(
+                    f"the {fence.get('member')} fence follows the activation"
+                )
+
+    # 4. Two independently identified inventories, both finally verified.
+    by_member: dict[str, list[dict]] = {}
+    for inventory in inventories:
+        by_member.setdefault(inventory.get("member", "?"), []).append(inventory)
+        if inventory.get("manifest_id") in (None, ""):
+            reasons.append(f"the {inventory.get('member')} inventory has no identity")
+        if inventory.get("watermark") is None:
+            reasons.append(f"the {inventory.get('member')} inventory has no watermark")
+    if inventories and set(by_member) != {"source", "dependent"}:
+        reasons.append(f"both inventories must be transferred: {sorted(by_member)}")
+    source_final = [i for i in by_member.get("source", []) if i.get("phase") == "final"]
+    dependent_final = [
+        i for i in by_member.get("dependent", []) if i.get("phase") == "final"
+    ]
+    if inventories and (not source_final or not dependent_final):
+        reasons.append("both members need a final verified inventory")
+    if source_final and dependent_final:
+        if source_final[-1]["manifest_id"] == dependent_final[-1]["manifest_id"]:
+            reasons.append("the two bundle inventories share one identity")
+
+    # 5. The activation carries both final identities, both fences and readiness.
+    if activations:
+        activation = activations[0]
+        if activation.get("target_ready") is not True:
+            reasons.append("the activation has no target readiness evidence")
+        if activation.get("transfer_watermark") is None:
+            reasons.append("the activation has no source transfer watermark")
+        if activation.get("dependent_transfer_watermark") is None:
+            reasons.append("the activation has no dependent transfer watermark")
+        for field in ("fence_offset", "fence_digest"):
+            if activation.get(field) in (None, ""):
+                reasons.append(f"the activation has no source {field}")
+        for field in ("dependent_fence_offset", "dependent_fence_digest"):
+            if activation.get(field) in (None, ""):
+                reasons.append(f"the activation has no dependent {field}")
+        if source_final and activation.get("manifest_id") != source_final[-1]["manifest_id"]:
+            reasons.append("the activation names another source inventory")
+        if dependent_final and (
+            activation.get("dependent_manifest_id") != dependent_final[-1]["manifest_id"]
+        ):
+            reasons.append("the activation names another dependent inventory")
+        if dependent_final and (
+            activation.get("dependent_transfer_watermark")
+            != dependent_final[-1]["watermark"]
+        ):
+            reasons.append("the dependent activation watermark is not the verified one")
+
+    # 6. The quiescence barrier precedes both fences and reports its accounting.
+    if quiesced:
+        if fences and quiesced[0]["seq"] > min(fence["seq"] for fence in fences):
+            reasons.append("a fence precedes the bundle quiescence barrier")
+        if quiesced[0].get("source_watermark") is None:
+            reasons.append("the quiescence barrier reports no watermark")
+    elif fences:
+        reasons.append("the bundle was fenced without a quiescence barrier")
+
+    # 7. The terminal disposition: one publication, one committed proof, one destination.
+    ids = [record["disposition_id"] for record in publications]
+    if len(ids) != len(set(ids)):
+        reasons.append(f"duplicate DLQ publications: {ids}")
+    dlq_by_identity: dict[tuple, dict] = {}
+    for record in recovered:
+        if record.get("partition") != "dependent":
+            continue
+        key = (record.get("incarnation"), record.get("offset"))
+        if key in dlq_by_identity and (
+            dlq_by_identity[key]["message_id"] != record.get("message_id")
+            or dlq_by_identity[key]["digest"] != record.get("digest")
+        ):
+            reasons.append(f"the recovered DLQ record {key} changed")
+        dlq_by_identity[key] = record
+    for terminal in terminals:
+        if terminal.get("kind") != "dlq":
+            continue
+        prior = [
+            item for item in publications
+            if item["disposition_id"] == terminal["disposition_id"]
+            and item["seq"] < terminal["seq"]
+        ]
+        if not prior:
+            reasons.append(
+                f"DLQ terminal {terminal['disposition_id']} has no prior publication"
+            )
+        else:
+            destination = prior[-1]
+            if (
+                destination.get("incarnation") != terminal.get("dlq_incarnation")
+                or destination.get("offset") != terminal.get("dlq_offset")
+            ):
+                reasons.append(
+                    f"the terminal proof of {terminal['disposition_id']} does not match "
+                    "its publication"
+                )
+            if destination.get("digest") != terminal.get("payload_digest"):
+                reasons.append(
+                    f"the terminal proof of {terminal['disposition_id']} carries another digest"
+                )
+    for proof in proofs:
+        if proof.get("verified") is not True:
+            reasons.append(
+                f"the DLQ proof of {proof.get('partition')} is not verified"
+            )
+        if terminals and proof.get("disposition_id") != terminals[0].get("disposition_id"):
+            reasons.append("the dependent proof names another disposition")
+        if terminals and proof.get("dlq_offset") != terminals[0].get("dlq_offset"):
+            reasons.append("the dependent proof names another destination offset")
+    if terminals and not proofs:
+        reasons.append("the committed disposition has no dependent proof")
+
+    # 8. The successor may only become active after both promotions completed.
+    for active in successor:
+        prior = [p for p in promotions if p["seq"] < active["seq"]]
+        if not prior:
+            reasons.append("the successor became active before any promotion evidence")
+        elif not (prior[-1].get("dependent_promoted") and prior[-1].get("source_promoted")):
+            reasons.append("the successor became active before both promotions completed")
+        if not restarts:
+            pass
+    if promotions and not successor:
+        reasons.append("the bundle promoted the storage but the successor never activated")
+
+    # 9. The successor serves exactly the observed source records and DLQ record.
+    expected_dlq = {record["disposition_id"]: record for record in publications}
+    served_dlq = [
+        record for record in recovered
+        if record.get("partition") == "dependent" and not record.get("restart")
+    ]
+    if expected_dlq:
+        if not served_dlq:
+            reasons.append("the successor never served the dependent record")
+        else:
+            served = served_dlq[0]
+            published = expected_dlq.get(served["message_id"])
+            if published is None:
+                reasons.append(
+                    f"the successor served an unknown disposition {served['message_id']}"
+                )
+            elif (
+                published.get("incarnation") != served.get("incarnation")
+                or published.get("offset") != served.get("offset")
+                or published.get("digest") != served.get("digest")
+            ):
+                reasons.append("the recovered dependent record changed identity")
+    for record in recovered:
+        if record.get("partition") != "source":
+            continue
+        acknowledged = [
+            commit for commit in commits
+            if commit.get("offset") == record.get("offset")
+            and commit.get("message_id") == record.get("message_id")
+        ]
+        if not acknowledged:
+            reasons.append(
+                f"the recovered source record {record.get('offset')} has no observed commit"
+            )
+        elif acknowledged[0].get("digest") != record.get("digest"):
+            reasons.append(
+                f"the payload digest of source offset {record.get('offset')} changed"
+            )
+
+    # 10. No dual owner: the old owner never commits after its fence.
+    source_fence_seq = None
+    if fences:
+        source_fences = [fence for fence in fences if fence.get("member") == "source"]
+        if source_fences:
+            source_fence_seq = min(fence["seq"] for fence in source_fences)
+    if source_fence_seq is not None and begins:
+        source_node = begins[0]["source"]
+        for commit in commits:
+            if commit.get("node") == source_node and commit["seq"] > source_fence_seq:
+                reasons.append(
+                    f"the old owner committed at seq {commit['seq']} after its fence"
+                )
+
+    # 11. One producer token keeps one offset and one message identity.
+    outcomes: dict[tuple, dict] = {}
+    for commit in commits:
+        key = (commit.get("producer"), commit.get("epoch"), commit.get("sequence"))
+        previous = outcomes.get(key)
+        if previous is None:
+            outcomes[key] = commit
+            continue
+        if previous.get("offset") != commit.get("offset"):
+            reasons.append(f"the producer token {key} changed its offset")
+        if previous.get("message_id") != commit.get("message_id"):
+            reasons.append(f"the producer token {key} changed its message identity")
+
+    # 12. A terminal lookup never publishes a second dependent message.
+    for lookup in (r for r in records if r["event"] == "terminal_lookup"):
+        if lookup.get("dlq_records") not in (1, None):
+            reasons.append(
+                f"a terminal lookup left {lookup.get('dlq_records')} dependent records"
+            )
+
+    counts = {
+        "migration_id": migration_id,
+        "stages": len(stages),
+        "fences": len(fences),
+        "inventories": len(inventories),
+        "promotions": len(promotions),
+        "dlq_publications": len(publications),
+        "dlq_proofs": len(proofs),
+        "terminals": len(terminals),
+        "recovered_records": len(recovered),
+        "restarts": len(restarts),
+    }
+    return _result(FAIL if reasons else PASS, reasons, counts)

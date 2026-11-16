@@ -1,0 +1,17 @@
+{
+  "counts": {
+    "dlq_proofs": 1,
+    "dlq_publications": 1,
+    "fences": 2,
+    "inventories": 4,
+    "migration_id": "212050808214637896123822867096069477401",
+    "promotions": 1,
+    "recovered_records": 8,
+    "restarts": 1,
+    "stages": 3,
+    "terminals": 1
+  },
+  "oracle": "scripts/q1_oracle.py:reconcile_bundle",
+  "reasons": [],
+  "verdict": "PASS"
+}

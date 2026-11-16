@@ -117,8 +117,10 @@ def broker(
     initialize: bool,
     env: dict[str, str] | None = None,
     client_port: int | None = None,
+    bundle: bool = False,
 ) -> Node:
     (root / "q1").mkdir(parents=True, exist_ok=True)
+    (root / "dlq").mkdir(parents=True, exist_ok=True)
     argv = [
         str(SERVER),
         "--listen", f"127.0.0.1:{client_port or free_port()}",
@@ -143,6 +145,20 @@ def broker(
         argv.extend(["--cluster-peer", f"{peer}=127.0.0.1:{port}"])
     for peer, port in raft_ports.items():
         argv.extend(["--metadata-raft-peer", f"{peer}=127.0.0.1:{port}"])
+    if bundle:
+        # A coordinated handover: the route owns a real local DLQ partition.
+        argv.extend([
+            "--q1-terminal-policy", "dlq",
+            "--q1-max-attempts", "1",
+            "--q1-retry-initial-ms", "10",
+            "--q1-retry-max-ms", "50",
+            "--q1-dlq-data-dir", str(root / "dlq"),
+            "--q1-dlq-topic", "durable-dlq",
+            "--q1-dlq-topic-id", "7",
+            "--q1-dlq-partition-id", "0",
+            "--q1-dlq-incarnation", "77",
+            "--q1-dlq-owner-epoch", "7",
+        ])
     if node_id == 1:
         argv.extend(["--migrate-to", "2"])
     return Node(name, argv, root, env)
@@ -158,11 +174,13 @@ def publish(node: Node, sequence: int, epoch: int = 7) -> subprocess.CompletedPr
 
 
 class Scenario:
-    def __init__(self, scenario_id: str, barrier: str, victim: str, invariant: str):
+    def __init__(self, scenario_id: str, barrier: str, victim: str, invariant: str,
+                 bundle: bool = False):
         self.id = scenario_id
         self.barrier = barrier
         self.victim = victim
         self.invariant = invariant
+        self.bundle = bundle
 
 
 SCENARIOS = [
@@ -172,6 +190,11 @@ SCENARIOS = [
     Scenario("C4-promotion-intent", "promotion_intent", "target", "no-partial-activation"),
     Scenario("C5-before-route-open", "before_route_open", "target", "route-recovers"),
     Scenario("C6-after-route-open", "after_route_open", "target", "route-recovers"),
+    # The coordinated bundle: the successor is killed between the dependent promotion and
+    # the source promotion. The source history must stay unavailable until the remaining
+    # promotion completes.
+    Scenario("C8-bundle-after-dependent-promotion", "after_dependent_promotion", "target",
+             "bundle-one-sided-promotion", bundle=True),
 ]
 
 
@@ -181,9 +204,11 @@ def run_scenario(scenario: Scenario) -> dict:
     raft_ports = {1: free_port(), 2: free_port(), 3: free_port()}
     barrier_env = {"ROVQET_MIGRATION_BARRIER": scenario.barrier}
     source = broker("source", 1, root / "source", peer_ports, raft_ports, True,
-                    barrier_env if scenario.victim == "source" else None)
+                    barrier_env if scenario.victim == "source" else None,
+                    bundle=scenario.bundle)
     target = broker("target", 2, root / "target", peer_ports, raft_ports, False,
-                    barrier_env if scenario.victim == "target" else None)
+                    barrier_env if scenario.victim == "target" else None,
+                    bundle=scenario.bundle)
     voter = Node(
         "voter3",
         [str(VOTER), "--id", "3", "--cluster-id", str(CLUSTER),
@@ -253,6 +278,26 @@ def run_scenario(scenario: Scenario) -> dict:
             refused = target.wait_for("the promoted storage was refused", 10)
             if active is None and refused is None:
                 result["reasons"].append("the target neither recovered nor refused the promotion")
+                return result
+            result["verdict"] = "PASS"
+        elif scenario.invariant == "bundle-one-sided-promotion":
+            # The successor was killed between the two promotions. It must not serve the
+            # source partition before the remaining promotion completed, and it must
+            # recover both histories after the restart.
+            source_history = (root / "target" / "q1" / "MANIFEST")
+            dependent_history = (root / "target" / "dlq" / "MANIFEST")
+            if not dependent_history.is_file():
+                result["reasons"].append("the dependent history was not promoted")
+                return result
+            active = target.wait_for("Q1 route active", 120)
+            if active is None:
+                result["reasons"].append("the successor did not recover the bundle")
+                return result
+            if not source_history.is_file():
+                result["reasons"].append("the source history was not promoted")
+                return result
+            if target.wait_for("Q1 DLQ route active", 10) is None:
+                result["reasons"].append("the dependent history was not reopened")
                 return result
             result["verdict"] = "PASS"
         elif scenario.invariant == "route-recovers":

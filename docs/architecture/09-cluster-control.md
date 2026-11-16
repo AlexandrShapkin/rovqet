@@ -127,3 +127,48 @@ committed transition that starts this protocol; the C-01 static fixture is only 
 development authority source. A Raft election alone still proves no revocation: the old
 owner keeps its authority until its lease validity interval ends, so a committed placement
 revision does not by itself activate a replacement owner.
+
+## Coordinated bundle handover (source plus local DLQ)
+
+A Q1 partition whose terminal policy is DLQ owns a second local Q1 partition. That DLQ is a
+durable dependency of the source: a terminal disposition publishes a real DLQ message and
+only then commits the source terminal record. The handover therefore moves both histories as
+one bundle and never lets the source become active while the dependency is incomplete.
+
+**Committed identity.** `BeginMigration` carries `dependent_partitions` and
+`AdvanceMigration` carries `dependent_evidence`. The coordinator populates the dependency from
+verified local configuration (the configured DLQ partition and incarnation) and from the
+committed placement of that partition; it never invents a partition, an incarnation or an
+epoch. A dependency that is unconfigured, foreign, declared twice, owned by another node, or
+whose committed epoch is not the installed one is refused before a byte moves.
+
+**Two inventories.** The transfer request carries a bundle member identity, and the staging
+identity is `(migration id, member, inventory digest)`. The source and the DLQ inventories
+therefore have distinct storage identities even when their file lists are identical; a chunk
+of the other member is refused. Both inventories are transferred, verified by the target and
+committed as preliminary evidence in CATCH_UP, and both are transferred again after the
+fences as the final inventories.
+
+**Quiescence before the final fences.** A terminal operation crosses two durability domains,
+so the terminal path is closed first: a serialized actor command blocks new terminal
+transitions, accounts for every admitted one (they either completed or left a durable
+PENDING record) and preserves the unfinished dispositions for the successor's recovery. The
+fences are then ordered explicitly: the source first (it can no longer append at all), the
+DLQ second (nothing can reach it afterwards). A repeated fence of the same handover returns
+the same durable proof, so an interrupted coordination can retry the second fence.
+
+**One activation.** The committed activation carries the source fence, the dependent fence
+evidence, both final watermarks and both final manifest identities, and it moves both
+placements in one entry. Before it is proposed, every committed terminal disposition of DLQ
+kind is proven against the transferred destination record (disposition identity, source
+identity, destination incarnation and offset, original message id, payload digest). A
+manifest alone is never accepted as proof of a terminal destination.
+
+**Paired promotion.** The successor promotes the dependent inventory into its configured DLQ
+directory, then the source inventory, verifying each completed promotion record and recording
+a durable bundle readiness state between the two. The two directory transactions are not
+atomic; the order and the readiness record are what make a crash between them recoverable.
+The recovered DLQ partition is opened first and the source is opened against it, so the
+durable recovery of the source history verifies every committed terminal reference of the
+transferred DLQ. The committed authority of both placements is installed only after that, and
+the route is published last.
