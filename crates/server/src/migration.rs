@@ -199,6 +199,9 @@ impl MigrationDriver {
                     digest: sha256(&data),
                     data,
                 };
+                // The sender announces the chunk before it hands it to the transport: the
+                // parent can kill the sender in the middle of a transfer.
+                crate::barrier::barrier("chunk_before_send");
                 let response = self
                     .transport
                     .call(
@@ -1075,6 +1078,9 @@ async fn prepare_stage(
             true,
         );
     }
+    // The verified inventory is durable on the target, but the stage transition is not
+    // committed yet: a crash here must not fabricate the missing Raft transition.
+    crate::barrier::barrier("before_catch_up_commit");
     let command = MetadataCommand::AdvanceMigration {
         migration_id: record.migration_id,
         stage: MigrationStage::CatchUp,
@@ -1221,6 +1227,9 @@ async fn catch_up_stage(
         report("committed", updated, driver.raft().applied_state().revision);
     }
     // 5. Final catch up: the logs are final now, so both watermarks are stable.
+    // The fences are already durable: a crash here leaves both old partitions fenced and
+    // the target without the final history.
+    crate::barrier::barrier("before_final_transfer");
     let source_watermark = route.committed_count();
     let source = transfer_member(
         driver,

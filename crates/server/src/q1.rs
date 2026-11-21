@@ -483,10 +483,39 @@ impl Route {
                     dedup_window: options.dedup_window,
                     group: rovqet_durable::GroupConfig::default(),
                 };
-                let partition = if dlq_dir.join("MANIFEST").is_file() {
-                    Partition::open_existing(&dlq_dir, dlq_wal, dlq_config)
-                } else {
-                    Partition::open(&dlq_dir, dlq_wal, dlq_config)
+                let partition = {
+                    #[cfg(feature = "fault-injection")]
+                    match dlq_test_control()? {
+                        Some(control) => {
+                            // The dependent partition can be driven into a deterministic
+                            // storage fault, so a pending terminal disposition can be
+                            // observed at the handover boundary.
+                            if dlq_dir.join("MANIFEST").is_file() {
+                                Partition::open_existing_with_test_control(
+                                    &dlq_dir, dlq_wal, dlq_config, control,
+                                )
+                            } else {
+                                Partition::open_with_test_control(
+                                    &dlq_dir, dlq_wal, dlq_config, control,
+                                )
+                            }
+                        }
+                        None => {
+                            if dlq_dir.join("MANIFEST").is_file() {
+                                Partition::open_existing(&dlq_dir, dlq_wal, dlq_config)
+                            } else {
+                                Partition::open(&dlq_dir, dlq_wal, dlq_config)
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "fault-injection"))]
+                    {
+                        if dlq_dir.join("MANIFEST").is_file() {
+                            Partition::open_existing(&dlq_dir, dlq_wal, dlq_config)
+                        } else {
+                            Partition::open(&dlq_dir, dlq_wal, dlq_config)
+                        }
+                    }
                 }
                 .map_err(|e| {
                     io::Error::other(format!("Q1 DLQ recovery failed (history preserved): {e}"))
@@ -1645,6 +1674,44 @@ fn test_control() -> io::Result<Option<rovqet_durable::TestControl>> {
         .parse()
         .map_err(|_| invalid("invalid Q1 test sequence"))?;
     Ok(Some(TestControl {
+        directory: directory.into(),
+        stage,
+        sequence,
+        wal_fault,
+    }))
+}
+
+/// The deterministic storage control of the dependent partition.
+///
+/// It exists only in a build with the fault-injection feature and only when the parent
+/// names a marker directory, so a normal build has no test-only behaviour at all.
+#[cfg(feature = "fault-injection")]
+fn dlq_test_control() -> io::Result<Option<rovqet_durable::TestControl>> {
+    let Some(directory) = std::env::var_os("ROVQET_Q1_DLQ_TEST_DIR") else {
+        return Ok(None);
+    };
+    let stage = match std::env::var("ROVQET_Q1_DLQ_TEST_STAGE").ok().as_deref() {
+        None => None,
+        Some("before-append") => Some(rovqet_durable::TestStage::BeforeAppend),
+        Some("after-append-before-sync") => Some(rovqet_durable::TestStage::AfterAppendBeforeSync),
+        Some("after-sync-before-reply") => Some(rovqet_durable::TestStage::AfterSyncBeforeReply),
+        _ => return Err(invalid("invalid Q1 DLQ test stage")),
+    };
+    let wal_fault = match std::env::var("ROVQET_Q1_DLQ_TEST_WAL_FAULT")
+        .ok()
+        .as_deref()
+    {
+        None => None,
+        Some("append") => Some(rovqet_wal::FaultPoint::Append),
+        Some("partial-append") => Some(rovqet_wal::FaultPoint::PartialAppend),
+        Some("segment-sync") => Some(rovqet_wal::FaultPoint::SegmentSync),
+        _ => return Err(invalid("invalid Q1 DLQ WAL fault")),
+    };
+    let sequence = std::env::var("ROVQET_Q1_DLQ_TEST_SEQUENCE")
+        .unwrap_or_else(|_| "0".into())
+        .parse()
+        .map_err(|_| invalid("invalid Q1 DLQ test sequence"))?;
+    Ok(Some(rovqet_durable::TestControl {
         directory: directory.into(),
         stage,
         sequence,

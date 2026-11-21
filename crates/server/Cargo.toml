@@ -26,7 +26,11 @@ serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 
 [features]
-fault-injection = ["rovqet-durable/fault-injection"]
+# Test-only barriers, storage controls and the directional transport fault.
+fault-injection = [
+    "rovqet-durable/fault-injection",
+    "rovqet-metadata-raft/fault-injection",
+]
 
 [dev-dependencies]
 rovqet-sdk = { path = "../sdk" }

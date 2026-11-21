@@ -12,5 +12,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+[features]
+# Test-only directional transport fault. A normal build compiles the check away.
+fault-injection = []
+
 [dev-dependencies]
 socket2 = "0.6"

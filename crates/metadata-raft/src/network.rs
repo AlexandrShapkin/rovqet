@@ -98,6 +98,11 @@ impl TcpRaftNetwork {
             )));
         }
         let call = async {
+            // A directional fault blackholes this path before the request is written: the
+            // peer never sees it, so the outcome of the remote work is unknown.
+            if rovqet_control::fault::is_blocked(self.target) {
+                return Err(rovqet_control::fault::blocked_error(self.target));
+            }
             let mut stream = TcpStream::connect(self.address).await?;
             let mut frame = Vec::with_capacity(payload.len() + 8);
             frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
@@ -218,10 +223,15 @@ impl RaftNetwork<MetadataRaftTypeConfig> for TcpRaftNetwork {
 /// is returned verbatim.
 pub async fn forward_client_write(
     address: SocketAddr,
+    leader: MetaNodeId,
     command: crate::types::MetadataCommand,
     timeout: Duration,
 ) -> Result<crate::types::MetadataCommandResponse, std::io::Error> {
     let call = async {
+        // A directional fault blackholes the path to the committed leader.
+        if rovqet_control::fault::is_blocked(leader) {
+            return Err(rovqet_control::fault::blocked_error(leader));
+        }
         let mut stream = TcpStream::connect(address).await?;
         let payload = serde_json::to_vec(&RaftRpc::ClientWrite(command))
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;

@@ -2,6 +2,7 @@
 //!
 //! The node exposes the applied metadata state so that the data plane can install a
 //! committed snapshot; the control-plane model of `rovqet-control` is not changed here.
+pub mod barrier;
 pub mod network;
 pub mod sm;
 pub mod storage;
@@ -82,6 +83,8 @@ impl MetadataNode {
         )
         .map_err(|error| MetadataError::Storage(format!("{error:?}")))?;
         let notify = machine.notify();
+        #[cfg(feature = "fault-injection")]
+        let leader_flag = machine.leader_flag();
         let network = RaftNetworkFactoryImpl::new(
             config.peers.clone(),
             Duration::from_millis(config.election_timeout_ms.max(500)),
@@ -99,6 +102,20 @@ impl MetadataNode {
         let raft = Raft::new(config.id, Arc::new(raft_config), network, log, machine)
             .await
             .map_err(|error| MetadataError::Raft(format!("{error:?}")))?;
+        #[cfg(feature = "fault-injection")]
+        {
+            // The fault barrier may only stop the leader: a follower that pauses in the
+            // apply path would hold the whole group back.
+            let raft = raft.clone();
+            let node = config.id;
+            tokio::spawn(async move {
+                loop {
+                    let is_leader = raft.current_leader().await == Some(node);
+                    leader_flag.store(is_leader, std::sync::atomic::Ordering::Release);
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            });
+        }
 
         // Explicit bootstrap: only the designated node initializes the membership and
         // only when the storage is still uninitialized.
@@ -312,6 +329,7 @@ impl MetadataNode {
                 };
                 let response = crate::network::forward_client_write(
                     address,
+                    target,
                     command,
                     std::time::Duration::from_secs(30),
                 )

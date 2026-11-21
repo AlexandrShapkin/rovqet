@@ -120,6 +120,13 @@ impl PeerTransport {
         if !self.peers.contains_key(&target) {
             return Err(TransportError::UnknownPeer);
         }
+        // A directional fault blackholes this path before the request is written: the peer
+        // never sees it, so the remote outcome is unknown rather than refused.
+        if crate::fault::is_blocked(target.get()) {
+            return Err(TransportError::Io(crate::fault::blocked_error(
+                target.get(),
+            )));
+        }
         let _permit = self
             .outstanding
             .clone()

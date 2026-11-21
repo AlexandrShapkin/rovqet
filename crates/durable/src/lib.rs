@@ -256,6 +256,30 @@ impl Partition {
             },
         )
     }
+    /// Opens an already initialized history with a deterministic storage control.
+    ///
+    /// Missing storage is unavailable, never recreated: the control never turns a lost
+    /// history into an empty one.
+    #[cfg(feature = "fault-injection")]
+    pub fn open_existing_with_test_control(
+        path: impl AsRef<Path>,
+        wal_config: WalConfig,
+        config: PartitionConfig,
+        control: TestControl,
+    ) -> Result<Self> {
+        if !path.as_ref().join("MANIFEST").is_file() {
+            return Err(Error::HistoryUnavailable);
+        }
+        Self::open_inner(
+            path,
+            wal_config,
+            config,
+            WorkerOptions {
+                control: Some(control),
+                ..WorkerOptions::default()
+            },
+        )
+    }
     /// Controlled time source for deterministic qualification; no client timestamp is trusted.
     pub fn open_with_clock(
         path: impl AsRef<Path>,

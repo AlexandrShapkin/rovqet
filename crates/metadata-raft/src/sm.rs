@@ -620,6 +620,11 @@ pub struct MetadataStateMachine {
     shared: std::sync::Arc<std::sync::Mutex<MetadataState>>,
     last_applied: Option<LogId<MetaNodeId>>,
     membership: Option<StoredMembership<MetaNodeId, MetaNode>>,
+    /// True while this node believes it is the committed leader.
+    ///
+    /// Only the leader answers a client proposal, so only the leader may stop at a fault
+    /// barrier: a follower that pauses in the apply path would hold the whole group back.
+    leader: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl MetadataStateMachine {
@@ -679,6 +684,7 @@ impl MetadataStateMachine {
             shared,
             last_applied,
             membership,
+            leader: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -696,6 +702,13 @@ impl MetadataStateMachine {
     /// The shared handle of the applied authoritative state.
     pub fn shared_state(&self) -> std::sync::Arc<std::sync::Mutex<MetadataState>> {
         self.shared.clone()
+    }
+
+    /// The flag that records whether this node is the committed leader.
+    ///
+    /// The node updates it; the fault barrier reads it so that only the leader pauses.
+    pub fn leader_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.leader.clone()
     }
 
     /// Notifies subscribers about committed metadata revisions.
@@ -922,6 +935,16 @@ impl RaftStateMachine<MetadataRaftTypeConfig> for MetadataStateMachine {
                 }),
                 EntryPayload::Normal(command) => {
                     let response = self.state.apply(&command);
+                    // A committed migration transition is durable at this point, but the
+                    // caller has not received its confirmation yet. The barrier lets the
+                    // parent kill the leader in exactly that window.
+                    if matches!(
+                        command,
+                        crate::types::MetadataCommand::AdvanceMigration { .. }
+                    ) && self.leader.load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        crate::barrier::barrier(crate::barrier::AFTER_MIGRATION_COMMIT);
+                    }
                     responses.push(response);
                 }
                 EntryPayload::Membership(membership) => {

@@ -4,6 +4,7 @@
 //! implement metadata consensus, ownership handover, WAL migration or Q2 replication.
 #![forbid(unsafe_code)]
 
+pub mod fault;
 pub mod ids;
 pub mod metadata;
 pub mod routing;
