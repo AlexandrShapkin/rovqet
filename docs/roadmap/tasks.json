@@ -922,7 +922,7 @@
         "scripts/test_q1_migration_partition.py"
       ],
       "evidence": {
-        "commit": "PENDING_FINAL_HEAD",
+        "commit": "05e1b5f",
         "verification": "PASS: the metadata Raft group, the committed migration state machine, the durable old-owner fence, the bounded transfer, the crash-safe promotion, the successor activation and the coordinated source-plus-DLQ bundle handover are implemented and verified end to end. The final safety gate executed the missing crash windows, the live asymmetric isolation of a still-serving old owner, the DLQ uncertainty cases and the adversarial transfer cases, and the independent oracle accepts every positive campaign and rejects every negative fixture.",
         "test_command": [
           "cargo build -p rovqet-metadata-raft --features fault-injection --bins --locked",
