@@ -50,8 +50,13 @@ def recovered(**overrides) -> dict:
     return record
 
 
-def concluded(records: list[dict]) -> list[dict]:
-    return records + [{"event": "conclusion", "verdict": "PASS", "seq": len(records)}]
+def concluded(
+    records: list[dict], verdict: str = "PASS", reason: str | None = None
+) -> list[dict]:
+    return records + [
+        {"event": "conclusion", "verdict": verdict, "reason": reason,
+         "seq": len(records)}
+    ]
 
 
 class PublicationOracle(unittest.TestCase):
@@ -385,6 +390,31 @@ class SafetyOracle(unittest.TestCase):
         result = self.reconcile(self.base())
         self.assertEqual(result["verdict"], oracle.PASS, result)
 
+    def test_compact_broker_stage_spellings_are_accepted(self):
+        # The brokers print their committed stage as
+        # format!("{:?}", stage).to_lowercase(), so the journals record the
+        # compact spelling; both spellings must reconcile to the same verdict.
+        compact = {
+            "catch_up": "catchup",
+            "fence_old": "fenceold",
+            "activate_new": "activatenew",
+        }
+        records = [
+            {**record, "stage": compact[record["stage"]]}
+            if record.get("event") == "migration_stage"
+            else record
+            for record in self.base()
+        ]
+        result = self.reconcile(records)
+        self.assertEqual(result["verdict"], oracle.PASS, result)
+        # A genuinely unknown stage is still rejected with its original value.
+        records.append(
+            {"event": "migration_stage", "stage": "teleport", "revision": 9}
+        )
+        result = self.reconcile(records)
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+        self.assertIn("unknown migration stage teleport", result["reasons"])
+
     def test_a_fabricated_activation_without_a_verified_transfer_fails(self):
         records = self.base()
         records = [r for r in records if r.get("member") != "source"]
@@ -486,6 +516,54 @@ class SafetyOracle(unittest.TestCase):
                                    {"file_index": 0, "offset": 0, "digest": "bb"}]})
         result = self.reconcile(records)
         self.assertEqual(result["verdict"], oracle.FAIL, result)
+
+    def test_a_failed_scenario_conclusion_is_never_a_pass(self):
+        # The journal itself is consistent, but the harness concluded FAIL: the safety
+        # verdict may never claim success for a scenario that did not succeed.
+        result = oracle.reconcile_safety(
+            concluded(
+                self.base(),
+                verdict="FAIL",
+                reason="the successor did not serve the bundle",
+            )
+        )
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+        self.assertTrue(
+            any("the scenario concluded FAIL" in reason
+                for reason in result["reasons"]),
+            result["reasons"],
+        )
+        self.assertTrue(
+            any("the successor did not serve the bundle" in reason
+                for reason in result["reasons"]),
+            result["reasons"],
+        )
+
+    def test_an_invalid_scenario_conclusion_is_never_a_pass(self):
+        result = oracle.reconcile_safety(
+            concluded(
+                self.base(),
+                verdict="INVALID",
+                reason="the durable control never reached after-append-before-sync",
+            )
+        )
+        self.assertNotEqual(result["verdict"], oracle.PASS, result)
+        self.assertTrue(
+            any("the scenario concluded INVALID" in reason
+                for reason in result["reasons"]),
+            result["reasons"],
+        )
+
+    def test_a_not_run_scenario_conclusion_is_never_a_pass(self):
+        result = oracle.reconcile_safety(
+            concluded(self.base(), verdict="NOT_RUN")
+        )
+        self.assertNotEqual(result["verdict"], oracle.PASS, result)
+        self.assertTrue(
+            any("the scenario concluded NOT_RUN" in reason
+                for reason in result["reasons"]),
+            result["reasons"],
+        )
 
 
 

@@ -1,0 +1,2025 @@
+{
+  "build": {
+    "binaries": {
+      "target/debug/examples/cluster_probe": "b3ee1615a8fb734f",
+      "target/debug/examples/consume_q1": "4e8bc4c3bd6942ab",
+      "target/debug/examples/fsync_profile": "1336a74b399b2226",
+      "target/debug/examples/nack_q1": "ae174e924b02e6e8",
+      "target/debug/examples/q0": "9fc37eeccdbdda67",
+      "target/debug/examples/q1": "7358ea24982b4afa",
+      "target/debug/examples/q1_measure": "35c7ed472e31b80b",
+      "target/debug/examples/read_q1": "ae32288239a8eb94",
+      "target/debug/metadata-raft-node": "5e7414e782ed79de",
+      "target/debug/rovqet": "fa0d686c485f6030"
+    },
+    "commit": "e28c606aa58256e3cf1a81595f9ff3be88b9c02c",
+    "status": [
+      " M benchmarks/evidence/c02-crash-matrix/verdicts.json",
+      " M crates/durable/src/lib.rs",
+      " M crates/metadata-raft/src/lib.rs",
+      " M crates/server/src/cluster.rs",
+      " M crates/server/src/main.rs",
+      " M crates/server/src/migration.rs",
+      " M crates/server/src/promotion.rs",
+      " M crates/server/src/transfer.rs",
+      " M docs/architecture/09-cluster-control.md",
+      " M docs/architecture/14-verification.md",
+      " M scripts/q1_oracle.py",
+      " M scripts/test_q1_migration_crash.py",
+      " M scripts/test_q1_oracle.py",
+      "?? benchmarks/evidence/c02-safety-matrix/",
+      "?? scripts/c02_evidence.py",
+      "?? scripts/test_q1_dlq_uncertainty.py",
+      "?? scripts/test_q1_migration_partition.py"
+    ]
+  },
+  "commands": [
+    "cargo build -p rovqet-server --features fault-injection --locked",
+    "cargo build -p rovqet-metadata-raft --features fault-injection --bins --locked",
+    "cargo fmt --all -- --check",
+    "cargo check --workspace --locked",
+    "cargo test --workspace --locked",
+    "cargo test -p rovqet-metadata-raft --locked",
+    "cargo test -p rovqet-durable --locked",
+    "cargo test -p rovqet-server --locked",
+    "python3 scripts/test_q1_migration_crash.py",
+    "python3 scripts/test_q1_migration_bundle.py",
+    "python3 scripts/test_q1_migration_partition.py",
+    "python3 scripts/test_q1_dlq_uncertainty.py",
+    "python3 scripts/test_q1_oracle.py",
+    "python3 scripts/check_docs.py",
+    "python3 scripts/q0_smoke.py",
+    "python3 scripts/q1_smoke.py --check-hooks-disabled",
+    "python3 scripts/test_metadata_raft.py",
+    "python3 scripts/test_cluster_routing.py",
+    "python3 scripts/test_q1_replay.py",
+    "python3 scripts/test_q1_consumer.py",
+    "python3 scripts/test_q1_terminal.py",
+    "python3 scripts/test_q1_durability.py",
+    "python3 scripts/test_q1_faults.py"
+  ],
+  "errors": [],
+  "generated_utc": "2026-11-21T18:44:38Z",
+  "machine": {
+    "cpu_count": 4,
+    "filesystem_available_bytes": 48238637056,
+    "filesystem_total_bytes": 105089261568,
+    "filesystem_type": "ext2/ext3",
+    "platform": "Linux-7.0.0-38-generic-x86_64-with-glibc2.43",
+    "python_version": "3.14.4"
+  },
+  "oracle": {
+    "agrees": true,
+    "journal": "benchmarks/evidence/c02-bundle-campaign/journal.jsonl",
+    "recomputed": {
+      "counts": {
+        "dlq_proofs": 1,
+        "dlq_publications": 1,
+        "fences": 2,
+        "inventories": 4,
+        "migration_id": "212050808214637896123822867096069477401",
+        "promotions": 1,
+        "recovered_records": 8,
+        "restarts": 1,
+        "stages": 3,
+        "terminals": 1
+      },
+      "reasons": [],
+      "verdict": "PASS"
+    },
+    "stored": {
+      "counts": {
+        "dlq_proofs": 1,
+        "dlq_publications": 1,
+        "fences": 2,
+        "inventories": 4,
+        "migration_id": "212050808214637896123822867096069477401",
+        "promotions": 1,
+        "recovered_records": 8,
+        "restarts": 1,
+        "stages": 3,
+        "terminals": 1
+      },
+      "oracle": "scripts/q1_oracle.py:reconcile_bundle",
+      "reasons": [],
+      "verdict": "PASS"
+    }
+  },
+  "production_commands": [
+    "cargo fmt --all -- --check",
+    "cargo check --workspace --locked",
+    "cargo test --workspace --locked",
+    "cargo test -p rovqet-metadata-raft --locked",
+    "cargo test -p rovqet-durable --locked",
+    "cargo test -p rovqet-server --locked",
+    "cargo build -p rovqet-server -p rovqet-sdk --examples --bins --locked"
+  ],
+  "scenarios": [
+    {
+      "barrier": "before_fence",
+      "barrier_reached": true,
+      "executed_cases": 1,
+      "journal": "benchmarks/evidence/c02-safety-matrix/C1-before-fence.jsonl",
+      "journal_conclusion": {
+        "reason": null,
+        "verdict": "PASS"
+      },
+      "oracle": {
+        "counts": {
+          "barriers": 1,
+          "commits": 1,
+          "dispositions": 0,
+          "fences": 0,
+          "histories": 1,
+          "kills": 1,
+          "restarts": 1,
+          "scenarios": 1,
+          "stages": 1,
+          "transfers": 1
+        },
+        "reasons": [],
+        "verdict": "PASS"
+      },
+      "process_killed": [
+        {
+          "event": "process_killed",
+          "process": "source",
+          "run": "C1-before-fence",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 8,
+          "time_mono_ns": 1024098415266261
+        }
+      ],
+      "process_restarted": [
+        {
+          "event": "process_restarted",
+          "process": "source",
+          "run": "C1-before-fence",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 9,
+          "time_mono_ns": 1024098417306151
+        }
+      ],
+      "scenario": "C1-before-fence",
+      "source": "safety-journal",
+      "stored_verdict": null
+    },
+    {
+      "barrier": "chunk_after_write",
+      "barrier_reached": true,
+      "executed_cases": 1,
+      "journal": "benchmarks/evidence/c02-safety-matrix/C10-chunk-written-before-sync.jsonl",
+      "journal_conclusion": {
+        "reason": null,
+        "verdict": "PASS"
+      },
+      "oracle": {
+        "counts": {
+          "barriers": 1,
+          "commits": 1,
+          "dispositions": 0,
+          "fences": 1,
+          "histories": 2,
+          "kills": 1,
+          "restarts": 1,
+          "scenarios": 1,
+          "stages": 3,
+          "transfers": 2
+        },
+        "reasons": [],
+        "verdict": "PASS"
+      },
+      "process_killed": [
+        {
+          "event": "process_killed",
+          "process": "target",
+          "run": "C10-chunk-written-before-sync",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 6,
+          "time_mono_ns": 1024152565848057
+        }
+      ],
+      "process_restarted": [
+        {
+          "event": "process_restarted",
+          "process": "target",
+          "run": "C10-chunk-written-before-sync",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 7,
+          "time_mono_ns": 1024152569085044
+        }
+      ],
+      "scenario": "C10-chunk-written-before-sync",
+      "source": "safety-journal",
+      "stored_verdict": null
+    },
+    {
+      "barrier": "chunk_after_sync",
+      "barrier_reached": true,
+      "executed_cases": 1,
+      "journal": "benchmarks/evidence/c02-safety-matrix/C11-chunk-synced-ack-lost.jsonl",
+      "journal_conclusion": {
+        "reason": null,
+        "verdict": "PASS"
+      },
+      "oracle": {
+        "counts": {
+          "barriers": 1,
+          "commits": 1,
+          "dispositions": 0,
+          "fences": 1,
+          "histories": 2,
+          "kills": 1,
+          "restarts": 1,
+          "scenarios": 1,
+          "stages": 3,
+          "transfers": 2
+        },
+        "reasons": [],
+        "verdict": "PASS"
+      },
+      "process_killed": [
+        {
+          "event": "process_killed",
+          "process": "target",
+          "run": "C11-chunk-synced-ack-lost",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 6,
+          "time_mono_ns": 1024158172788542
+        }
+      ],
+      "process_restarted": [
+        {
+          "event": "process_restarted",
+          "process": "target",
+          "run": "C11-chunk-synced-ack-lost",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 7,
+          "time_mono_ns": 1024158176176020
+        }
+      ],
+      "scenario": "C11-chunk-synced-ack-lost",
+      "source": "safety-journal",
+      "stored_verdict": null
+    },
+    {
+      "barrier": "before_catch_up_commit",
+      "barrier_reached": true,
+      "executed_cases": 1,
+      "journal": "benchmarks/evidence/c02-safety-matrix/C12-finalize-before-transition.jsonl",
+      "journal_conclusion": {
+        "reason": null,
+        "verdict": "PASS"
+      },
+      "oracle": {
+        "counts": {
+          "barriers": 1,
+          "commits": 1,
+          "dispositions": 0,
+          "fences": 1,
+          "histories": 1,
+          "kills": 1,
+          "restarts": 1,
+          "scenarios": 1,
+          "stages": 3,
+          "transfers": 2
+        },
+        "reasons": [],
+        "verdict": "PASS"
+      },
+      "process_killed": [
+        {
+          "event": "process_killed",
+          "process": "source",
+          "run": "C12-finalize-before-transition",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 7,
+          "time_mono_ns": 1024163762754446
+        }
+      ],
+      "process_restarted": [
+        {
+          "event": "process_restarted",
+          "process": "source",
+          "run": "C12-finalize-before-transition",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 8,
+          "time_mono_ns": 1024163766102973
+        }
+      ],
+      "scenario": "C12-finalize-before-transition",
+      "source": "safety-journal",
+      "stored_verdict": null
+    },
+    {
+      "barrier": "before_final_transfer",
+      "barrier_reached": true,
+      "executed_cases": 1,
+      "journal": "benchmarks/evidence/c02-safety-matrix/C13-final-delta-interrupted.jsonl",
+      "journal_conclusion": {
+        "reason": null,
+        "verdict": "PASS"
+      },
+      "oracle": {
+        "counts": {
+          "barriers": 1,
+          "commits": 1,
+          "dispositions": 0,
+          "fences": 2,
+          "histories": 2,
+          "kills": 1,
+          "restarts": 1,
+          "scenarios": 1,
+          "stages": 3,
+          "transfers": 4
+        },
+        "reasons": [],
+        "verdict": "PASS"
+      },
+      "process_killed": [
+        {
+          "event": "process_killed",
+          "process": "source",
+          "run": "C13-final-delta-interrupted",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 12,
+          "time_mono_ns": 1024169339477339
+        }
+      ],
+      "process_restarted": [
+        {
+          "event": "process_restarted",
+          "process": "source",
+          "run": "C13-final-delta-interrupted",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 13,
+          "time_mono_ns": 1024169341517457
+        }
+      ],
+      "scenario": "C13-final-delta-interrupted",
+      "source": "safety-journal",
+      "stored_verdict": null
+    },
+    {
+      "barrier": "after_migration_proposal",
+      "barrier_reached": true,
+      "executed_cases": 1,
+      "journal": "benchmarks/evidence/c02-safety-matrix/C14-leader-crash-pending-transition.jsonl",
+      "journal_conclusion": {
+        "reason": null,
+        "verdict": "PASS"
+      },
+      "oracle": {
+        "counts": {
+          "barriers": 1,
+          "commits": 1,
+          "dispositions": 0,
+          "fences": 1,
+          "histories": 1,
+          "kills": 1,
+          "restarts": 1,
+          "scenarios": 1,
+          "stages": 3,
+          "transfers": 2
+        },
+        "reasons": [],
+        "verdict": "PASS"
+      },
+      "process_killed": [
+        {
+          "event": "process_killed",
+          "process": "source",
+          "run": "C14-leader-crash-pending-transition",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 7,
+          "time_mono_ns": 1024176335243038
+        }
+      ],
+      "process_restarted": [
+        {
+          "event": "process_restarted",
+          "process": "source",
+          "run": "C14-leader-crash-pending-transition",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 8,
+          "time_mono_ns": 1024176339629738
+        }
+      ],
+      "scenario": "C14-leader-crash-pending-transition",
+      "source": "safety-journal",
+      "stored_verdict": null
+    },
+    {
+      "barrier": "after_migration_commit",
+      "barrier_reached": true,
+      "executed_cases": 1,
+      "journal": "benchmarks/evidence/c02-safety-matrix/C15-leader-crash-after-commit.jsonl",
+      "journal_conclusion": {
+        "reason": null,
+        "verdict": "PASS"
+      },
+      "oracle": {
+        "counts": {
+          "barriers": 1,
+          "commits": 1,
+          "dispositions": 0,
+          "fences": 1,
+          "histories": 1,
+          "kills": 1,
+          "restarts": 1,
+          "scenarios": 1,
+          "stages": 2,
+          "transfers": 2
+        },
+        "reasons": [],
+        "verdict": "PASS"
+      },
+      "process_killed": [
+        {
+          "event": "process_killed",
+          "process": "source",
+          "run": "C15-leader-crash-after-commit",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 7,
+          "time_mono_ns": 1024182911063918
+        }
+      ],
+      "process_restarted": [
+        {
+          "event": "process_restarted",
+          "process": "source",
+          "run": "C15-leader-crash-after-commit",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 8,
+          "time_mono_ns": 1024182914371091
+        }
+      ],
+      "scenario": "C15-leader-crash-after-commit",
+      "source": "safety-journal",
+      "stored_verdict": null
+    },
+    {
+      "barrier": null,
+      "barrier_reached": null,
+      "executed_cases": 1,
+      "journal": "benchmarks/evidence/c02-safety-matrix/C16-successor-first-commit-interrupted.jsonl",
+      "journal_conclusion": {
+        "reason": null,
+        "verdict": "PASS"
+      },
+      "oracle": {
+        "counts": {
+          "barriers": 0,
+          "commits": 2,
+          "dispositions": 0,
+          "fences": 1,
+          "histories": 2,
+          "kills": 1,
+          "restarts": 1,
+          "scenarios": 1,
+          "stages": 3,
+          "transfers": 2
+        },
+        "reasons": [],
+        "verdict": "PASS"
+      },
+      "process_killed": [
+        {
+          "event": "process_killed",
+          "process": "target",
+          "run": "C16-successor-first-commit-interrupted",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 13,
+          "time_mono_ns": 1024194143045911
+        }
+      ],
+      "process_restarted": [
+        {
+          "event": "process_restarted",
+          "process": "target",
+          "run": "C16-successor-first-commit-interrupted",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 15,
+          "time_mono_ns": 1024194148153213
+        }
+      ],
+      "scenario": "C16-successor-first-commit-interrupted",
+      "source": "safety-journal",
+      "stored_verdict": null
+    },
+    {
+      "barrier": null,
+      "barrier_reached": null,
+      "executed_cases": 1,
+      "journal": "benchmarks/evidence/c02-safety-matrix/C17-live-isolation.jsonl",
+      "journal_conclusion": {
+        "reason": "the isolated owner stayed alive and kept serving, the metadata majority advanced independently while refusing a fabricated fence proof, the successor never activated until the path was restored, and no durable record overlapped",
+        "verdict": "PASS"
+      },
+      "oracle": {
+        "counts": {
+          "barriers": 0,
+          "commits": 2,
+          "dispositions": 0,
+          "fences": 1,
+          "histories": 5,
+          "kills": 0,
+          "restarts": 0,
+          "scenarios": 1,
+          "stages": 3,
+          "transfers": 2
+        },
+        "reasons": [],
+        "verdict": "PASS"
+      },
+      "process_killed": [],
+      "process_restarted": [],
+      "scenario": "C17-live-isolation",
+      "source": "safety-journal",
+      "stored_verdict": null
+    },
+    {
+      "barrier": "after_fence",
+      "barrier_reached": true,
+      "executed_cases": 1,
+      "journal": "benchmarks/evidence/c02-safety-matrix/C2-after-fence.jsonl",
+      "journal_conclusion": {
+        "reason": null,
+        "verdict": "PASS"
+      },
+      "oracle": {
+        "counts": {
+          "barriers": 1,
+          "commits": 1,
+          "dispositions": 0,
+          "fences": 1,
+          "histories": 1,
+          "kills": 1,
+          "restarts": 1,
+          "scenarios": 1,
+          "stages": 1,
+          "transfers": 1
+        },
+        "reasons": [],
+        "verdict": "PASS"
+      },
+      "process_killed": [
+        {
+          "event": "process_killed",
+          "process": "source",
+          "run": "C2-after-fence",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 9,
+          "time_mono_ns": 1024103833616069
+        }
+      ],
+      "process_restarted": [
+        {
+          "event": "process_restarted",
+          "process": "source",
+          "run": "C2-after-fence",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 10,
+          "time_mono_ns": 1024103837309968
+        }
+      ],
+      "scenario": "C2-after-fence",
+      "source": "safety-journal",
+      "stored_verdict": null
+    },
+    {
+      "barrier": "before_activate_commit",
+      "barrier_reached": true,
+      "executed_cases": 1,
+      "journal": "benchmarks/evidence/c02-safety-matrix/C3-before-activate-commit.jsonl",
+      "journal_conclusion": {
+        "reason": null,
+        "verdict": "PASS"
+      },
+      "oracle": {
+        "counts": {
+          "barriers": 1,
+          "commits": 1,
+          "dispositions": 0,
+          "fences": 1,
+          "histories": 1,
+          "kills": 1,
+          "restarts": 1,
+          "scenarios": 1,
+          "stages": 2,
+          "transfers": 2
+        },
+        "reasons": [],
+        "verdict": "PASS"
+      },
+      "process_killed": [
+        {
+          "event": "process_killed",
+          "process": "source",
+          "run": "C3-before-activate-commit",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 11,
+          "time_mono_ns": 1024109628967338
+        }
+      ],
+      "process_restarted": [
+        {
+          "event": "process_restarted",
+          "process": "source",
+          "run": "C3-before-activate-commit",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 12,
+          "time_mono_ns": 1024109631115541
+        }
+      ],
+      "scenario": "C3-before-activate-commit",
+      "source": "safety-journal",
+      "stored_verdict": null
+    },
+    {
+      "barrier": "promotion_intent",
+      "barrier_reached": true,
+      "executed_cases": 1,
+      "journal": "benchmarks/evidence/c02-safety-matrix/C4-promotion-intent.jsonl",
+      "journal_conclusion": {
+        "reason": null,
+        "verdict": "PASS"
+      },
+      "oracle": {
+        "counts": {
+          "barriers": 1,
+          "commits": 1,
+          "dispositions": 0,
+          "fences": 1,
+          "histories": 1,
+          "kills": 1,
+          "restarts": 1,
+          "scenarios": 1,
+          "stages": 3,
+          "transfers": 2
+        },
+        "reasons": [],
+        "verdict": "PASS"
+      },
+      "process_killed": [
+        {
+          "event": "process_killed",
+          "process": "target",
+          "run": "C4-promotion-intent",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 12,
+          "time_mono_ns": 1024115263747972
+        }
+      ],
+      "process_restarted": [
+        {
+          "event": "process_restarted",
+          "process": "target",
+          "run": "C4-promotion-intent",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 13,
+          "time_mono_ns": 1024115267119839
+        }
+      ],
+      "scenario": "C4-promotion-intent",
+      "source": "safety-journal",
+      "stored_verdict": null
+    },
+    {
+      "barrier": "before_route_open",
+      "barrier_reached": true,
+      "executed_cases": 1,
+      "journal": "benchmarks/evidence/c02-safety-matrix/C5-before-route-open.jsonl",
+      "journal_conclusion": {
+        "reason": null,
+        "verdict": "PASS"
+      },
+      "oracle": {
+        "counts": {
+          "barriers": 1,
+          "commits": 1,
+          "dispositions": 0,
+          "fences": 1,
+          "histories": 1,
+          "kills": 1,
+          "restarts": 1,
+          "scenarios": 1,
+          "stages": 3,
+          "transfers": 2
+        },
+        "reasons": [],
+        "verdict": "PASS"
+      },
+      "process_killed": [
+        {
+          "event": "process_killed",
+          "process": "target",
+          "run": "C5-before-route-open",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 12,
+          "time_mono_ns": 1024130727715936
+        }
+      ],
+      "process_restarted": [
+        {
+          "event": "process_restarted",
+          "process": "target",
+          "run": "C5-before-route-open",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 13,
+          "time_mono_ns": 1024130731196251
+        }
+      ],
+      "scenario": "C5-before-route-open",
+      "source": "safety-journal",
+      "stored_verdict": null
+    },
+    {
+      "barrier": "after_route_open",
+      "barrier_reached": true,
+      "executed_cases": 1,
+      "journal": "benchmarks/evidence/c02-safety-matrix/C6-after-route-open.jsonl",
+      "journal_conclusion": {
+        "reason": null,
+        "verdict": "PASS"
+      },
+      "oracle": {
+        "counts": {
+          "barriers": 1,
+          "commits": 1,
+          "dispositions": 0,
+          "fences": 1,
+          "histories": 1,
+          "kills": 1,
+          "restarts": 1,
+          "scenarios": 1,
+          "stages": 3,
+          "transfers": 2
+        },
+        "reasons": [],
+        "verdict": "PASS"
+      },
+      "process_killed": [
+        {
+          "event": "process_killed",
+          "process": "target",
+          "run": "C6-after-route-open",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 12,
+          "time_mono_ns": 1024136167047758
+        }
+      ],
+      "process_restarted": [
+        {
+          "event": "process_restarted",
+          "process": "target",
+          "run": "C6-after-route-open",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 13,
+          "time_mono_ns": 1024136170290237
+        }
+      ],
+      "scenario": "C6-after-route-open",
+      "source": "safety-journal",
+      "stored_verdict": null
+    },
+    {
+      "barrier": null,
+      "barrier_reached": null,
+      "executed_cases": 1,
+      "journal": "benchmarks/evidence/c02-safety-matrix/C7-unreachable-successor.jsonl",
+      "journal_conclusion": {
+        "reason": null,
+        "verdict": "PASS"
+      },
+      "oracle": {
+        "counts": {
+          "barriers": 0,
+          "commits": 2,
+          "dispositions": 0,
+          "fences": 1,
+          "histories": 2,
+          "kills": 0,
+          "restarts": 0,
+          "scenarios": 1,
+          "stages": 3,
+          "transfers": 2
+        },
+        "reasons": [],
+        "verdict": "PASS"
+      },
+      "process_killed": [],
+      "process_restarted": [],
+      "scenario": "C7-unreachable-successor",
+      "source": "safety-journal",
+      "stored_verdict": null
+    },
+    {
+      "barrier": "after_dependent_promotion",
+      "barrier_reached": true,
+      "executed_cases": 1,
+      "journal": "benchmarks/evidence/c02-safety-matrix/C8-bundle-after-dependent-promotion.jsonl",
+      "journal_conclusion": {
+        "reason": null,
+        "verdict": "PASS"
+      },
+      "oracle": {
+        "counts": {
+          "barriers": 1,
+          "commits": 1,
+          "dispositions": 0,
+          "fences": 2,
+          "histories": 1,
+          "kills": 1,
+          "restarts": 1,
+          "scenarios": 1,
+          "stages": 3,
+          "transfers": 4
+        },
+        "reasons": [],
+        "verdict": "PASS"
+      },
+      "process_killed": [
+        {
+          "event": "process_killed",
+          "process": "target",
+          "run": "C8-bundle-after-dependent-promotion",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 15,
+          "time_mono_ns": 1024141604845047
+        }
+      ],
+      "process_restarted": [
+        {
+          "event": "process_restarted",
+          "process": "target",
+          "run": "C8-bundle-after-dependent-promotion",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 16,
+          "time_mono_ns": 1024141608115154
+        }
+      ],
+      "scenario": "C8-bundle-after-dependent-promotion",
+      "source": "safety-journal",
+      "stored_verdict": null
+    },
+    {
+      "barrier": "chunk_before_send",
+      "barrier_reached": true,
+      "executed_cases": 1,
+      "journal": "benchmarks/evidence/c02-safety-matrix/C9-initial-transfer-interrupted.jsonl",
+      "journal_conclusion": {
+        "reason": null,
+        "verdict": "PASS"
+      },
+      "oracle": {
+        "counts": {
+          "barriers": 1,
+          "commits": 1,
+          "dispositions": 0,
+          "fences": 1,
+          "histories": 2,
+          "kills": 1,
+          "restarts": 1,
+          "scenarios": 1,
+          "stages": 3,
+          "transfers": 2
+        },
+        "reasons": [],
+        "verdict": "PASS"
+      },
+      "process_killed": [
+        {
+          "event": "process_killed",
+          "process": "source",
+          "run": "C9-initial-transfer-interrupted",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 6,
+          "time_mono_ns": 1024146982329511
+        }
+      ],
+      "process_restarted": [
+        {
+          "event": "process_restarted",
+          "process": "source",
+          "run": "C9-initial-transfer-interrupted",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 7,
+          "time_mono_ns": 1024146985661107
+        }
+      ],
+      "scenario": "C9-initial-transfer-interrupted",
+      "source": "safety-journal",
+      "stored_verdict": null
+    },
+    {
+      "barrier": null,
+      "barrier_reached": null,
+      "executed_cases": 1,
+      "journal": "benchmarks/evidence/c02-safety-matrix/D1-duplicate-disposition-across-fencing.jsonl",
+      "journal_conclusion": {
+        "reason": null,
+        "verdict": "PASS"
+      },
+      "oracle": {
+        "counts": {
+          "barriers": 0,
+          "commits": 3,
+          "dispositions": 1,
+          "fences": 2,
+          "histories": 2,
+          "kills": 0,
+          "restarts": 0,
+          "scenarios": 1,
+          "stages": 3,
+          "transfers": 2
+        },
+        "reasons": [],
+        "verdict": "PASS"
+      },
+      "process_killed": [],
+      "process_restarted": [],
+      "scenario": "D1-duplicate-disposition-across-fencing",
+      "source": "safety-journal",
+      "stored_verdict": null
+    },
+    {
+      "barrier": null,
+      "barrier_reached": null,
+      "executed_cases": 1,
+      "journal": "benchmarks/evidence/c02-safety-matrix/D2-pending-terminal-at-migration.jsonl",
+      "journal_conclusion": {
+        "reason": null,
+        "verdict": "PASS"
+      },
+      "oracle": {
+        "counts": {
+          "barriers": 0,
+          "commits": 3,
+          "dispositions": 1,
+          "fences": 2,
+          "histories": 2,
+          "kills": 0,
+          "restarts": 0,
+          "scenarios": 1,
+          "stages": 3,
+          "transfers": 2
+        },
+        "reasons": [],
+        "verdict": "PASS"
+      },
+      "process_killed": [],
+      "process_restarted": [],
+      "scenario": "D2-pending-terminal-at-migration",
+      "source": "safety-journal",
+      "stored_verdict": null
+    },
+    {
+      "barrier": "dlq-after-publish-before-terminal",
+      "barrier_reached": true,
+      "executed_cases": 1,
+      "journal": "benchmarks/evidence/c02-safety-matrix/D3-crash-after-dlq-commit-before-terminal-closure.jsonl",
+      "journal_conclusion": {
+        "reason": null,
+        "verdict": "PASS"
+      },
+      "oracle": {
+        "counts": {
+          "barriers": 1,
+          "commits": 3,
+          "dispositions": 1,
+          "fences": 2,
+          "histories": 2,
+          "kills": 1,
+          "restarts": 1,
+          "scenarios": 1,
+          "stages": 3,
+          "transfers": 2
+        },
+        "reasons": [],
+        "verdict": "PASS"
+      },
+      "process_killed": [
+        {
+          "event": "process_killed",
+          "process": "source",
+          "run": "D3-crash-after-dlq-commit-before-terminal-closure",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 9,
+          "signal": "SIGKILL",
+          "time_mono_ns": 1022927297694026
+        }
+      ],
+      "process_restarted": [
+        {
+          "event": "process_restarted",
+          "process": "source",
+          "run": "D3-crash-after-dlq-commit-before-terminal-closure",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 10,
+          "time_mono_ns": 1022927351744957
+        }
+      ],
+      "scenario": "D3-crash-after-dlq-commit-before-terminal-closure",
+      "source": "safety-journal",
+      "stored_verdict": null
+    },
+    {
+      "barrier": "before_fence",
+      "barrier_reached": true,
+      "campaign": {
+        "broker_version": "rovqet 0.1.0 (wire v1; development profile)",
+        "build": null,
+        "executed": 16,
+        "schema": "rovqet-migration-crash-v1"
+      },
+      "executed_cases": 1,
+      "journal": "benchmarks/evidence/c02-safety-matrix/C1-before-fence.jsonl",
+      "journal_conclusion": {
+        "reason": null,
+        "verdict": "PASS"
+      },
+      "oracle": {
+        "counts": {
+          "barriers": 1,
+          "commits": 1,
+          "dispositions": 0,
+          "fences": 0,
+          "histories": 1,
+          "kills": 1,
+          "restarts": 1,
+          "scenarios": 1,
+          "stages": 1,
+          "transfers": 1
+        },
+        "reasons": [],
+        "verdict": "PASS"
+      },
+      "process_killed": [
+        {
+          "event": "process_killed",
+          "process": "source",
+          "run": "C1-before-fence",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 8,
+          "time_mono_ns": 1024098415266261
+        }
+      ],
+      "process_restarted": [
+        {
+          "event": "process_restarted",
+          "process": "source",
+          "run": "C1-before-fence",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 9,
+          "time_mono_ns": 1024098417306151
+        }
+      ],
+      "scenario": "C1-before-fence",
+      "source": "crash-verdict",
+      "stored_verdict": {
+        "barrier": "before_fence",
+        "barrier_reached": true,
+        "reasons": [],
+        "scenario": "C1-before-fence",
+        "verdict": "PASS"
+      }
+    },
+    {
+      "barrier": "after_fence",
+      "barrier_reached": true,
+      "campaign": {
+        "broker_version": "rovqet 0.1.0 (wire v1; development profile)",
+        "build": null,
+        "executed": 16,
+        "schema": "rovqet-migration-crash-v1"
+      },
+      "executed_cases": 1,
+      "journal": "benchmarks/evidence/c02-safety-matrix/C2-after-fence.jsonl",
+      "journal_conclusion": {
+        "reason": null,
+        "verdict": "PASS"
+      },
+      "oracle": {
+        "counts": {
+          "barriers": 1,
+          "commits": 1,
+          "dispositions": 0,
+          "fences": 1,
+          "histories": 1,
+          "kills": 1,
+          "restarts": 1,
+          "scenarios": 1,
+          "stages": 1,
+          "transfers": 1
+        },
+        "reasons": [],
+        "verdict": "PASS"
+      },
+      "process_killed": [
+        {
+          "event": "process_killed",
+          "process": "source",
+          "run": "C2-after-fence",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 9,
+          "time_mono_ns": 1024103833616069
+        }
+      ],
+      "process_restarted": [
+        {
+          "event": "process_restarted",
+          "process": "source",
+          "run": "C2-after-fence",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 10,
+          "time_mono_ns": 1024103837309968
+        }
+      ],
+      "scenario": "C2-after-fence",
+      "source": "crash-verdict",
+      "stored_verdict": {
+        "barrier": "after_fence",
+        "barrier_reached": true,
+        "reasons": [],
+        "scenario": "C2-after-fence",
+        "verdict": "PASS"
+      }
+    },
+    {
+      "barrier": "before_activate_commit",
+      "barrier_reached": true,
+      "campaign": {
+        "broker_version": "rovqet 0.1.0 (wire v1; development profile)",
+        "build": null,
+        "executed": 16,
+        "schema": "rovqet-migration-crash-v1"
+      },
+      "executed_cases": 1,
+      "journal": "benchmarks/evidence/c02-safety-matrix/C3-before-activate-commit.jsonl",
+      "journal_conclusion": {
+        "reason": null,
+        "verdict": "PASS"
+      },
+      "oracle": {
+        "counts": {
+          "barriers": 1,
+          "commits": 1,
+          "dispositions": 0,
+          "fences": 1,
+          "histories": 1,
+          "kills": 1,
+          "restarts": 1,
+          "scenarios": 1,
+          "stages": 2,
+          "transfers": 2
+        },
+        "reasons": [],
+        "verdict": "PASS"
+      },
+      "process_killed": [
+        {
+          "event": "process_killed",
+          "process": "source",
+          "run": "C3-before-activate-commit",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 11,
+          "time_mono_ns": 1024109628967338
+        }
+      ],
+      "process_restarted": [
+        {
+          "event": "process_restarted",
+          "process": "source",
+          "run": "C3-before-activate-commit",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 12,
+          "time_mono_ns": 1024109631115541
+        }
+      ],
+      "scenario": "C3-before-activate-commit",
+      "source": "crash-verdict",
+      "stored_verdict": {
+        "barrier": "before_activate_commit",
+        "barrier_reached": true,
+        "reasons": [],
+        "scenario": "C3-before-activate-commit",
+        "verdict": "PASS"
+      }
+    },
+    {
+      "barrier": "promotion_intent",
+      "barrier_reached": true,
+      "campaign": {
+        "broker_version": "rovqet 0.1.0 (wire v1; development profile)",
+        "build": null,
+        "executed": 16,
+        "schema": "rovqet-migration-crash-v1"
+      },
+      "executed_cases": 1,
+      "journal": "benchmarks/evidence/c02-safety-matrix/C4-promotion-intent.jsonl",
+      "journal_conclusion": {
+        "reason": null,
+        "verdict": "PASS"
+      },
+      "oracle": {
+        "counts": {
+          "barriers": 1,
+          "commits": 1,
+          "dispositions": 0,
+          "fences": 1,
+          "histories": 1,
+          "kills": 1,
+          "restarts": 1,
+          "scenarios": 1,
+          "stages": 3,
+          "transfers": 2
+        },
+        "reasons": [],
+        "verdict": "PASS"
+      },
+      "process_killed": [
+        {
+          "event": "process_killed",
+          "process": "target",
+          "run": "C4-promotion-intent",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 12,
+          "time_mono_ns": 1024115263747972
+        }
+      ],
+      "process_restarted": [
+        {
+          "event": "process_restarted",
+          "process": "target",
+          "run": "C4-promotion-intent",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 13,
+          "time_mono_ns": 1024115267119839
+        }
+      ],
+      "scenario": "C4-promotion-intent",
+      "source": "crash-verdict",
+      "stored_verdict": {
+        "barrier": "promotion_intent",
+        "barrier_reached": true,
+        "reasons": [],
+        "scenario": "C4-promotion-intent",
+        "verdict": "PASS"
+      }
+    },
+    {
+      "barrier": "before_route_open",
+      "barrier_reached": true,
+      "campaign": {
+        "broker_version": "rovqet 0.1.0 (wire v1; development profile)",
+        "build": null,
+        "executed": 16,
+        "schema": "rovqet-migration-crash-v1"
+      },
+      "executed_cases": 1,
+      "journal": "benchmarks/evidence/c02-safety-matrix/C5-before-route-open.jsonl",
+      "journal_conclusion": {
+        "reason": null,
+        "verdict": "PASS"
+      },
+      "oracle": {
+        "counts": {
+          "barriers": 1,
+          "commits": 1,
+          "dispositions": 0,
+          "fences": 1,
+          "histories": 1,
+          "kills": 1,
+          "restarts": 1,
+          "scenarios": 1,
+          "stages": 3,
+          "transfers": 2
+        },
+        "reasons": [],
+        "verdict": "PASS"
+      },
+      "process_killed": [
+        {
+          "event": "process_killed",
+          "process": "target",
+          "run": "C5-before-route-open",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 12,
+          "time_mono_ns": 1024130727715936
+        }
+      ],
+      "process_restarted": [
+        {
+          "event": "process_restarted",
+          "process": "target",
+          "run": "C5-before-route-open",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 13,
+          "time_mono_ns": 1024130731196251
+        }
+      ],
+      "scenario": "C5-before-route-open",
+      "source": "crash-verdict",
+      "stored_verdict": {
+        "barrier": "before_route_open",
+        "barrier_reached": true,
+        "reasons": [],
+        "scenario": "C5-before-route-open",
+        "verdict": "PASS"
+      }
+    },
+    {
+      "barrier": "after_route_open",
+      "barrier_reached": true,
+      "campaign": {
+        "broker_version": "rovqet 0.1.0 (wire v1; development profile)",
+        "build": null,
+        "executed": 16,
+        "schema": "rovqet-migration-crash-v1"
+      },
+      "executed_cases": 1,
+      "journal": "benchmarks/evidence/c02-safety-matrix/C6-after-route-open.jsonl",
+      "journal_conclusion": {
+        "reason": null,
+        "verdict": "PASS"
+      },
+      "oracle": {
+        "counts": {
+          "barriers": 1,
+          "commits": 1,
+          "dispositions": 0,
+          "fences": 1,
+          "histories": 1,
+          "kills": 1,
+          "restarts": 1,
+          "scenarios": 1,
+          "stages": 3,
+          "transfers": 2
+        },
+        "reasons": [],
+        "verdict": "PASS"
+      },
+      "process_killed": [
+        {
+          "event": "process_killed",
+          "process": "target",
+          "run": "C6-after-route-open",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 12,
+          "time_mono_ns": 1024136167047758
+        }
+      ],
+      "process_restarted": [
+        {
+          "event": "process_restarted",
+          "process": "target",
+          "run": "C6-after-route-open",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 13,
+          "time_mono_ns": 1024136170290237
+        }
+      ],
+      "scenario": "C6-after-route-open",
+      "source": "crash-verdict",
+      "stored_verdict": {
+        "barrier": "after_route_open",
+        "barrier_reached": true,
+        "reasons": [],
+        "scenario": "C6-after-route-open",
+        "verdict": "PASS"
+      }
+    },
+    {
+      "barrier": "after_dependent_promotion",
+      "barrier_reached": true,
+      "campaign": {
+        "broker_version": "rovqet 0.1.0 (wire v1; development profile)",
+        "build": null,
+        "executed": 16,
+        "schema": "rovqet-migration-crash-v1"
+      },
+      "executed_cases": 1,
+      "journal": "benchmarks/evidence/c02-safety-matrix/C8-bundle-after-dependent-promotion.jsonl",
+      "journal_conclusion": {
+        "reason": null,
+        "verdict": "PASS"
+      },
+      "oracle": {
+        "counts": {
+          "barriers": 1,
+          "commits": 1,
+          "dispositions": 0,
+          "fences": 2,
+          "histories": 1,
+          "kills": 1,
+          "restarts": 1,
+          "scenarios": 1,
+          "stages": 3,
+          "transfers": 4
+        },
+        "reasons": [],
+        "verdict": "PASS"
+      },
+      "process_killed": [
+        {
+          "event": "process_killed",
+          "process": "target",
+          "run": "C8-bundle-after-dependent-promotion",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 15,
+          "time_mono_ns": 1024141604845047
+        }
+      ],
+      "process_restarted": [
+        {
+          "event": "process_restarted",
+          "process": "target",
+          "run": "C8-bundle-after-dependent-promotion",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 16,
+          "time_mono_ns": 1024141608115154
+        }
+      ],
+      "scenario": "C8-bundle-after-dependent-promotion",
+      "source": "crash-verdict",
+      "stored_verdict": {
+        "barrier": "after_dependent_promotion",
+        "barrier_reached": true,
+        "reasons": [],
+        "scenario": "C8-bundle-after-dependent-promotion",
+        "verdict": "PASS"
+      }
+    },
+    {
+      "barrier": "chunk_before_send",
+      "barrier_reached": true,
+      "campaign": {
+        "broker_version": "rovqet 0.1.0 (wire v1; development profile)",
+        "build": null,
+        "executed": 16,
+        "schema": "rovqet-migration-crash-v1"
+      },
+      "executed_cases": 1,
+      "journal": "benchmarks/evidence/c02-safety-matrix/C9-initial-transfer-interrupted.jsonl",
+      "journal_conclusion": {
+        "reason": null,
+        "verdict": "PASS"
+      },
+      "oracle": {
+        "counts": {
+          "barriers": 1,
+          "commits": 1,
+          "dispositions": 0,
+          "fences": 1,
+          "histories": 2,
+          "kills": 1,
+          "restarts": 1,
+          "scenarios": 1,
+          "stages": 3,
+          "transfers": 2
+        },
+        "reasons": [],
+        "verdict": "PASS"
+      },
+      "process_killed": [
+        {
+          "event": "process_killed",
+          "process": "source",
+          "run": "C9-initial-transfer-interrupted",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 6,
+          "time_mono_ns": 1024146982329511
+        }
+      ],
+      "process_restarted": [
+        {
+          "event": "process_restarted",
+          "process": "source",
+          "run": "C9-initial-transfer-interrupted",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 7,
+          "time_mono_ns": 1024146985661107
+        }
+      ],
+      "scenario": "C9-initial-transfer-interrupted",
+      "source": "crash-verdict",
+      "stored_verdict": {
+        "barrier": "chunk_before_send",
+        "barrier_reached": true,
+        "reasons": [],
+        "scenario": "C9-initial-transfer-interrupted",
+        "verdict": "PASS"
+      }
+    },
+    {
+      "barrier": "chunk_after_write",
+      "barrier_reached": true,
+      "campaign": {
+        "broker_version": "rovqet 0.1.0 (wire v1; development profile)",
+        "build": null,
+        "executed": 16,
+        "schema": "rovqet-migration-crash-v1"
+      },
+      "executed_cases": 1,
+      "journal": "benchmarks/evidence/c02-safety-matrix/C10-chunk-written-before-sync.jsonl",
+      "journal_conclusion": {
+        "reason": null,
+        "verdict": "PASS"
+      },
+      "oracle": {
+        "counts": {
+          "barriers": 1,
+          "commits": 1,
+          "dispositions": 0,
+          "fences": 1,
+          "histories": 2,
+          "kills": 1,
+          "restarts": 1,
+          "scenarios": 1,
+          "stages": 3,
+          "transfers": 2
+        },
+        "reasons": [],
+        "verdict": "PASS"
+      },
+      "process_killed": [
+        {
+          "event": "process_killed",
+          "process": "target",
+          "run": "C10-chunk-written-before-sync",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 6,
+          "time_mono_ns": 1024152565848057
+        }
+      ],
+      "process_restarted": [
+        {
+          "event": "process_restarted",
+          "process": "target",
+          "run": "C10-chunk-written-before-sync",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 7,
+          "time_mono_ns": 1024152569085044
+        }
+      ],
+      "scenario": "C10-chunk-written-before-sync",
+      "source": "crash-verdict",
+      "stored_verdict": {
+        "barrier": "chunk_after_write",
+        "barrier_reached": true,
+        "reasons": [],
+        "scenario": "C10-chunk-written-before-sync",
+        "verdict": "PASS"
+      }
+    },
+    {
+      "barrier": "chunk_after_sync",
+      "barrier_reached": true,
+      "campaign": {
+        "broker_version": "rovqet 0.1.0 (wire v1; development profile)",
+        "build": null,
+        "executed": 16,
+        "schema": "rovqet-migration-crash-v1"
+      },
+      "executed_cases": 1,
+      "journal": "benchmarks/evidence/c02-safety-matrix/C11-chunk-synced-ack-lost.jsonl",
+      "journal_conclusion": {
+        "reason": null,
+        "verdict": "PASS"
+      },
+      "oracle": {
+        "counts": {
+          "barriers": 1,
+          "commits": 1,
+          "dispositions": 0,
+          "fences": 1,
+          "histories": 2,
+          "kills": 1,
+          "restarts": 1,
+          "scenarios": 1,
+          "stages": 3,
+          "transfers": 2
+        },
+        "reasons": [],
+        "verdict": "PASS"
+      },
+      "process_killed": [
+        {
+          "event": "process_killed",
+          "process": "target",
+          "run": "C11-chunk-synced-ack-lost",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 6,
+          "time_mono_ns": 1024158172788542
+        }
+      ],
+      "process_restarted": [
+        {
+          "event": "process_restarted",
+          "process": "target",
+          "run": "C11-chunk-synced-ack-lost",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 7,
+          "time_mono_ns": 1024158176176020
+        }
+      ],
+      "scenario": "C11-chunk-synced-ack-lost",
+      "source": "crash-verdict",
+      "stored_verdict": {
+        "barrier": "chunk_after_sync",
+        "barrier_reached": true,
+        "reasons": [],
+        "scenario": "C11-chunk-synced-ack-lost",
+        "verdict": "PASS"
+      }
+    },
+    {
+      "barrier": "before_catch_up_commit",
+      "barrier_reached": true,
+      "campaign": {
+        "broker_version": "rovqet 0.1.0 (wire v1; development profile)",
+        "build": null,
+        "executed": 16,
+        "schema": "rovqet-migration-crash-v1"
+      },
+      "executed_cases": 1,
+      "journal": "benchmarks/evidence/c02-safety-matrix/C12-finalize-before-transition.jsonl",
+      "journal_conclusion": {
+        "reason": null,
+        "verdict": "PASS"
+      },
+      "oracle": {
+        "counts": {
+          "barriers": 1,
+          "commits": 1,
+          "dispositions": 0,
+          "fences": 1,
+          "histories": 1,
+          "kills": 1,
+          "restarts": 1,
+          "scenarios": 1,
+          "stages": 3,
+          "transfers": 2
+        },
+        "reasons": [],
+        "verdict": "PASS"
+      },
+      "process_killed": [
+        {
+          "event": "process_killed",
+          "process": "source",
+          "run": "C12-finalize-before-transition",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 7,
+          "time_mono_ns": 1024163762754446
+        }
+      ],
+      "process_restarted": [
+        {
+          "event": "process_restarted",
+          "process": "source",
+          "run": "C12-finalize-before-transition",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 8,
+          "time_mono_ns": 1024163766102973
+        }
+      ],
+      "scenario": "C12-finalize-before-transition",
+      "source": "crash-verdict",
+      "stored_verdict": {
+        "barrier": "before_catch_up_commit",
+        "barrier_reached": true,
+        "reasons": [],
+        "scenario": "C12-finalize-before-transition",
+        "verdict": "PASS"
+      }
+    },
+    {
+      "barrier": "before_final_transfer",
+      "barrier_reached": true,
+      "campaign": {
+        "broker_version": "rovqet 0.1.0 (wire v1; development profile)",
+        "build": null,
+        "executed": 16,
+        "schema": "rovqet-migration-crash-v1"
+      },
+      "executed_cases": 1,
+      "journal": "benchmarks/evidence/c02-safety-matrix/C13-final-delta-interrupted.jsonl",
+      "journal_conclusion": {
+        "reason": null,
+        "verdict": "PASS"
+      },
+      "oracle": {
+        "counts": {
+          "barriers": 1,
+          "commits": 1,
+          "dispositions": 0,
+          "fences": 2,
+          "histories": 2,
+          "kills": 1,
+          "restarts": 1,
+          "scenarios": 1,
+          "stages": 3,
+          "transfers": 4
+        },
+        "reasons": [],
+        "verdict": "PASS"
+      },
+      "process_killed": [
+        {
+          "event": "process_killed",
+          "process": "source",
+          "run": "C13-final-delta-interrupted",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 12,
+          "time_mono_ns": 1024169339477339
+        }
+      ],
+      "process_restarted": [
+        {
+          "event": "process_restarted",
+          "process": "source",
+          "run": "C13-final-delta-interrupted",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 13,
+          "time_mono_ns": 1024169341517457
+        }
+      ],
+      "scenario": "C13-final-delta-interrupted",
+      "source": "crash-verdict",
+      "stored_verdict": {
+        "barrier": "before_final_transfer",
+        "barrier_reached": true,
+        "reasons": [],
+        "scenario": "C13-final-delta-interrupted",
+        "verdict": "PASS"
+      }
+    },
+    {
+      "barrier": "after_migration_proposal",
+      "barrier_reached": true,
+      "campaign": {
+        "broker_version": "rovqet 0.1.0 (wire v1; development profile)",
+        "build": null,
+        "executed": 16,
+        "schema": "rovqet-migration-crash-v1"
+      },
+      "executed_cases": 1,
+      "journal": "benchmarks/evidence/c02-safety-matrix/C14-leader-crash-pending-transition.jsonl",
+      "journal_conclusion": {
+        "reason": null,
+        "verdict": "PASS"
+      },
+      "oracle": {
+        "counts": {
+          "barriers": 1,
+          "commits": 1,
+          "dispositions": 0,
+          "fences": 1,
+          "histories": 1,
+          "kills": 1,
+          "restarts": 1,
+          "scenarios": 1,
+          "stages": 3,
+          "transfers": 2
+        },
+        "reasons": [],
+        "verdict": "PASS"
+      },
+      "process_killed": [
+        {
+          "event": "process_killed",
+          "process": "source",
+          "run": "C14-leader-crash-pending-transition",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 7,
+          "time_mono_ns": 1024176335243038
+        }
+      ],
+      "process_restarted": [
+        {
+          "event": "process_restarted",
+          "process": "source",
+          "run": "C14-leader-crash-pending-transition",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 8,
+          "time_mono_ns": 1024176339629738
+        }
+      ],
+      "scenario": "C14-leader-crash-pending-transition",
+      "source": "crash-verdict",
+      "stored_verdict": {
+        "barrier": "after_migration_proposal",
+        "barrier_reached": true,
+        "reasons": [],
+        "scenario": "C14-leader-crash-pending-transition",
+        "verdict": "PASS"
+      }
+    },
+    {
+      "barrier": "after_migration_commit",
+      "barrier_reached": true,
+      "campaign": {
+        "broker_version": "rovqet 0.1.0 (wire v1; development profile)",
+        "build": null,
+        "executed": 16,
+        "schema": "rovqet-migration-crash-v1"
+      },
+      "executed_cases": 1,
+      "journal": "benchmarks/evidence/c02-safety-matrix/C15-leader-crash-after-commit.jsonl",
+      "journal_conclusion": {
+        "reason": null,
+        "verdict": "PASS"
+      },
+      "oracle": {
+        "counts": {
+          "barriers": 1,
+          "commits": 1,
+          "dispositions": 0,
+          "fences": 1,
+          "histories": 1,
+          "kills": 1,
+          "restarts": 1,
+          "scenarios": 1,
+          "stages": 2,
+          "transfers": 2
+        },
+        "reasons": [],
+        "verdict": "PASS"
+      },
+      "process_killed": [
+        {
+          "event": "process_killed",
+          "process": "source",
+          "run": "C15-leader-crash-after-commit",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 7,
+          "time_mono_ns": 1024182911063918
+        }
+      ],
+      "process_restarted": [
+        {
+          "event": "process_restarted",
+          "process": "source",
+          "run": "C15-leader-crash-after-commit",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 8,
+          "time_mono_ns": 1024182914371091
+        }
+      ],
+      "scenario": "C15-leader-crash-after-commit",
+      "source": "crash-verdict",
+      "stored_verdict": {
+        "barrier": "after_migration_commit",
+        "barrier_reached": true,
+        "reasons": [],
+        "scenario": "C15-leader-crash-after-commit",
+        "verdict": "PASS"
+      }
+    },
+    {
+      "barrier": null,
+      "barrier_reached": true,
+      "campaign": {
+        "broker_version": "rovqet 0.1.0 (wire v1; development profile)",
+        "build": null,
+        "executed": 16,
+        "schema": "rovqet-migration-crash-v1"
+      },
+      "executed_cases": 1,
+      "journal": "benchmarks/evidence/c02-safety-matrix/C7-unreachable-successor.jsonl",
+      "journal_conclusion": {
+        "reason": null,
+        "verdict": "PASS"
+      },
+      "oracle": {
+        "counts": {
+          "barriers": 0,
+          "commits": 2,
+          "dispositions": 0,
+          "fences": 1,
+          "histories": 2,
+          "kills": 0,
+          "restarts": 0,
+          "scenarios": 1,
+          "stages": 3,
+          "transfers": 2
+        },
+        "reasons": [],
+        "verdict": "PASS"
+      },
+      "process_killed": [],
+      "process_restarted": [],
+      "scenario": "C7-unreachable-successor",
+      "source": "crash-verdict",
+      "stored_verdict": {
+        "barrier": null,
+        "barrier_reached": true,
+        "reasons": [],
+        "scenario": "C7-unreachable-successor",
+        "verdict": "PASS"
+      }
+    },
+    {
+      "barrier": null,
+      "barrier_reached": true,
+      "campaign": {
+        "broker_version": "rovqet 0.1.0 (wire v1; development profile)",
+        "build": null,
+        "executed": 16,
+        "schema": "rovqet-migration-crash-v1"
+      },
+      "executed_cases": 1,
+      "journal": "benchmarks/evidence/c02-safety-matrix/C16-successor-first-commit-interrupted.jsonl",
+      "journal_conclusion": {
+        "reason": null,
+        "verdict": "PASS"
+      },
+      "oracle": {
+        "counts": {
+          "barriers": 0,
+          "commits": 2,
+          "dispositions": 0,
+          "fences": 1,
+          "histories": 2,
+          "kills": 1,
+          "restarts": 1,
+          "scenarios": 1,
+          "stages": 3,
+          "transfers": 2
+        },
+        "reasons": [],
+        "verdict": "PASS"
+      },
+      "process_killed": [
+        {
+          "event": "process_killed",
+          "process": "target",
+          "run": "C16-successor-first-commit-interrupted",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 13,
+          "time_mono_ns": 1024194143045911
+        }
+      ],
+      "process_restarted": [
+        {
+          "event": "process_restarted",
+          "process": "target",
+          "run": "C16-successor-first-commit-interrupted",
+          "schema": "rovqet-q1-oracle-v1",
+          "seq": 15,
+          "time_mono_ns": 1024194148153213
+        }
+      ],
+      "scenario": "C16-successor-first-commit-interrupted",
+      "source": "crash-verdict",
+      "stored_verdict": {
+        "barrier": null,
+        "barrier_reached": true,
+        "reasons": [],
+        "scenario": "C16-successor-first-commit-interrupted",
+        "verdict": "PASS"
+      }
+    },
+    {
+      "barrier": null,
+      "barrier_reached": null,
+      "executed_cases": 1,
+      "journal": "benchmarks/evidence/c02-bundle-campaign/journal.jsonl",
+      "journal_conclusion": {
+        "reason": "both histories were transferred, fenced, activated and promoted; the successor serves the same source records and the same DLQ disposition",
+        "verdict": "PASS"
+      },
+      "oracle": {
+        "counts": {},
+        "reasons": [
+          "no scenario evidence"
+        ],
+        "verdict": "NOT_RUN"
+      },
+      "process_killed": [],
+      "process_restarted": [],
+      "scenario": "c02-bundle-campaign",
+      "source": "bundle-verdict",
+      "stored_verdict": {
+        "counts": {
+          "dlq_proofs": 1,
+          "dlq_publications": 1,
+          "fences": 2,
+          "inventories": 4,
+          "migration_id": "212050808214637896123822867096069477401",
+          "promotions": 1,
+          "recovered_records": 8,
+          "restarts": 1,
+          "stages": 3,
+          "terminals": 1
+        },
+        "oracle": "scripts/q1_oracle.py:reconcile_bundle",
+        "reasons": [],
+        "verdict": "PASS"
+      }
+    }
+  ],
+  "schema": "rovqet-c02-evidence-v1"
+}

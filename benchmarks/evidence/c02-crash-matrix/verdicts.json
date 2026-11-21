@@ -1,6 +1,6 @@
 {
   "schema": "rovqet-migration-crash-v1",
-  "executed": 8,
+  "executed": 16,
   "verdicts": [
     {
       "scenario": "C1-before-fence",
@@ -52,8 +52,64 @@
       "barrier_reached": true
     },
     {
+      "scenario": "C9-initial-transfer-interrupted",
+      "barrier": "chunk_before_send",
+      "verdict": "PASS",
+      "reasons": [],
+      "barrier_reached": true
+    },
+    {
+      "scenario": "C10-chunk-written-before-sync",
+      "barrier": "chunk_after_write",
+      "verdict": "PASS",
+      "reasons": [],
+      "barrier_reached": true
+    },
+    {
+      "scenario": "C11-chunk-synced-ack-lost",
+      "barrier": "chunk_after_sync",
+      "verdict": "PASS",
+      "reasons": [],
+      "barrier_reached": true
+    },
+    {
+      "scenario": "C12-finalize-before-transition",
+      "barrier": "before_catch_up_commit",
+      "verdict": "PASS",
+      "reasons": [],
+      "barrier_reached": true
+    },
+    {
+      "scenario": "C13-final-delta-interrupted",
+      "barrier": "before_final_transfer",
+      "verdict": "PASS",
+      "reasons": [],
+      "barrier_reached": true
+    },
+    {
+      "scenario": "C14-leader-crash-pending-transition",
+      "barrier": "after_migration_proposal",
+      "verdict": "PASS",
+      "reasons": [],
+      "barrier_reached": true
+    },
+    {
+      "scenario": "C15-leader-crash-after-commit",
+      "barrier": "after_migration_commit",
+      "verdict": "PASS",
+      "reasons": [],
+      "barrier_reached": true
+    },
+    {
       "scenario": "C7-unreachable-successor",
-      "barrier": "-",
+      "barrier": null,
+      "verdict": "PASS",
+      "reasons": [],
+      "barrier_reached": true
+    },
+    {
+      "scenario": "C16-successor-first-commit-interrupted",
+      "barrier": null,
       "verdict": "PASS",
       "reasons": [],
       "barrier_reached": true

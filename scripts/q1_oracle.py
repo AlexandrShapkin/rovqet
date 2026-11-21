@@ -402,6 +402,28 @@ def reconcile_terminal(
 
 MIGRATION_STAGES = ("prepare", "catch_up", "fence_old", "activate_new", "cleanup")
 
+# The brokers print their committed stage as
+# ``format!("{:?}", record.stage).to_lowercase()`` (crates/server/src/migration.rs
+# ``report()``), which yields the compact spellings below.  The journals record
+# exactly what the broker printed, so both spellings name the same stage.
+STAGE_ALIASES = {
+    "catchup": "catch_up",
+    "fenceold": "fence_old",
+    "activatenew": "activate_new",
+}
+
+
+def canonical_stage(value):
+    """Map a broker-printed stage spelling onto the canonical stage name.
+
+    ``prepare`` and ``cleanup`` are already canonical and pass through; an
+    unknown value is returned unchanged so the caller can reject it with
+    ``unknown migration stage <value>``.
+    """
+    if isinstance(value, str):
+        return STAGE_ALIASES.get(value, value)
+    return value
+
 
 def reconcile_migration(records: list[dict], *, require_conclusion: bool = True) -> dict:
     """Checks an ownership migration journal for safety violations.
@@ -437,9 +459,9 @@ def reconcile_migration(records: list[dict], *, require_conclusion: bool = True)
     # The committed stages may not skip and may not move backwards.
     order: list[tuple[int, str]] = []
     for record in stages:
-        stage = record.get("stage")
+        stage = canonical_stage(record.get("stage"))
         if stage not in MIGRATION_STAGES:
-            reasons.append(f"unknown migration stage {stage}")
+            reasons.append(f"unknown migration stage {record.get('stage')}")
             continue
         order.append((MIGRATION_STAGES.index(stage), stage))
     for previous, current in zip(order, order[1:]):
@@ -621,9 +643,9 @@ def reconcile_bundle(records: list[dict], *, require_conclusion: bool = True) ->
     # 2. The committed stages may neither skip nor move backwards.
     order: list[tuple[int, str]] = []
     for record in stages:
-        stage = record.get("stage")
+        stage = canonical_stage(record.get("stage"))
         if stage not in MIGRATION_STAGES:
-            reasons.append(f"unknown migration stage {stage}")
+            reasons.append(f"unknown migration stage {record.get('stage')}")
             continue
         order.append((MIGRATION_STAGES.index(stage), stage))
     for previous, current in zip(order, order[1:]):
@@ -875,7 +897,9 @@ def reconcile_safety(records: list[dict], *, require_conclusion: bool = True) ->
 
     A contradiction is INVALID, a broken safety invariant is FAIL and a journal without
     evidence is NOT_RUN. A missed barrier, a missing observation or an absent journal is
-    never a pass.
+    never a pass. A journal whose own conclusion is not PASS is never reported as a
+    successful safety verdict: the harness that observed the scenario has the final say
+    about whether the scenario succeeded.
     """
     reasons: list[str] = []
     if require_conclusion and (not records or records[-1]["event"] != "conclusion"):
@@ -886,6 +910,20 @@ def reconcile_safety(records: list[dict], *, require_conclusion: bool = True) ->
         record if record.get("seq") is not None else {**record, "seq": index}
         for index, record in enumerate(records)
     ]
+
+    # 0. The scenario's own conclusion must be a success. A scenario that concluded
+    # FAIL, INVALID or NOT_RUN can never be reported as a successful safety verdict,
+    # even when the journal alone does not contradict it.
+    conclusions = [r for r in records if r.get("event") == "conclusion"]
+    if conclusions:
+        conclusion = conclusions[-1]
+        own_verdict = conclusion.get("verdict")
+        if own_verdict != PASS:
+            detail = conclusion.get("reason")
+            if detail:
+                reasons.append(f"the scenario concluded {own_verdict}: {detail}")
+            else:
+                reasons.append(f"the scenario concluded {own_verdict}")
 
     scenarios = [r for r in records if r["event"] == "scenario_started"]
     barriers = [r for r in records if r["event"] == "barrier_reached"]
@@ -903,7 +941,9 @@ def reconcile_safety(records: list[dict], *, require_conclusion: bool = True) ->
     cursors = [r for r in records if r["event"] == "cursor_observed"]
     receipts = [r for r in records if r["event"] == "chunk_receipts"]
 
-    if not scenarios:
+    if not scenarios and not reasons:
+        # A journal with no scenario evidence is NOT_RUN, but a journal whose own
+        # conclusion already failed must keep that failure instead.
         return _result(NOT_RUN, ["no scenario evidence"], {})
 
     # 1. A scenario that never reached its barrier is never a pass.
@@ -1004,7 +1044,9 @@ def reconcile_safety(records: list[dict], *, require_conclusion: bool = True) ->
         reasons.append(f"the log incarnation changed: {sorted(map(str, incarnations))}")
 
     # 6. No target commit may precede the verified activation.
-    activations = [s for s in stages if s.get("stage") == "activate_new"]
+    activations = [
+        s for s in stages if canonical_stage(s.get("stage")) == "activate_new"
+    ]
     for commit in commits:
         if commit.get("node") != "target":
             continue
@@ -1042,9 +1084,9 @@ def reconcile_safety(records: list[dict], *, require_conclusion: bool = True) ->
     # 9. The committed stage never moves backwards and never skips.
     order: list[tuple[int, str]] = []
     for record in stages:
-        stage = record.get("stage")
+        stage = canonical_stage(record.get("stage"))
         if stage not in MIGRATION_STAGES:
-            reasons.append(f"unknown migration stage {stage}")
+            reasons.append(f"unknown migration stage {record.get('stage')}")
             continue
         order.append((MIGRATION_STAGES.index(stage), stage))
     for previous, current in zip(order, order[1:]):
@@ -1056,7 +1098,9 @@ def reconcile_safety(records: list[dict], *, require_conclusion: bool = True) ->
     # 10. A repeated committed transition never creates a second revision.
     revisions: dict[str, set[int]] = {}
     for record in stages:
-        revisions.setdefault(record.get("stage", ""), set()).add(record.get("revision"))
+        revisions.setdefault(
+            str(canonical_stage(record.get("stage", ""))), set()
+        ).add(record.get("revision"))
     for stage, values in revisions.items():
         if len(values) > 1:
             reasons.append(f"the stage {stage} was committed with several revisions: {values}")
