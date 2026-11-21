@@ -1001,4 +1001,157 @@ mod tests {
             TransferError::MemberMismatch
         );
     }
+
+    /// A chunk of another migration is refused before it can touch this staging area.
+    #[test]
+    fn a_chunk_of_another_migration_is_refused_and_leaves_the_staging_area_unchanged() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let payload = b"q1 wal bytes".to_vec();
+        let request = prepare(
+            1,
+            vec![("seg-000000.wal", payload.len() as u64, sha256(&payload))],
+        );
+        let mut staging = TransferStaging::prepare(directory.path(), &request).expect("prepare");
+        // The chunk declares another migration than the staging area it arrived in.
+        let foreign = chunk(2, 0, 0, 0, payload.clone());
+        assert_eq!(
+            staging.accept_chunk(&foreign),
+            Err(TransferError::MigrationMismatch),
+            "a chunk of another migration must be refused"
+        );
+        // Nothing was written: no part file, no receipt in the durable chunk journal.
+        assert_eq!(
+            staging.missing_chunks(),
+            vec![(0u32, 0u64)],
+            "the refused chunk must not advance the covered inventory"
+        );
+        let entries: Vec<String> = std::fs::read_dir(staging.directory())
+            .expect("staging directory")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            entries,
+            vec!["staging.json".to_string()],
+            "a refused chunk must leave no receipt or part behind: {entries:?}"
+        );
+        // The staging area of the first migration still accepts its own chunk.
+        assert_eq!(
+            staging
+                .accept_chunk(&chunk(1, 0, 0, 0, payload))
+                .expect("chunk"),
+            ChunkOutcome::Stored
+        );
+        assert!(staging.missing_chunks().is_empty());
+    }
+
+    /// A payload that does not match its declared digest is refused before any receipt.
+    #[test]
+    fn a_chunk_with_an_unmatched_payload_writes_no_receipt_to_the_chunk_journal() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let payload = b"q1 wal bytes".to_vec();
+        let request = prepare(
+            1,
+            vec![("seg-000000.wal", payload.len() as u64, sha256(&payload))],
+        );
+        let mut staging = TransferStaging::prepare(directory.path(), &request).expect("prepare");
+        // The declared digest describes other bytes than the payload that arrives.
+        let mut foreign = chunk(1, 0, 0, 0, payload);
+        foreign.digest = sha256(b"completely different bytes");
+        assert_eq!(
+            staging.accept_chunk(&foreign),
+            Err(TransferError::DigestMismatch),
+            "a payload that does not match its digest must be refused"
+        );
+        assert!(
+            !staging.directory().join("chunks.jsonl").exists(),
+            "a refused chunk must not enter the durable chunk journal"
+        );
+        assert!(
+            !staging.directory().join("part-000000.bin").exists(),
+            "a refused chunk must not write its payload"
+        );
+        assert_eq!(staging.missing_chunks(), vec![(0u32, 0u64)]);
+        assert_eq!(
+            staging.finalize(&finalize(1)),
+            Err(TransferError::Incomplete),
+            "the inventory without the refused chunk can never finalize"
+        );
+    }
+
+    /// A chunk outside the declared file never advances the inventory.
+    #[test]
+    fn a_chunk_outside_the_declared_file_leaves_the_inventory_incomplete() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let payload = b"q1 wal bytes".to_vec();
+        let request = prepare(
+            1,
+            vec![("seg-000000.wal", payload.len() as u64, sha256(&payload))],
+        );
+        let mut staging = TransferStaging::prepare(directory.path(), &request).expect("prepare");
+        assert_eq!(
+            staging.accept_chunk(&chunk(1, 0, 0, 4096, payload)),
+            Err(TransferError::OutOfRange),
+            "a chunk outside the declared file must be refused"
+        );
+        assert_eq!(
+            staging.missing_chunks(),
+            vec![(0u32, 0u64)],
+            "the refused chunk must not advance the covered inventory"
+        );
+        assert!(
+            !staging.directory().join("part-000000.bin").exists(),
+            "a refused chunk must not write its payload"
+        );
+        assert_eq!(
+            staging.finalize(&finalize(1)),
+            Err(TransferError::Incomplete),
+            "an inventory with an out-of-range chunk can never finalize"
+        );
+    }
+
+    /// The manager refuses an incomplete finalize and a changed inventory of the member.
+    #[test]
+    fn an_incomplete_finalize_and_a_changed_inventory_are_refused_by_the_manager() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let first = b"first half ".to_vec();
+        let first_len = first.len();
+        let second = b"second half".to_vec();
+        let mut whole = first.clone();
+        whole.extend_from_slice(&second);
+        let mut manager = TransferManager::new(root.path());
+        let request = prepare(
+            1,
+            vec![("seg-000000.wal", whole.len() as u64, sha256(&whole))],
+        );
+        manager.prepare(&request).expect("prepare");
+        manager.chunk(&chunk(1, 0, 0, 0, first)).expect("chunk");
+        // The second half is missing: the finalize refuses instead of claiming readiness.
+        let response = manager.finalize(&finalize(1)).expect("finalize answer");
+        assert_eq!(response.status, Q1TransferStatus::Mismatch);
+        assert!(
+            response.error.is_some(),
+            "an incomplete finalize must carry the refusal"
+        );
+        // A repeated prepare with a different inventory for the same migration and member
+        // is a conflict: one staging area never describes two inventories.
+        let changed = prepare(
+            1,
+            vec![("seg-000001.wal", whole.len() as u64, sha256(&whole))],
+        );
+        assert_eq!(
+            manager.prepare(&changed),
+            Err(TransferError::Conflict),
+            "a changed inventory of the same migration and member must conflict"
+        );
+        // The refused prepare did not corrupt the first staging area: once the inventory
+        // is complete, the finalize succeeds.
+        manager
+            .chunk(&chunk(1, 1, 0, first_len as u64, second))
+            .expect("chunk");
+        assert_eq!(
+            manager.finalize(&finalize(1)).expect("finalize").status,
+            Q1TransferStatus::ReadyForFence
+        );
+    }
 }

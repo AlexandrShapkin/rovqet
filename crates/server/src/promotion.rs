@@ -201,6 +201,27 @@ pub fn promote(
             return Err(PromotionError::TargetNotEmpty);
         }
     }
+    // A completed promotion of the same migration and the same inventory identity is
+    // already durable. The partition may have appended to the promoted history since, so
+    // the published files no longer carry the digests of the staged files: a repeated
+    // promotion must not refuse its own directory. The integrity of the grown history is
+    // established by the real WAL recovery (manifest, segment inventory, record checksums
+    // and committed watermark) and, for a handover, by the fence-proof verification, not
+    // by re-comparing the published files against the staged digests.
+    if let Some(existing) = promotion_record(target)? {
+        if existing.migration_id == record.migration_id
+            && existing.inventory_digest == record.inventory_digest
+        {
+            if existing.state == PromotionState::Promoted {
+                return Ok(());
+            }
+            // An incomplete record of this promotion is redone by the protocol below.
+        } else {
+            // A record of another migration or of another inventory identity is a
+            // conflicting destination: this promotion must never publish over it.
+            return Err(PromotionError::TargetNotEmpty);
+        }
+    }
     // The staged inventory must match the plan.
     let manifest_path = staging.join("staging.json");
     let manifest = std::fs::read(&manifest_path)
@@ -498,6 +519,76 @@ mod tests {
         assert_eq!(
             std::fs::read(target.path().join("segment-000000.wal")).expect("segment"),
             b"wal"
+        );
+    }
+
+    #[test]
+    fn a_completed_promotion_is_idempotent_against_a_grown_history() {
+        let files = [
+            ("MANIFEST", b"manifest".as_slice()),
+            ("segment-000000.wal", b"wal"),
+        ];
+        let (_directory, staging) = staging_with(&files);
+        let target = tempfile::tempdir().expect("target");
+        let plan = record(&files);
+        promote(&staging, target.path(), &plan).expect("promotion");
+        // The successor served traffic: the partition appended its own records to the
+        // promoted history, so the published files no longer match the staged digests.
+        std::fs::write(target.path().join("MANIFEST"), b"manifest, appended").expect("manifest");
+        std::fs::write(target.path().join("segment-000000.wal"), b"wal-appended").expect("segment");
+        // The activator repeats the promotion after a restart: it must not refuse the
+        // directory it grew itself, and the appended history must survive.
+        promote(&staging, target.path(), &plan).expect("repeated promotion");
+        assert_eq!(
+            std::fs::read(target.path().join("MANIFEST")).expect("manifest"),
+            b"manifest, appended",
+            "the appended history must not be overwritten"
+        );
+        assert_eq!(
+            std::fs::read(target.path().join("segment-000000.wal")).expect("segment"),
+            b"wal-appended",
+            "the appended history must not be overwritten"
+        );
+        let stored = promotion_record(target.path())
+            .expect("record")
+            .expect("the promotion must stay recorded");
+        assert_eq!(stored.state, PromotionState::Promoted);
+        assert_eq!(stored.migration_id, 7);
+    }
+
+    #[test]
+    fn a_promotion_refuses_a_target_with_a_record_of_another_promotion() {
+        let files = [("MANIFEST", b"manifest".as_slice())];
+        let (_directory, staging) = staging_with(&files);
+        // Another migration completed its promotion in this directory.
+        let other_migration = tempfile::tempdir().expect("target");
+        let mut foreign = record(&files);
+        foreign.migration_id = 9;
+        foreign.state = PromotionState::Promoted;
+        std::fs::write(
+            other_migration.path().join(PROMOTION_RECORD),
+            serde_json::to_vec(&foreign).expect("record"),
+        )
+        .expect("record");
+        assert_eq!(
+            promote(&staging, other_migration.path(), &record(&files)),
+            Err(PromotionError::TargetNotEmpty),
+            "a promotion record of another migration must refuse the destination"
+        );
+        // The same migration with another inventory identity is a conflict as well.
+        let other_inventory = tempfile::tempdir().expect("target");
+        let mut foreign = record(&files);
+        foreign.inventory_digest = "ffff".into();
+        foreign.state = PromotionState::Promoted;
+        std::fs::write(
+            other_inventory.path().join(PROMOTION_RECORD),
+            serde_json::to_vec(&foreign).expect("record"),
+        )
+        .expect("record");
+        assert_eq!(
+            promote(&staging, other_inventory.path(), &record(&files)),
+            Err(PromotionError::TargetNotEmpty),
+            "a promotion record of another inventory must refuse the destination"
         );
     }
 

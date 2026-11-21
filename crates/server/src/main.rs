@@ -477,7 +477,18 @@ async fn main() -> io::Result<()> {
                         if let Some(route) = route_slot.current() {
                             route.install_authority(cluster.authority_for(&partition));
                             if let Some(dlq_partition) = dlq_partition {
-                                route.install_dlq_authority(cluster.authority_for(&dlq_partition));
+                                let dlq_authority = cluster.authority_for(&dlq_partition);
+                                route.install_dlq_authority(dlq_authority);
+                                // The dependent authority must be observable: the test
+                                // harness proves that the expired placement is in place.
+                                eprintln!(
+                                    "Q1 DLQ authority: epoch={} owner={} lease_ms={}",
+                                    dlq_authority.map(|value| value.epoch).unwrap_or(0),
+                                    dlq_authority.map(|value| value.owner).unwrap_or(0),
+                                    dlq_authority
+                                        .map(|value| value.lease.as_millis())
+                                        .unwrap_or(0)
+                                );
                             }
                         }
                     }

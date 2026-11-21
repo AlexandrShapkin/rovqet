@@ -26,7 +26,7 @@ pub use authority::{Authority, Fence, FenceError};
 mod group;
 mod terminal;
 pub use fence::{FenceProof, FenceState};
-use fence::{decode_fence, encode_fence, fence_digest};
+pub use fence::{decode_fence, encode_fence, fence_digest};
 use group::{AckCommand, GroupFetchCommand, GroupState, MessageMeta};
 pub use group::{
     AckRequest, AckResult, GROUP_BATCH_BYTES, GROUP_MESSAGE_BYTES, GroupConfig, GroupDelivery,

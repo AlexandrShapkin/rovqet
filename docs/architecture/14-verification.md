@@ -138,4 +138,106 @@ fencing protocol at the durable commit boundary:
   committing further records while its committed history stays readable.
 
 The metadata Raft group, committed-metadata driven ownership transitions and the staged Q1
-migration are not yet verified and C-02 therefore stays IN_PROGRESS.
+migration are exercised by the safety matrix below. The recorded stage of C-02 itself is
+kept in `docs/roadmap/tasks.json`, not in this chapter.
+
+## C-02 safety matrix (executed part)
+
+The safety matrix executes the ownership handover of
+[09-cluster-control.md](09-cluster-control.md) against a deterministic fault model: every
+window is an exact operation boundary of the production code, not a simulation of one. The
+window is reached, the process is killed or isolated there, and an independent journal of
+externally observed results decides whether the transition stayed safe. The ownership,
+staging, fencing and activation results of the campaign are recorded in
+`docs/roadmap/tasks.json` and under `benchmarks/evidence/`; this section documents the
+contract the matrix is required to prove.
+
+### Deterministic seam model
+
+A named barrier is an exact operation boundary of the production path. It exists only in a
+build with the `fault-injection` feature: the process announces the barrier to the parent and
+waits, and the parent kills it there. A normal build compiles the seam away, so no
+release artifact can be paused or terminated at a barrier.
+
+The handover barriers are:
+
+- `chunk_before_send`, `chunk_after_write` (the staged bytes are written but not
+  synchronized), `chunk_after_append` (the staged bytes are synchronized) and
+  `chunk_after_sync` (the durable chunk receipt is journaled);
+- `before_catch_up_commit`, the boundary between the received inventory and its committed
+  preliminary evidence;
+- `before_fence` and `after_fence`, before and after the durable fence of the old owner;
+- `before_final_transfer`, the final post-fence delta;
+- `before_activate_commit`, the committed activation;
+- the promotion barriers of the paired promotion: the dependent inventory is promoted, the
+  durable readiness is recorded, and the source inventory is promoted;
+- the metadata barriers `after_migration_proposal` (a transition reached the leader but is
+  not committed) and `after_migration_commit` (the transition is committed and applied, the
+  confirmation is not delivered).
+
+The metadata barrier fires only on the committed leader. A follower never holds a barrier, so
+an isolated or slow follower cannot stall the group, and a transition that never reached the
+leader has no window to exercise.
+
+### Durable storage and transport controls
+
+Two environment families control the durable storage of one isolated broker process.
+`ROVQET_Q1_TEST_DIR`, `_STAGE`, `_SEQUENCE` and `_WAL_FAULT` select a disposable marker
+directory, the exact durability stage, a one-shot sequence number and a WAL fault point for
+the source partition; `ROVQET_Q1_DLQ_TEST_DIR`, `_STAGE`, `_SEQUENCE` and `_WAL_FAULT` are
+the equivalent for the dependent DLQ partition. The control pauses at the selected stage,
+writes a `reached-<stage>` marker and waits for the release marker, so the parent knows
+exactly when the window is open and when to terminate the process.
+
+The transport fault is directional and lives in `ROVQET_FAULT_BLOCK_FILE`: a marker file with
+a comma separated list of peer node ids whose outgoing path is blackholed. The file is read
+on every call, so the parent can isolate and restore a live process without restarting it.
+Only the outgoing direction is affected; the client facing listener keeps serving, which is
+what makes the asymmetric isolation case meaningful.
+
+### Windows the matrix must cover
+
+- the initial transfer interrupted before the target holds a committed inventory;
+- a chunk written before its synchronization;
+- a chunk synchronized with the acknowledgement lost;
+- the finalize interrupted before the committed transition;
+- the final post-fence delta interrupted;
+- the first durable commit of the successor interrupted around the commit/response boundary;
+- the metadata leader crashed with a transition pending, both before the commitment and
+  after the commitment but before the confirmation.
+
+### Live asymmetric isolation
+
+The old owner is not killed in this case: it stays alive and keeps serving inside its still
+valid authority, while the metadata majority stays reachable independently. The matrix must
+show that a fabricated or foreign fence proof is refused, that the successor does not
+activate while the old owner is unfenced, and that restoring the path lets the real fence and
+the handover complete.
+
+### Independent oracle
+
+`q1_oracle.reconcile_safety` reconciles the scenario journal from externally observed results
+only, never from a broker's own claim. A contradiction is `INVALID`, a broken safety
+invariant is `FAIL` and a journal without evidence is `NOT_RUN`. The oracle requires that:
+
+- every scenario reaches its barrier and declares its build identity; a missed barrier or a
+  missing conclusion is a failure, never a pass;
+- every killed process is restarted on its original storage;
+- no acknowledged publication disappears from a history observed after the acknowledgement,
+  and a producer token never changes its offset or its message identity;
+- an uncertain outcome is never classified as a definite noncommit;
+- the incarnation of an intact history never changes;
+- no target commit precedes the committed activation;
+- no old-owner commit follows its durable fence;
+- no activation happens without a verified transfer of the source inventory and, when a
+  bundle is moved, of the dependent inventory;
+- the committed stage never moves backwards and never skips;
+- a repeated committed transition never creates a second revision;
+- no disposition is published twice, and every disposition is proved against its
+  destination;
+- the cursor never moves backwards, and the staged chunk receipts are unique per chunk
+  identity with a stable digest and the expected count.
+
+The lease-expiry fallback stays unsupported. A handover needs the durable fence of the actual
+old owner; an expiry that merely lets the old owner stop committing is not accepted as a
+substitute for observing that fence.

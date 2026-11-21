@@ -321,7 +321,10 @@ impl MetadataNode {
     ) -> Result<crate::types::MetadataCommandResponse, MetadataError> {
         // A migration transition that this node submits to itself is pending from here until
         // the entry is committed: the barrier lets the parent kill the leader there.
-        if matches!(command, crate::types::MetadataCommand::AdvanceMigration { .. }) {
+        if matches!(
+            command,
+            crate::types::MetadataCommand::AdvanceMigration { .. }
+        ) {
             crate::barrier::barrier(crate::barrier::AFTER_MIGRATION_PROPOSAL);
         }
         match self.raft.client_write(command.clone()).await {

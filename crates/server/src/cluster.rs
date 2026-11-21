@@ -1683,4 +1683,386 @@ mod successor_tests {
             "the fenced old owner must not commit another publication"
         );
     }
+
+    /// Scenario C13 regression: the process dies after the `FENCE_OLD` transition was
+    /// committed but before the activation. The restarted coordinator must finish the
+    /// final post-fence delta on the committed fence proofs instead of leaving the old
+    /// owner durably fenced and the successor inactive for ever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn the_committed_fence_stage_resumes_the_final_delta_and_activates_the_successor() {
+        let raft_ports = [free_port(), free_port(), free_port()];
+        let raft_peers: Vec<(u64, SocketAddr)> = (1..=3)
+            .map(|node| {
+                (
+                    node,
+                    format!("127.0.0.1:{}", raft_ports[node as usize - 1])
+                        .parse()
+                        .expect("addr"),
+                )
+            })
+            .collect();
+        let source_address: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+        let target_address: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+        let source_staging = directory("source-resume");
+        let target_staging = directory("target-resume");
+        let source_directory = directory("source-resume-q1");
+        let target_directory = directory("target-resume-q1");
+
+        let source_cluster = Arc::new(
+            Cluster::new(&ClusterOptions {
+                cluster_id: CLUSTER,
+                node_id: 1,
+                listen: source_address,
+                peers: vec![(2, target_address)],
+                metadata: None,
+                metadata_raft: Some(MetadataRaftOptions {
+                    cluster_id: CLUSTER,
+                    node_id: 1,
+                    listen: raft_peers[0].1,
+                    peers: raft_peers.clone(),
+                    data_directory: directory("source-resume-raft"),
+                    bootstrap: true,
+                }),
+                transfer_staging: Some(source_staging.clone()),
+            })
+            .await
+            .expect("the source cluster"),
+        );
+        let target_cluster = Arc::new(
+            Cluster::new(&ClusterOptions {
+                cluster_id: CLUSTER,
+                node_id: 2,
+                listen: target_address,
+                peers: vec![(1, source_address)],
+                metadata: None,
+                metadata_raft: Some(MetadataRaftOptions {
+                    cluster_id: CLUSTER,
+                    node_id: 2,
+                    listen: raft_peers[1].1,
+                    peers: raft_peers.clone(),
+                    data_directory: directory("target-resume-raft"),
+                    bootstrap: false,
+                }),
+                transfer_staging: Some(target_staging.clone()),
+            })
+            .await
+            .expect("the target cluster"),
+        );
+        let _source_stop = serve(source_cluster.clone(), source_address).await;
+        let _target_stop = serve(target_cluster.clone(), target_address).await;
+
+        let source_raft = source_cluster.raft.clone().expect("the source voter");
+        let target_raft = target_cluster.raft.clone().expect("the target voter");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while source_raft.current_leader().await != Some(1) && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(source_raft.current_leader().await, Some(1));
+
+        for command in [
+            MetadataCommand::SetNode {
+                node: 1,
+                address: "127.0.0.1:1".into(),
+            },
+            MetadataCommand::SetNode {
+                node: 2,
+                address: "127.0.0.1:2".into(),
+            },
+            MetadataCommand::SetPlacement {
+                tenant_id: 1,
+                topic_id: 3,
+                partition_id: 0,
+                owner: 1,
+                ownership_epoch: 7,
+                lease_valid_for_ms: 600_000,
+            },
+        ] {
+            let response = source_raft
+                .propose(command)
+                .await
+                .expect("committed metadata");
+            assert!(
+                matches!(
+                    response,
+                    rovqet_metadata_raft::types::MetadataCommandResponse::Applied { .. }
+                ),
+                "the metadata command must be applied"
+            );
+        }
+
+        // The source opens its route because the committed metadata names it as the owner.
+        let source_slot = Arc::new(RouteSlot::default());
+        tokio::spawn(crate::migration::run_activator(
+            source_cluster.clone(),
+            source_raft.clone(),
+            source_slot.clone(),
+            q1_options(source_directory.clone(), 1, true),
+            1,
+            Some(source_staging.clone()),
+        ));
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while source_slot.current().is_none() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let source_route = source_slot.current().expect("the source route must open");
+
+        // A committed history that is large enough for the final delta to take real work:
+        // the interruption must land inside the post-fence transfer window, not after it.
+        let request = RoutePublishRequest {
+            tenant_id: 1,
+            topic_id: 3,
+            partition_id: 0,
+            qos: 1,
+            ownership_epoch: 7,
+            producer_id: 11,
+            producer_epoch: 1,
+            producer_sequence: 0,
+            message_id: 777,
+            ttl_ms: 600_000,
+            payload: b"committed before the migration".to_vec(),
+        };
+        let published = source_route
+            .publish_durable(&request)
+            .await
+            .expect("the publication must commit");
+        let original_offset = published.sequence;
+        for sequence in 1..=16u64 {
+            source_route
+                .publish_durable(&RoutePublishRequest {
+                    producer_sequence: sequence,
+                    message_id: 777 + u128::from(sequence),
+                    payload: vec![0x5a; 128 * 1024],
+                    ..request.clone()
+                })
+                .await
+                .expect("the padding publication must commit");
+        }
+
+        // The target waits for the committed activation.
+        let target_slot = Arc::new(RouteSlot::default());
+        tokio::spawn(crate::migration::run_activator(
+            target_cluster.clone(),
+            target_raft.clone(),
+            target_slot.clone(),
+            q1_options(target_directory.clone(), 2, false),
+            2,
+            Some(target_staging.clone()),
+        ));
+
+        // The committed transitions are watched from the very beginning, so the committed
+        // fence stage is caught while the fresh coordinator is still in its final transfer.
+        let mut updates = source_raft.committed_updates();
+        let migration_id = crate::migration::migration_id(1, 3, 0, 42, 1, 2);
+        let response = source_raft
+            .propose(MetadataCommand::BeginMigration {
+                migration_id,
+                tenant_id: 1,
+                topic_id: 3,
+                partition_id: 0,
+                source_node: 1,
+                target_node: 2,
+                source_incarnation: 42,
+                original_epoch: 7,
+                next_epoch: 8,
+                dependent_partitions: Vec::new(),
+            })
+            .await
+            .expect("the migration must be committed");
+        assert!(
+            matches!(
+                response,
+                rovqet_metadata_raft::types::MetadataCommandResponse::Applied { .. }
+            ),
+            "the migration must be accepted"
+        );
+        let driver = MigrationDriver::new(
+            source_cluster.transport.clone(),
+            source_raft.clone(),
+            source_directory.clone(),
+            1,
+        );
+        let coordinator_slot =
+            std::sync::Arc::new(crate::q1::RouteSlot::new(Some(source_route.clone())));
+        let coordinator = tokio::spawn(crate::migration::run_coordinator(
+            driver,
+            coordinator_slot,
+            coordinator_options(source_directory.clone()),
+            1,
+            None,
+        ));
+
+        // The coordinator commits the fence stage in `catch_up_stage` and immediately
+        // begins the final delta. It is interrupted while the committed stage is exactly
+        // FENCE_OLD: the durable fence exists, the activation does not.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            match source_raft
+                .applied_state()
+                .migrations
+                .get(&migration_id)
+                .map(|record| record.stage)
+            {
+                Some(MigrationStage::FenceOld) => break,
+                Some(MigrationStage::ActivateNew) => panic!(
+                    "the coordinator completed the activation before it could be \
+                     interrupted; the final delta window was missed"
+                ),
+                _ => {}
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the migration must reach the committed fence stage"
+            );
+            tokio::select! {
+                changed = updates.changed() => {
+                    changed.expect("the metadata group must stay available");
+                }
+                _ = tokio::time::sleep(Duration::from_millis(1)) => {}
+            }
+        }
+        coordinator.abort();
+        let _ = tokio::time::timeout(Duration::from_secs(10), coordinator).await;
+
+        // Nothing finished the handover behind the interrupted coordinator: the state
+        // really is the committed fence without a committed activation.
+        let interrupted = source_raft
+            .applied_state()
+            .migrations
+            .get(&migration_id)
+            .cloned()
+            .expect("the committed migration record");
+        assert_eq!(
+            interrupted.stage,
+            MigrationStage::FenceOld,
+            "the coordinator must be interrupted between the committed fence and the \
+             activation"
+        );
+        let committed_fence = interrupted
+            .fence_proof
+            .clone()
+            .expect("the committed fence stage must carry the source fence proof");
+        let settle = std::time::Instant::now() + Duration::from_millis(300);
+        while std::time::Instant::now() < settle {
+            let stage = source_raft
+                .applied_state()
+                .migrations
+                .get(&migration_id)
+                .map(|record| record.stage);
+            assert_eq!(
+                stage,
+                Some(MigrationStage::FenceOld),
+                "the interrupted window must stay at the committed fence stage"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // A fresh coordinator restarts against exactly the committed state. It must take
+        // the FENCE_OLD resume path: transfer the final delta on the committed proofs and
+        // commit the activation — the same command the fresh path commits.
+        let resume_driver = MigrationDriver::new(
+            source_cluster.transport.clone(),
+            source_raft.clone(),
+            source_directory.clone(),
+            1,
+        );
+        let resume_slot =
+            std::sync::Arc::new(crate::q1::RouteSlot::new(Some(source_route.clone())));
+        tokio::spawn(crate::migration::run_coordinator(
+            resume_driver,
+            resume_slot,
+            coordinator_options(source_directory.clone()),
+            1,
+            None,
+        ));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(90);
+        let mut activated = false;
+        while std::time::Instant::now() < deadline {
+            let state = source_raft.applied_state();
+            if let Some(record) = state.migrations.get(&migration_id) {
+                if record.stage == MigrationStage::ActivateNew {
+                    activated = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            activated,
+            "the resumed coordinator must commit the activation"
+        );
+
+        // The resumed activation keeps the committed fence evidence: the resume path must
+        // not mint a new proof, and a migration with a dependent partition must carry the
+        // dependent fence proof in its committed evidence again.
+        let finished = source_raft
+            .applied_state()
+            .migrations
+            .get(&migration_id)
+            .cloned()
+            .expect("the committed migration record");
+        let resumed_fence = finished
+            .fence_proof
+            .clone()
+            .expect("the committed activation must carry the source fence proof");
+        assert_eq!(resumed_fence.migration_id, committed_fence.migration_id);
+        assert_eq!(resumed_fence.old_owner, committed_fence.old_owner);
+        assert_eq!(resumed_fence.old_epoch, committed_fence.old_epoch);
+        assert_eq!(resumed_fence.fence_offset, committed_fence.fence_offset);
+        assert_eq!(resumed_fence.fence_digest, committed_fence.fence_digest);
+        assert_eq!(
+            resumed_fence.manifest_generation,
+            committed_fence.manifest_generation
+        );
+        for evidence in &finished.dependent_evidence {
+            assert!(
+                evidence.fence_proof.is_some(),
+                "the resumed activation must carry the dependent fence proof again"
+            );
+        }
+
+        // The successor opens the transferred history.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while target_slot.current().is_none() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let target_route = target_slot
+            .current()
+            .expect("the successor must open the transferred history");
+
+        let fetched = target_route
+            .group_fetch_routed(&rovqet_control::rpc::RouteFetchRequest {
+                tenant_id: 1,
+                topic_id: 3,
+                partition_id: 0,
+                group_id: 1,
+                generation: 0,
+                max_messages: 64,
+                max_bytes: 1024 * 1024,
+                wait_ms: 0,
+            })
+            .await
+            .expect("the transferred history must be fetchable");
+        assert!(
+            !fetched.deliveries.is_empty(),
+            "the transferred message must be delivered"
+        );
+        assert_eq!(fetched.deliveries[0].offset.sequence, original_offset);
+        assert_eq!(fetched.deliveries[0].offset.log_incarnation, 42);
+
+        // The old owner stayed durably fenced through the resume.
+        let refused = source_route
+            .publish_durable(&RoutePublishRequest {
+                producer_sequence: 17,
+                message_id: 999,
+                payload: b"after the fence".to_vec(),
+                ..request.clone()
+            })
+            .await;
+        assert!(
+            refused.is_err(),
+            "the fenced old owner must not commit another publication"
+        );
+    }
 }

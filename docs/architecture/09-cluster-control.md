@@ -157,6 +157,12 @@ fences are then ordered explicitly: the source first (it can no longer append at
 DLQ second (nothing can reach it afterwards). A repeated fence of the same handover returns
 the same durable proof, so an interrupted coordination can retry the second fence.
 
+**Ordered bundle fences.** The order is part of the contract: the terminal path is quiesced
+first, then the source is fenced, then the dependent. A fenced or quiesced owner never
+completes a pending disposition, so a dependent publication cannot happen after the bundle
+fence; the unfinished disposition survives into the transferred history and is proven
+against its destination before activation instead of being replayed by the old owner.
+
 **One activation.** The committed activation carries the source fence, the dependent fence
 evidence, both final watermarks and both final manifest identities, and it moves both
 placements in one entry. Before it is proposed, every committed terminal disposition of DLQ
@@ -172,3 +178,9 @@ The recovered DLQ partition is opened first and the source is opened against it,
 durable recovery of the source history verifies every committed terminal reference of the
 transferred DLQ. The committed authority of both placements is installed only after that, and
 the route is published last.
+
+**Evidence chain of the successor.** The committed fence proof is verified against the
+durable fence record of the promoted history before the route opens: the proof must name the
+same handover, the same partition and the same old owner epoch as the fence the target
+actually promoted. A proof that does not match the promoted history — fabricated, foreign, or
+of an older epoch — cannot activate a successor, and the route stays closed.

@@ -3,7 +3,9 @@
 //! The driver observes the committed migration record and performs the stages in order:
 //! it transfers the committed history, fences itself durably, transfers the final delta
 //! and only then asks the metadata group to commit the activation. The committed metadata
-//! is the only authority: a local timer never advances a stage.
+//! is the only authority: a local timer never advances a stage. A process that dies after
+//! the fence stage was committed but before the activation resumed the final transfer on
+//! the committed fence proofs instead of stalling the handover for ever.
 use crate::transfer::{bytes_to_hex, hex_to_bytes, sha256};
 use rovqet_control::TimeoutBudget;
 use rovqet_control::ids::NodeId;
@@ -13,7 +15,7 @@ use rovqet_control::rpc::{
     Q1TransferPrepareResponse, Q1TransferStatus, RpcErrorCode, RpcKind,
 };
 use rovqet_control::transport::PeerTransport;
-use rovqet_core::PartitionRef;
+use rovqet_core::{DurableOffset, PartitionRef};
 use rovqet_metadata_raft::MetadataNode;
 use rovqet_metadata_raft::sm::{MigrationState, PlacementState};
 use rovqet_metadata_raft::types::{FenceProof, MetadataCommand, MigrationStage};
@@ -626,6 +628,99 @@ fn verify_fence(
     Ok(())
 }
 
+/// Verifies that a committed fence proof is the fence record of a promoted history.
+///
+/// The state machine binds a submitted proof to the migration, the old owner and the
+/// revoked epoch, but only this check binds it to storage: the record at
+/// `proof.fence_offset` of the promoted history must exist, must be a FENCE record, must
+/// revoke exactly the migration, owner and epoch of the proof, and its payload digest
+/// must be the `fence_digest` of the proof. A successor therefore never activates on a
+/// transferred history whose committed fence proof was fabricated.
+///
+/// Every deviation — a missing record, another record kind, another identity or another
+/// digest — is refused with a message that names it. The verification only reads
+/// already-promoted storage and never panics.
+pub fn verify_fence_against_history(
+    directory: &Path,
+    partition: PartitionRef,
+    incarnation: u128,
+    proof: &FenceProof,
+) -> Result<(), String> {
+    if !directory.join("MANIFEST").is_file() {
+        return Err(format!(
+            "the promoted history of partition {partition:?} incarnation {incarnation} \
+             carries no manifest"
+        ));
+    }
+    let config = rovqet_wal::Config {
+        partition,
+        incarnation,
+        ..Default::default()
+    };
+    let max_record_bytes = config.max_record_bytes;
+    let wal = rovqet_wal::Wal::open(directory, config).map_err(|error| {
+        format!(
+            "the promoted history of partition {partition:?} incarnation {incarnation} \
+             is unreadable: {error}"
+        )
+    })?;
+    let records = wal
+        .read(
+            DurableOffset {
+                log_incarnation: incarnation,
+                sequence: proof.fence_offset,
+            },
+            1,
+            max_record_bytes,
+        )
+        .map_err(|error| {
+            format!(
+                "the fence record at offset {} of the promoted history is missing: {error}",
+                proof.fence_offset
+            )
+        })?;
+    let Some(record) = records.into_iter().next() else {
+        return Err(format!(
+            "the fence record at offset {} of the promoted history is missing",
+            proof.fence_offset
+        ));
+    };
+    if record.kind != rovqet_wal::RecordKind::Fence {
+        return Err(format!(
+            "the record at offset {} of the promoted history is not a fence record ({:?})",
+            proof.fence_offset, record.kind
+        ));
+    }
+    let (migration_id, old_owner, old_epoch, _) = rovqet_durable::decode_fence(&record.payload)
+        .map_err(|error| {
+            format!(
+                "the fence record at offset {} of the promoted history is not decodable: \
+                 {error}",
+                proof.fence_offset
+            )
+        })?;
+    if migration_id != proof.migration_id
+        || old_owner != proof.old_owner
+        || old_epoch != proof.old_epoch
+    {
+        return Err(format!(
+            "the fence record at offset {} revokes migration {migration_id}, owner \
+             {old_owner} epoch {old_epoch}, but the proof names migration {}, owner {} \
+             epoch {}",
+            proof.fence_offset, proof.migration_id, proof.old_owner, proof.old_epoch
+        ));
+    }
+    let digest = rovqet_durable::fence_digest(&record.payload);
+    if digest != proof.fence_digest {
+        return Err(format!(
+            "the fence digest of the proof ({}) is not the digest of the durable fence \
+             record ({digest})",
+            proof.fence_digest
+        ));
+    }
+    Ok(())
+}
+
 /// One verified transferred inventory.
 #[derive(Debug, Clone)]
 struct TransferredInventory {
@@ -949,9 +1044,67 @@ pub async fn run_coordinator(
                         }
                     }
                 }
-                MigrationStage::FenceOld
-                | MigrationStage::ActivateNew
-                | MigrationStage::Cleanup => {}
+                MigrationStage::FenceOld => {
+                    // CRASH RESUME: a committed fence without a committed activation is
+                    // exactly the interrupted window of the final post-fence delta. The
+                    // committed proofs are the authority on this path: it never quiesces
+                    // and never fences again, it only repeats the final transfer of both
+                    // members on the proofs the metadata group already committed and
+                    // commits the one activation the fresh path would have committed.
+                    let Some(source_fence) = record.fence_proof.clone() else {
+                        eprintln!(
+                            "the committed fence stage of migration {} carries no source \
+                             fence proof; the handover stays interrupted",
+                            record.migration_id
+                        );
+                        return;
+                    };
+                    let dependent_fence = if record.dependent_partitions.is_empty() {
+                        None
+                    } else {
+                        let [dependency] = record.dependent_partitions.as_slice() else {
+                            eprintln!(
+                                "a coordinated handover moves exactly one dependent \
+                                 partition; the handover stays interrupted"
+                            );
+                            return;
+                        };
+                        let evidence = record.dependent_evidence.iter().find(|evidence| {
+                            evidence.tenant_id == dependency.tenant_id
+                                && evidence.topic_id == dependency.topic_id
+                                && evidence.partition_id == dependency.partition_id
+                        });
+                        match evidence.and_then(|evidence| evidence.fence_proof.clone()) {
+                            Some(proof) => Some(proof),
+                            None => {
+                                eprintln!(
+                                    "the committed fence stage of migration {} carries no \
+                                     dependent fence proof; the handover stays interrupted",
+                                    record.migration_id
+                                );
+                                return;
+                            }
+                        }
+                    };
+                    match finalize_stage(
+                        &driver,
+                        &route,
+                        &state.placements,
+                        &record,
+                        target,
+                        &source_fence,
+                        dependent_fence.as_ref(),
+                    )
+                    .await
+                    {
+                        Ok(()) => {}
+                        Err(error) => {
+                            eprintln!("metadata migration finalization failed: {error}");
+                            return;
+                        }
+                    }
+                }
+                MigrationStage::ActivateNew | MigrationStage::Cleanup => {}
             }
         }
         .await;
@@ -1113,6 +1266,10 @@ async fn prepare_stage(
 ///
 /// A failure between the two fences leaves the source fenced and the migration at CATCH_UP:
 /// the coordinator retries and the repeated fence returns the same durable proof.
+///
+/// The tail of this stage — the final post-fence transfer of both members and the committed
+/// activation — is [`finalize_stage`], the same step the coordinator runs when it restarts
+/// onto an already committed `FENCE_OLD` stage.
 async fn catch_up_stage(
     driver: &MigrationDriver,
     route: &crate::q1::Route,
@@ -1226,6 +1383,40 @@ async fn catch_up_stage(
     {
         report("committed", updated, driver.raft().applied_state().revision);
     }
+    // 5..7. The final inventories and the committed activation: the very same step the
+    // coordinator resumes with when this process dies after the committed fence stage.
+    finalize_stage(
+        driver,
+        route,
+        placements,
+        record,
+        target,
+        &source_fence,
+        dependent_fence.as_ref(),
+    )
+    .await
+}
+
+/// FINALE: transfer the final inventories on existing fence evidence and commit the
+/// activation.
+///
+/// This step never quiesces and never fences: the two durable fences are an input, not an
+/// action. On the fresh path the caller just minted and committed them; on the resumed path
+/// (the committed stage is already `FENCE_OLD`) the caller passes the committed proofs of
+/// the record itself, because a committed fence is the authority and a restart must never
+/// mint a second one. Both paths therefore commit exactly one identical
+/// `AdvanceMigration { stage: ActivateNew, .. }`, so the state machine's idempotency and
+/// dependency checks behave the same for a fresh handover and for a resumed one.
+async fn finalize_stage(
+    driver: &MigrationDriver,
+    route: &crate::q1::Route,
+    placements: &[PlacementState],
+    record: &MigrationState,
+    target: NodeId,
+    source_fence: &FenceProof,
+    dependent_fence: Option<&FenceProof>,
+) -> Result<(), MigrationError> {
+    let bundle = resolve_bundle(record, placements, route, driver.directory())?;
     // 5. Final catch up: the logs are final now, so both watermarks are stable.
     // The fences are already durable: a crash here leaves both old partitions fenced and
     // the target without the final history.
@@ -1237,7 +1428,7 @@ async fn catch_up_stage(
         record,
         &bundle.source,
         source_fence.manifest_generation,
-        Some(&source_fence),
+        Some(source_fence),
         source_watermark,
     )
     .await?;
@@ -1262,10 +1453,9 @@ async fn catch_up_stage(
             record,
             dependent,
             dependent_fence
-                .as_ref()
                 .map(|proof| proof.manifest_generation)
                 .unwrap_or_default(),
-            dependent_fence.as_ref(),
+            dependent_fence,
             watermark,
         )
         .await?;
@@ -1314,7 +1504,7 @@ async fn catch_up_stage(
         }
         dependencies = dependent_evidence(
             &bundle,
-            dependent_fence.clone(),
+            dependent_fence.cloned(),
             Some(transferred.watermark),
             Some(transferred.manifest_id),
             true,
@@ -1435,6 +1625,76 @@ pub async fn run_activator(
                                 );
                                 return None;
                             }
+                            // The committed fence proof of the source member must be the
+                            // fence record the promoted source history really carries:
+                            // a fabricated proof never opens the route.
+                            let Some(fence) = record.fence_proof.as_ref() else {
+                                eprintln!(
+                                    "the committed activation carries no source fence \
+                                     proof; the successor stays inactive"
+                                );
+                                return None;
+                            };
+                            if let Err(error) = verify_fence_against_history(
+                                &route_options.directory,
+                                options.partition,
+                                record.source_incarnation,
+                                fence,
+                            ) {
+                                eprintln!(
+                                    "the committed fence proof of the source member was \
+                                     refused: {error}; the successor stays inactive"
+                                );
+                                return None;
+                            }
+                            // The dependent member is verified against its own promoted
+                            // DLQ history: its fence offset names the DLQ log.
+                            let Some(dependency) = record.dependent_partitions.first() else {
+                                eprintln!(
+                                    "the committed bundle carries no dependent partition; \
+                                     the successor stays inactive"
+                                );
+                                return None;
+                            };
+                            let Some(evidence) =
+                                record.dependent_evidence.iter().find(|evidence| {
+                                    evidence.tenant_id == dependency.tenant_id
+                                        && evidence.topic_id == dependency.topic_id
+                                        && evidence.partition_id == dependency.partition_id
+                                })
+                            else {
+                                eprintln!(
+                                    "the committed activation carries no evidence of the \
+                                     dependent member; the successor stays inactive"
+                                );
+                                return None;
+                            };
+                            let Some(dependent_fence) = evidence.fence_proof.as_ref() else {
+                                eprintln!(
+                                    "the committed activation carries no dependent fence \
+                                     proof; the successor stays inactive"
+                                );
+                                return None;
+                            };
+                            let Some(dlq) = route_options.dlq.as_ref() else {
+                                eprintln!(
+                                    "the committed dependency is not configured on this \
+                                     successor; the successor stays inactive"
+                                );
+                                return None;
+                            };
+                            if let Err(error) = verify_fence_against_history(
+                                &dlq.directory,
+                                dlq.partition,
+                                evidence.incarnation,
+                                dependent_fence,
+                            ) {
+                                eprintln!(
+                                    "the committed fence proof of the dependent member was \
+                                     refused: {error}; the successor stays inactive"
+                                );
+                                return None;
+                            }
                         }
                         Err(error) => {
                             eprintln!("the bundle promotion was refused: {error}");
@@ -1491,6 +1751,28 @@ pub async fn run_activator(
                         &plan,
                     ) {
                         eprintln!("the promoted storage was refused: {error}");
+                        return None;
+                    }
+                    // The committed fence proof must be the fence record the promoted
+                    // source history really carries: a fabricated proof never opens the
+                    // route.
+                    let Some(fence) = record.fence_proof.as_ref() else {
+                        eprintln!(
+                            "the committed activation carries no fence proof; \
+                             the successor stays inactive"
+                        );
+                        return None;
+                    };
+                    if let Err(error) = verify_fence_against_history(
+                        &route_options.directory,
+                        options.partition,
+                        record.source_incarnation,
+                        fence,
+                    ) {
+                        eprintln!(
+                            "the committed fence proof was refused: {error}; \
+                             the successor stays inactive"
+                        );
                         return None;
                     }
                     // The transferred history keeps its incarnation.
@@ -2450,5 +2732,748 @@ mod bundle_tests {
             error.contains("readiness"),
             "the refusal must name the readiness record: {error}"
         );
+    }
+
+    #[test]
+    fn a_dependent_staging_area_of_another_inventory_is_refused() {
+        let (root, source, dlq) = directories();
+        let staging_root = root.path().join("staging");
+        std::fs::create_dir_all(&staging_root).expect("staging root");
+        let source_manifest = staging(
+            &staging_root,
+            Q1TransferMember::Source,
+            &[("MANIFEST", b"source manifest")],
+        );
+        let dependent_manifest = staging(
+            &staging_root,
+            Q1TransferMember::Dependent,
+            &[("MANIFEST", b"dependent manifest")],
+        );
+        let record = activation(&source_manifest, &dependent_manifest, 77);
+        // The staging area that is named after the committed dependent inventory holds the
+        // bytes of a different inventory: the promotion must refuse it instead of publishing
+        // the unstaged bytes into the dependent directory.
+        let dependent_staging = crate::promotion::staging_area(
+            &staging_root,
+            MIGRATION,
+            Q1TransferMember::Dependent,
+            &hex_to_bytes(&dependent_manifest),
+        );
+        std::fs::write(
+            dependent_staging.join("part-000000.bin"),
+            b"another inventory",
+        )
+        .expect("foreign staged bytes");
+        let configured = options(source.clone(), Some(dlq.clone()));
+        let error = promote_bundle(&record, &configured, &staging_root, 9, 8)
+            .expect_err("a dependent staging area of another inventory must be refused");
+        assert!(
+            error.contains("dependent promotion"),
+            "the refusal must name the dependent promotion: {error}"
+        );
+        assert!(
+            error.contains("DigestMismatch"),
+            "the refused bytes must be named as an inventory mismatch: {error}"
+        );
+        assert!(
+            !dlq.join("MANIFEST").is_file(),
+            "a refused dependent promotion must not publish the dependent history"
+        );
+        assert!(
+            !source.join("MANIFEST").is_file(),
+            "the source must never be published after a refused dependent promotion"
+        );
+    }
+
+    #[test]
+    fn a_bundle_without_the_source_staging_area_never_publishes_the_source() {
+        let (root, source, dlq) = directories();
+        let staging_root = root.path().join("staging");
+        std::fs::create_dir_all(&staging_root).expect("staging root");
+        let source_manifest = staging(
+            &staging_root,
+            Q1TransferMember::Source,
+            &[("MANIFEST", b"source manifest")],
+        );
+        let dependent_manifest = staging(
+            &staging_root,
+            Q1TransferMember::Dependent,
+            &[("MANIFEST", b"dependent manifest")],
+        );
+        let record = activation(&source_manifest, &dependent_manifest, 77);
+        // The source inventory was verified, but its staging area is gone.
+        let source_staging = crate::promotion::staging_area(
+            &staging_root,
+            MIGRATION,
+            Q1TransferMember::Source,
+            &hex_to_bytes(&source_manifest),
+        );
+        std::fs::remove_dir_all(&source_staging).expect("remove the source staging area");
+        let configured = options(source.clone(), Some(dlq.clone()));
+        let error = promote_bundle(&record, &configured, &staging_root, 9, 8)
+            .expect_err("a missing source staging area must stop the promotion");
+        assert!(
+            error.contains("source promotion"),
+            "the refusal must name the source promotion: {error}"
+        );
+        assert!(
+            !source.join("MANIFEST").is_file(),
+            "the successor must not become active without its source history"
+        );
+        // The dependent history was published first and stays: the interrupted bundle is
+        // resumable and never hidden behind a half-published source.
+        assert!(dlq.join("MANIFEST").is_file());
+    }
+
+    #[test]
+    fn a_promotion_record_of_another_activation_is_refused() {
+        let (root, source, dlq) = directories();
+        let staging_root = root.path().join("staging");
+        std::fs::create_dir_all(&staging_root).expect("staging root");
+        let source_manifest = staging(
+            &staging_root,
+            Q1TransferMember::Source,
+            &[("MANIFEST", b"source manifest")],
+        );
+        let dependent_manifest = staging(
+            &staging_root,
+            Q1TransferMember::Dependent,
+            &[("MANIFEST", b"dependent manifest")],
+        );
+        let record = activation(&source_manifest, &dependent_manifest, 77);
+        let configured = options(source.clone(), Some(dlq));
+        promote_bundle(&record, &configured, &staging_root, 9, 8)
+            .expect("the paired promotion completes");
+        let committed = crate::promotion::promotion_record(&source)
+            .expect("the promotion record is readable")
+            .expect("the source promotion is recorded");
+        assert_eq!(committed.migration_id, MIGRATION);
+        assert_eq!(committed.state, crate::promotion::PromotionState::Promoted);
+        // A promotion record of another activation in the same directory is never accepted.
+        let error = verify_promotion(
+            &source,
+            MIGRATION ^ 1,
+            &record.source_incarnation,
+            record.tenant_id,
+            record.topic_id,
+            record.partition_id,
+        )
+        .expect_err("a promotion record of another activation must be refused");
+        assert!(
+            error.contains("another activation"),
+            "the refusal must name the foreign activation: {error}"
+        );
+        // The committed promotion record of the activated bundle stays intact.
+        let intact = crate::promotion::promotion_record(&source)
+            .expect("the promotion record is still readable")
+            .expect("the source promotion is still recorded");
+        assert_eq!(
+            intact, committed,
+            "refusing a foreign activation must not rewrite the committed promotion"
+        );
+    }
+}
+
+#[cfg(test)]
+mod adversarial_recovery_tests {
+    //! The recovery cases of the C-02 safety assignment.
+    //!
+    //! Every test builds a real Q1 history with the durable partition, promotes it with the
+    //! real promotion protocol and then requires that the real recovery refuses bytes that
+    //! are not exactly the history the activation committed. A refused history never becomes
+    //! an active route.
+    use super::*;
+    use rovqet_core::{DurableOffset, PartitionRef, PublishOutcome, QoS};
+    use rovqet_durable::{
+        DlqError, DlqPublisher, DlqRecord, GroupConfig, Partition, PartitionConfig, PublishRequest,
+        TerminalPolicy,
+    };
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    const MIGRATION: u128 = 0x7171_7171_7171_7171;
+    const INCARNATION: u128 = 42;
+    const EPOCH: u64 = 8;
+    const NODE: u64 = 2;
+    const DLQ_INCARNATION: u128 = 77;
+
+    fn source_partition() -> PartitionRef {
+        PartitionRef {
+            tenant_id: 1,
+            topic_id: 3,
+            partition_id: 0,
+        }
+    }
+
+    fn dependent_partition() -> PartitionRef {
+        PartitionRef {
+            tenant_id: 1,
+            topic_id: 7,
+            partition_id: 0,
+        }
+    }
+
+    fn options(
+        directory: std::path::PathBuf,
+        dlq: Option<std::path::PathBuf>,
+    ) -> crate::q1::Options {
+        crate::q1::Options {
+            directory,
+            topic: "durable".into(),
+            node_id: NODE,
+            partition: source_partition(),
+            incarnation: INCARNATION,
+            owner_epoch: EPOCH,
+            dedup_window: Duration::from_secs(86400),
+            max_producers: 64,
+            max_outcomes: 64,
+            initialize_new_log: false,
+            terminal_policy: TerminalPolicy::Dlq,
+            max_attempts: 1,
+            retry_initial: Duration::from_millis(10),
+            retry_max: Duration::from_millis(100),
+            dlq: dlq.map(|directory| crate::q1::DlqOptions {
+                directory,
+                topic: "durable-dlq".into(),
+                partition: dependent_partition(),
+                incarnation: DLQ_INCARNATION,
+                owner_epoch: EPOCH,
+                max_outcomes: 64,
+                max_producers: 64,
+            }),
+        }
+    }
+
+    fn partition_config(partition: PartitionRef, group: GroupConfig) -> PartitionConfig {
+        PartitionConfig {
+            partition,
+            ownership_epoch: EPOCH,
+            node_id: NODE,
+            queue_messages: 64,
+            queue_bytes: 8 * 1024 * 1024,
+            max_outcomes: 64,
+            max_producers: 64,
+            dedup_window: Duration::from_secs(86400),
+            group,
+        }
+    }
+
+    fn publish_request(partition: PartitionRef, message_id: u128) -> PublishRequest {
+        PublishRequest {
+            partition,
+            qos: QoS::Q1,
+            ownership_epoch: EPOCH,
+            principal: 1,
+            producer_id: 7,
+            producer_epoch: 1,
+            sequence: 0,
+            message_id,
+            payload: b"committed history".to_vec(),
+        }
+    }
+
+    /// Builds a real, committed Q1 history of the given identity and incarnation.
+    fn real_history(directory: &Path, partition: PartitionRef, incarnation: u128) {
+        std::fs::create_dir_all(directory).expect("the history directory exists");
+        let history = Partition::open(
+            directory,
+            rovqet_wal::Config {
+                partition,
+                incarnation,
+                ..Default::default()
+            },
+            partition_config(partition, GroupConfig::default()),
+        )
+        .expect("the source history opens");
+        match history
+            .try_publish(publish_request(partition, 500))
+            .expect("the publication is admitted")
+            .wait()
+            .expect("the publication commits")
+        {
+            PublishOutcome::CommittedLocal(_) => {}
+            other => panic!("the source record must commit locally: {other:?}"),
+        }
+        history.shutdown().expect("the history shuts down");
+    }
+
+    /// Promotes the files of a real history with the real promotion protocol.
+    fn promote_history(
+        history: &Path,
+        staging: &Path,
+        target: &Path,
+        partition: PartitionRef,
+        incarnation: u128,
+    ) {
+        let files = partition_inventory(history).expect("the real inventory is readable");
+        assert!(
+            !files.is_empty(),
+            "a real history carries at least a manifest and a segment"
+        );
+        std::fs::create_dir_all(staging).expect("the staging area exists");
+        let declared: Vec<serde_json::Value> = files
+            .iter()
+            .map(|file| {
+                serde_json::json!({
+                    "name": file.name,
+                    "size": file.size,
+                    "digest": bytes_to_hex(&file.digest),
+                })
+            })
+            .collect();
+        let document = serde_json::json!({
+            "migration_id": MIGRATION.to_string(),
+            "files": declared,
+        });
+        std::fs::write(
+            staging.join("staging.json"),
+            serde_json::to_vec(&document).expect("the staging manifest"),
+        )
+        .expect("the staging manifest");
+        for (index, file) in files.iter().enumerate() {
+            std::fs::copy(
+                history.join(&file.name),
+                staging.join(format!("part-{index:06}.bin")),
+            )
+            .expect("the staged file is copied");
+        }
+        std::fs::create_dir_all(target).expect("the target directory exists");
+        // The file list is taken from the staging manifest, exactly like the real promotion:
+        // the plan only carries the identity of the activation.
+        let plan = crate::promotion::PromotionRecord {
+            migration_id: MIGRATION,
+            inventory_digest: "00".repeat(32),
+            incarnation,
+            tenant_id: partition.tenant_id,
+            topic_id: partition.topic_id,
+            partition_id: partition.partition_id,
+            target_epoch: EPOCH,
+            activation_revision: 9,
+            files: Vec::new(),
+            state: crate::promotion::PromotionState::Promoted,
+        };
+        crate::promotion::promote_with_manifest(staging, target, &plan)
+            .expect("the verified history is promoted");
+        assert!(
+            target.join("MANIFEST").is_file(),
+            "the promotion publishes the manifest of the inventory"
+        );
+    }
+
+    fn promoted_history(
+        root: &Path,
+    ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let history = root.join("history");
+        let staging = root.join("staging");
+        let installed = root.join("installed");
+        (history, staging, installed)
+    }
+
+    /// Builds a real Q1 history that carries a genuine durable fence and promotes it with
+    /// the real promotion protocol.
+    ///
+    /// The returned proof is the committed form of the durable proof of
+    /// `Partition::fence_old_owner`, exactly like the source side commits it.
+    fn promoted_fence(root: &Path) -> (std::path::PathBuf, FenceProof) {
+        let (history, staging, installed) = promoted_history(root);
+        std::fs::create_dir_all(&history).expect("the history directory exists");
+        let partition = source_partition();
+        let handle = Partition::open(
+            &history,
+            rovqet_wal::Config {
+                partition,
+                incarnation: INCARNATION,
+                ..Default::default()
+            },
+            partition_config(partition, GroupConfig::default()),
+        )
+        .expect("the fenced history opens");
+        handle
+            .set_authority(Some(
+                rovqet_durable::Authority::new(NODE, EPOCH, Duration::from_secs(3600))
+                    .expect("the authority is valid"),
+            ))
+            .expect("the authority is installed");
+        match handle
+            .try_publish(publish_request(partition, 501))
+            .expect("the publication is admitted")
+            .wait()
+            .expect("the publication commits")
+        {
+            PublishOutcome::CommittedLocal(_) => {}
+            other => panic!("the source record must commit locally: {other:?}"),
+        }
+        let proof = handle
+            .fence_old_owner(MIGRATION, EPOCH, EPOCH + 1)
+            .expect("the durable fence commits");
+        handle.shutdown().expect("the history shuts down");
+        promote_history(&history, &staging, &installed, partition, INCARNATION);
+        (installed, committed_fence(&proof))
+    }
+
+    /// Verifies a proof against the promoted history and returns the refusal message.
+    /// An accepted proof is a test failure.
+    fn refused(installed: &Path, proof: &FenceProof) -> String {
+        verify_fence_against_history(installed, source_partition(), INCARNATION, proof)
+            .expect_err("a forged fence proof must never verify")
+    }
+
+    #[test]
+    fn a_genuine_fence_proof_verifies_against_the_promoted_history() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let (installed, proof) = promoted_fence(root.path());
+        verify_fence_against_history(&installed, source_partition(), INCARNATION, &proof)
+            .expect("the genuine proof is the fence record of the promoted history");
+    }
+
+    #[test]
+    fn a_fabricated_fence_digest_is_refused_against_the_promoted_history() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let (installed, mut proof) = promoted_fence(root.path());
+        proof.fence_digest = rovqet_durable::fence_digest(b"a fabricated fence record");
+        let error = refused(&installed, &proof);
+        assert!(error.contains("digest"), "{error}");
+    }
+
+    #[test]
+    fn a_proof_pointing_at_a_non_fence_record_is_refused() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let (installed, mut proof) = promoted_fence(root.path());
+        assert_ne!(
+            proof.fence_offset, 0,
+            "the fence follows the published record and its outcome"
+        );
+        // Offset 0 is the published message of this history, never a fence record.
+        proof.fence_offset = 0;
+        let error = refused(&installed, &proof);
+        assert!(error.contains("not a fence record"), "{error}");
+    }
+
+    #[test]
+    fn a_proof_of_another_migration_owner_or_epoch_is_refused() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let (installed, genuine) = promoted_fence(root.path());
+        let mut other_migration = genuine.clone();
+        other_migration.migration_id += 1;
+        let mut other_owner = genuine.clone();
+        other_owner.old_owner += 1;
+        let mut other_epoch = genuine.clone();
+        other_epoch.old_epoch += 1;
+        for proof in [&other_migration, &other_owner, &other_epoch] {
+            let error = refused(&installed, proof);
+            assert!(error.contains("revokes migration"), "{error}");
+        }
+    }
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a current-thread runtime")
+            .block_on(future)
+    }
+
+    /// Opens a route and returns the refusal message. An opened route is a test failure.
+    fn open_failure(options: crate::q1::Options) -> String {
+        match crate::q1::Route::open(options) {
+            Ok(_) => panic!("a refused history must never become an active route"),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_promoted_history_with_a_corrupted_segment_never_opens() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let (history, staging, installed) = promoted_history(root.path());
+        real_history(&history, source_partition(), INCARNATION);
+        promote_history(
+            &history,
+            &staging,
+            &installed,
+            source_partition(),
+            INCARNATION,
+        );
+        // The segment is corrupted after the promotion completed: the recovery validates the
+        // record checksums and must refuse the history.
+        let segment = std::fs::read_dir(&installed)
+            .expect("the promoted directory is readable")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().starts_with("segment-"))
+                    .unwrap_or(false)
+            })
+            .expect("a promoted segment exists");
+        let mut bytes = std::fs::read(&segment).expect("the promoted segment is readable");
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        std::fs::write(&segment, &bytes).expect("the corrupted segment is written");
+        let error = open_failure(options(installed, None));
+        assert!(
+            error.contains("Q1 recovery failed"),
+            "the refusal must come from the recovery: {error}"
+        );
+    }
+
+    #[test]
+    fn a_promoted_history_without_its_manifest_never_opens() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let (history, staging, installed) = promoted_history(root.path());
+        real_history(&history, source_partition(), INCARNATION);
+        promote_history(
+            &history,
+            &staging,
+            &installed,
+            source_partition(),
+            INCARNATION,
+        );
+        std::fs::remove_file(installed.join("MANIFEST")).expect("the promoted manifest is removed");
+        let error = open_failure(options(installed, None));
+        assert!(
+            error.contains("REPLAY_NOT_AVAILABLE"),
+            "a manifest-less history is unavailable, never recreated: {error}"
+        );
+    }
+
+    #[test]
+    fn a_promoted_history_of_another_partition_never_opens() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let (history, staging, installed) = promoted_history(root.path());
+        let foreign = PartitionRef {
+            tenant_id: 1,
+            topic_id: 3,
+            partition_id: 1,
+        };
+        real_history(&history, foreign, INCARNATION);
+        promote_history(&history, &staging, &installed, foreign, INCARNATION);
+        let error = open_failure(options(installed, None));
+        assert!(
+            error.contains("Q1 recovery failed"),
+            "the durable identity must be validated by the recovery: {error}"
+        );
+    }
+
+    #[test]
+    fn a_promoted_history_of_another_incarnation_never_opens() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let (history, staging, installed) = promoted_history(root.path());
+        real_history(&history, source_partition(), 99);
+        promote_history(&history, &staging, &installed, source_partition(), 99);
+        let error = open_failure(options(installed, None));
+        assert!(
+            error.contains("Q1 recovery failed"),
+            "the incarnation must be validated by the recovery: {error}"
+        );
+    }
+
+    /// A real `DlqPublisher` over a real destination partition.
+    struct TestDlq {
+        partition: Arc<Partition>,
+        partition_ref: PartitionRef,
+        incarnation: u128,
+    }
+
+    impl DlqPublisher for TestDlq {
+        fn publish(&self, record: &DlqRecord<'_>) -> std::result::Result<DurableOffset, DlqError> {
+            let payload = rovqet_durable::dlq_payload(record);
+            self.partition
+                .try_publish(PublishRequest {
+                    partition: self.partition_ref,
+                    qos: QoS::Q1,
+                    ownership_epoch: EPOCH,
+                    principal: 0,
+                    producer_id: record.disposition_id,
+                    producer_epoch: 0,
+                    sequence: 0,
+                    message_id: record.disposition_id,
+                    payload,
+                })
+                .and_then(|pending| pending.wait())
+                .map_err(|_| DlqError::Unavailable)
+                .and_then(|outcome| match outcome {
+                    PublishOutcome::CommittedLocal(offset) => Ok(offset),
+                    _ => Err(DlqError::Unavailable),
+                })
+        }
+
+        fn verify(
+            &self,
+            offset: DurableOffset,
+            disposition_id: u128,
+            original_message_id: u128,
+        ) -> std::result::Result<bool, DlqError> {
+            let batch = self
+                .partition
+                .try_replay(rovqet_durable::ReplayRequest {
+                    partition: self.partition_ref,
+                    from: offset,
+                    max_messages: 1,
+                    max_bytes: 64 * 1024,
+                    wait: Duration::ZERO,
+                })
+                .and_then(|pending| pending.wait())
+                .map_err(|_| DlqError::Unavailable)?;
+            let Some(message) = batch.messages.first() else {
+                return Ok(false);
+            };
+            if message.offset != offset
+                || message.message_id != disposition_id
+                || message.offset.log_incarnation != self.incarnation
+            {
+                return Ok(false);
+            }
+            let metadata = rovqet_durable::parse_dlq_payload(&message.payload)
+                .map_err(|_| DlqError::Corruption("DLQ payload"))?;
+            Ok(metadata.disposition_id == disposition_id
+                && metadata.original_message_id == original_message_id)
+        }
+    }
+
+    #[test]
+    fn a_committed_dlq_disposition_without_its_destination_never_opens() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let history = root.path().join("history");
+        let destination = root.path().join("dlq");
+        let empty_destination = root.path().join("empty-dlq");
+        std::fs::create_dir_all(&history).expect("the history directory exists");
+        std::fs::create_dir_all(&destination).expect("the destination directory exists");
+        let dlq = Arc::new(
+            Partition::open(
+                &destination,
+                rovqet_wal::Config {
+                    partition: dependent_partition(),
+                    incarnation: DLQ_INCARNATION,
+                    ..Default::default()
+                },
+                partition_config(dependent_partition(), GroupConfig::default()),
+            )
+            .expect("the destination opens"),
+        );
+        let publisher = Arc::new(TestDlq {
+            partition: dlq.clone(),
+            partition_ref: dependent_partition(),
+            incarnation: DLQ_INCARNATION,
+        });
+        let source = Partition::open_with_dlq(
+            &history,
+            rovqet_wal::Config {
+                partition: source_partition(),
+                incarnation: INCARNATION,
+                ..Default::default()
+            },
+            partition_config(
+                source_partition(),
+                GroupConfig {
+                    max_attempts: 1,
+                    terminal_policy: TerminalPolicy::Dlq,
+                    ..Default::default()
+                },
+            ),
+            publisher.clone(),
+        )
+        .expect("the source opens with its destination");
+        let offset = match source
+            .try_publish(publish_request(source_partition(), 500))
+            .expect("the publication is admitted")
+            .wait()
+            .expect("the publication commits")
+        {
+            PublishOutcome::CommittedLocal(offset) => offset,
+            other => panic!("the source record must commit locally: {other:?}"),
+        };
+        // The single record is delivered once and NACKed: `max_attempts = 1` with the DLQ
+        // terminal policy commits a terminal disposition whose proof lives in the DLQ.
+        let batch = source
+            .try_fetch_group(rovqet_durable::GroupFetchRequest {
+                partition: source_partition(),
+                group_id: 1,
+                generation: 0,
+                from: DurableOffset {
+                    log_incarnation: INCARNATION,
+                    sequence: 0,
+                },
+                max_messages: 1,
+                max_bytes: 64 * 1024,
+                wait: Duration::ZERO,
+            })
+            .expect("the group fetch is admitted")
+            .wait()
+            .expect("the group fetch completes");
+        let delivery = batch.deliveries.first().expect("one delivery");
+        assert_eq!(delivery.offset, offset);
+        let outcome = source
+            .try_nack(rovqet_durable::NackRequest {
+                partition: source_partition(),
+                group_id: 1,
+                generation: delivery.generation,
+                lease_id: delivery.lease_id,
+                ownership_epoch: EPOCH,
+                offset: delivery.offset,
+                attempt: delivery.attempt,
+                principal: 1,
+                reason: 1,
+            })
+            .expect("the nack is admitted")
+            .wait()
+            .expect("the nack commits");
+        assert!(
+            matches!(
+                outcome,
+                rovqet_durable::NackOutcome::TerminalCommitted { .. }
+            ),
+            "the exhausted record must commit a terminal DLQ disposition: {outcome:?}"
+        );
+        source.shutdown().expect("the source shuts down");
+        // The successor is opened with an EMPTY destination: the committed proof of the
+        // terminal disposition cannot be verified, so the recovery fails closed.
+        std::fs::create_dir_all(&empty_destination).expect("the empty destination exists");
+        let error = open_failure(options(history, Some(empty_destination)));
+        assert!(
+            error.contains("Q1 recovery failed"),
+            "the terminal proof must be verified by the recovery: {error}"
+        );
+    }
+
+    #[test]
+    fn a_route_that_does_not_hold_the_committed_epoch_refuses_a_durable_publication() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let mut configured = options(directory.path().to_path_buf(), None);
+        configured.initialize_new_log = true;
+        let route = crate::q1::Route::open(configured).expect("the new successor history opens");
+        // The successor resumes at its committed epoch 8. An older authority (the revoked
+        // epoch 7) is installed locally, and the requester claims the committed epoch 9:
+        // this route does not hold that epoch and must never commit with it. The durable
+        // actor validates the mutation against the configured ownership epoch.
+        route.install_authority(Some(
+            rovqet_durable::Authority::new(NODE, EPOCH - 1, Duration::from_secs(30))
+                .expect("a valid authority"),
+        ));
+        let request = rovqet_control::RoutePublishRequest {
+            tenant_id: 1,
+            topic_id: 3,
+            partition_id: 0,
+            qos: 1,
+            ownership_epoch: EPOCH + 1,
+            producer_id: 7,
+            producer_epoch: 1,
+            producer_sequence: 0,
+            message_id: 500,
+            ttl_ms: 1_000,
+            payload: b"stale successor".to_vec(),
+        };
+        let error = block_on(route.publish_durable(&request))
+            .expect_err("a route that does not hold the committed epoch must refuse");
+        assert_eq!(
+            format!("{error:?}"),
+            "StaleEpoch",
+            "a successor must never commit with a stale ownership epoch"
+        );
+        assert_eq!(
+            route.committed_count(),
+            0,
+            "a refused publication must not commit anything"
+        );
+        route.shutdown().expect("the route shuts down");
     }
 }
