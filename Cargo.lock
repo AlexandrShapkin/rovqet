@@ -1229,6 +1229,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rovqet-consensus"
+version = "0.1.0"
+dependencies = [
+ "openraft",
+ "rovqet-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "rovqet-control"
 version = "0.1.0"
 dependencies = [
