@@ -241,3 +241,89 @@ invariant is `FAIL` and a journal without evidence is `NOT_RUN`. The oracle requ
 The lease-expiry fallback stays unsupported. A handover needs the durable fence of the actual
 old owner; an expiry that merely lets the old owner stop committing is not accepted as a
 substitute for observing that fence.
+
+## C-03 Q2 Raft storage adapter (executed part)
+
+The Q2 Raft adapter of [07-q2-consensus.md](07-q2-consensus.md) is exercised at two
+levels: an in-process integration test of the library adapter, and a three-process
+harness of the observable `q2-raft-node` process. Both record their observations in an
+independent journal; the stage and results of C-03 itself are kept in
+`docs/roadmap/tasks.json` and under `benchmarks/evidence/`, and this section documents
+the contract the fixtures are required to prove.
+
+### In-process integration contract
+
+`crates/consensus/tests/three_voters.rs` drives the real node lifecycle — three voters
+on free loopback ports with separate data directories, the bounded TCP transport and a
+log compaction that forces a snapshot transfer — with every wait bounded by a deadline.
+It covers:
+
+- bootstrap and election: the designated bootstrap node initializes the membership, a
+  leader is elected with a term, and the leader is a live voter;
+- replication across partitions: commands submitted through a follower are forwarded to
+  the leader, applied with increasing committed indexes, and every voter reaches the
+  same revision with the same per-partition counts and chain digests;
+- a stale-epoch refusal that creates no entry: a proposal carrying a foreign metadata
+  epoch is refused before it becomes a Raft entry, and the last applied index does not
+  move;
+- leader death and replacement with the committed prefix intact: the surviving majority
+  elects a new leader in a later term, and every survivor keeps the previously committed
+  partitions unchanged while applying the new term's entries;
+- a restarted voter catching up: a voter stopped earlier restarts from its original data
+  directory and reaches the same committed view as the rest of the group;
+- a voter recovering after the leader purged past its index: while a voter is down, the
+  leader snapshots and compacts until its purge point is beyond that voter's last
+  applied index, and the restarted voter then recovers the same committed chains through
+  a snapshot installation rather than log replay.
+
+### Three-process harness
+
+`scripts/test_q2_raft.py` runs the acceptance scenarios against three real
+`q2-raft-node` processes with three independently persisted data directories on
+loopback. The parent process owns a journal per scenario, written and fsynced outside
+the node data directories before any deliberate termination, so externally observed
+outcomes survive the fault. The scenarios drive leadership changes, majority and
+lost-quorum proposals, divergent uncommitted tails, follower catch-up, snapshot
+compaction and installation, whole-cluster restart on the original directories,
+disk-level corruption injected between restarts, an interrupted append, rejection of
+corrupted and foreign snapshots, and the on-disk separation of the Q2 Raft log from the
+Q1 WAL and the metadata Raft log. Faults are SIGKILL and restart on the original
+directories, and a scenario that cannot reach its required state concludes with an
+explicit reason instead of a silent success. Every wait is bounded over the captured
+event history, and every child process is terminated in a `finally`.
+
+Three processes on one host with three directories prove protocol behaviour against
+independently persisted storage; they are **not** evidence about independent physical
+failure domains, and no such claim is made from them.
+
+### Independent oracle
+
+`q1_oracle.reconcile_q2_raft` reconciles a scenario journal from externally observed
+results only — the process lifecycle, the applied and recovered state each node
+printed, the results a client received, the quorum it observed and the corruption it
+injected — never from a broker's own claim that a command committed. Missing or
+contradictory evidence is `INVALID`, a broken safety invariant is `FAIL` and a journal
+without scenario or cluster evidence is `NOT_RUN`; a journal whose own conclusion is
+not a success is never reported as one, and nothing is inferred from a clock. The
+oracle requires that:
+
+- a committed result needs a majority of distinct voters reporting the same index and
+  chain for the same partition and request identity — one node's applied index is a
+  claim, never a majority proof;
+- a previously committed count never decreases across a restart of the same node;
+- two observations with the same count carry the same chain, so equal counts must have
+  equal chains and only an extended count may differ;
+- an acknowledgement backed by a lone voter is never treated as a commit;
+- a request classified as not committed never appears in any later committed state;
+- injected corruption always has an observed outcome — a corruption whose outcome was
+  never observed invalidates the journal instead of passing it;
+- a snapshot never lowers a previously committed count and never changes a previously
+  committed chain;
+- no commit is accepted while the latest observed quorum record shows fewer voters
+  available than a majority;
+- the cluster and shard identity never change across a scenario: a recorded change is a
+  failure, and an observation carrying no identity cannot contradict the baseline.
+
+A state observation that carries no request identity cannot prove which proposal it
+contains, so such a journal is `INVALID` rather than a pass: the majority
+acknowledgement would be unverifiable.

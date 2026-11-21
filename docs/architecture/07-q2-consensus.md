@@ -50,6 +50,127 @@ RaftStorage:
 
 Do not implement this with two unsynchronized stores whose crash consistency is assumed. Either keep committed state WAL-derived or write an independently checked recovery protocol that reconstructs dedup/cursor state from committed entries.
 
+## C-03 Q2 Raft storage adapter: implemented contract
+
+The implemented adapter is the crate `rovqet-consensus`. It holds the Q2 type
+configuration, the durable Raft log, the deterministic shard state machine, the bounded
+TCP transport and the lifecycle of one shard voter; OpenRaft types stay inside this crate
+and the public data-plane model of `rovqet-core` is not changed by it.
+
+- **A Q2 group is identified by `(cluster_id, shard_id)`.** The identity
+  (`ShardGroupIdentity`) renders as the fixed string `q2:{cluster_id}:{shard_id}`. It is
+  pinned in the data directory at first start: `identity.json` is written with temp +
+  fsync + rename + directory fsync, and every later start refuses a directory that
+  records another identity **before** anything else is opened, because silently reusing
+  a directory of another group would replay that group's committed history into this
+  state machine.
+- **The formats are not interchangeable.** A Q2 Raft log starts with the `QRL1` magic
+  instead of the metadata `MRL1` magic, so a Q2 log can never be opened, scanned or
+  mistaken for a metadata log. A Q1 locally committed WAL record is a third durability
+  domain: its local durability never makes it a Q2 quorum-committed entry.
+
+**Log storage contract.**
+
+- **Entries are keyed by their own `log_id.index`**: zero based, with no storage-internal
+  sequence counter and no fabricated sentinel `LogId`. A second numbering scheme would
+  silently shift entries and break the library's log-id bookkeeping.
+- **Readers share the live index.** A reader observes appends that landed after the
+  reader was created, opens an independent read handle per read, and never reads through
+  a descriptor that a rewrite has replaced.
+- **`truncate(log_id)` is inclusive**: it drops `log_id` itself and everything after it,
+  and the next append continues directly at the retained index. **`purge(log_id)` drops
+  everything up to and including it**, refuses a purge point that moves backwards and
+  persists `purged.json` before rewriting the file; `get_log_state` reports the persisted
+  purge point even when no entry remains in the file.
+- **The record format is checksummed and bounded.** `raft-log.bin` holds the `QRL1`
+  magic followed by `len u32 | crc32c u32 | payload` records whose payload is the
+  JSON-encoded Raft entry; record and file sizes are bounded, every checksum is verified
+  on scan and on read, and the stored index sequence must be contiguous.
+- **`LogFlushed` fires only after `fsync`.** A failed append rolls the file back so it
+  never disagrees with the in-memory index, and it is never acknowledged.
+- **An uncertain durable write fails closed.** A flush failure after the bytes reached
+  the page cache poisons the storage: it refuses to serve a log it cannot vouch for
+  instead of pretending the write did not happen.
+- **Recovery distinguishes a torn purge from a real gap.** A purge pointer that outran
+  its file is authoritative: the entries at or below it were purged by design and are
+  covered by the published snapshot, so they are dropped from the recovered index. A
+  first entry after the expected one is a lost entry and still fails closed. A bad magic,
+  a bad checksum, an oversized or truncated record or a non-contiguous index sequence
+  refuses on open, and committed corruption is never reset.
+
+**State machine contract.**
+
+- **Several logical partitions live in one shard group.** Each partition keeps its own
+  `applied_count`, `last_request_id`, `last_metadata_epoch` and `chain_digest`; a
+  physical Raft index never becomes a public logical offset.
+- **Only committed entries are applied**, in log order, and the machine returns exactly
+  one response per applied entry — blank and membership entries included, as `Noop` — so
+  the applied result is known before any acknowledgement leaves the node.
+- **A stale metadata epoch is rejected deterministically**: a committed command whose
+  epoch is below the highest epoch seen by that partition is refused without touching
+  the partition state. **A repeated request id is idempotent**: it returns the existing
+  outcome and never increments `applied_count`.
+- **Each partition carries a digest chain over its committed prefix**:
+  `sha256(previous_chain_digest || raft_index || request_id || tenant || topic ||
+  partition || payload_digest)`, where `payload_digest` covers the inline bytes or the
+  `(incarnation, offset)` reference pair. The same prefix always rebuilds the same
+  digests, so a divergent state can never reproduce them.
+- **State persistence is atomic.** The applied state is written to `state.json` with
+  temp + fsync + rename + directory fsync *before* `apply` returns, and the shared view
+  published to the node advances only with it.
+- **Snapshots carry the whole recovery point**: the group identity, the included log id
+  (index and term), the membership as of that index, the monotonic revision and the
+  per-partition states — each document versioned and sealed with a `sha256` checksum
+  over its own body.
+- **Installation validates everything before activation**: size bound, supported
+  version, checksum, group identity, the included index against the snapshot metadata,
+  and internal consistency of the carried state (no partition without an applied
+  command, no duplicate or unordered partition, no membership log id above the included
+  index). A foreign identity, a bad checksum or an inconsistent index is refused and the
+  live state stays untouched. A snapshot is published image-first under a temporary name
+  renamed over the previous image, so an interrupted publication leaves the previous
+  recovery point intact.
+
+**Network and lifecycle contract.**
+
+- **Each RPC is one bounded, checksummed frame.** A length-prefixed, CRC32C-checked JSON
+  frame carries vote, append-entries, install-snapshot or client-write messages over a
+  fresh loopback connection with a fixed payload bound; the transport never invents
+  consensus. A non-loopback listen address is refused at start.
+- **The peer server is bounded.** It caps concurrent connections with a semaphore,
+  bounds the read, handling and write of one request by a wall-clock timeout, and closes
+  a connection from outside the voter address list before reading a byte.
+- **Bootstrap is explicit.** Only the designated node initializes membership, and only
+  when the storage is still uninitialized; existing storage is never re-initialized —
+  the group identity and the log decide the membership.
+- **Election is the library's.** A proposal goes through the leader; a follower
+  forwards it once to the committed leader and returns the answer verbatim instead of
+  pretending it can commit on its own.
+- **The metadata epoch is checked before submission.** `propose` compares the command's
+  epoch with the installed authority and refuses a mismatch as `ShardError::Rejected`:
+  the command never becomes a Raft entry.
+- **Applied state is the only publication path.** The state machine publishes its
+  applied state and a monitor turns the published revision into the watch notification
+  subscribers receive; because that is the only bridge, a subscriber can never see a
+  revision that was not applied. Shutdown signals the monitor, shuts the Raft core down
+  and waits for the peer server and the monitor to finish.
+
+**Ownership boundary.** A Raft election is not a metadata authority: the metadata epoch
+is installed from outside through `install_authority`, a local election never mints or
+extends it, and a stale or foreign epoch is refused before submission instead of being
+fenced away after replication. When the quorum is missing, no Q2 path falls back to Q1
+durability: the pending request reports NO_QUORUM or OUTCOME_UNKNOWN and never a local
+substitute.
+
+**Observable process.** `q2-raft-node` runs one voter from `--id`, `--cluster-id`,
+`--shard-id`, `--listen`, `--data-dir`, repeated `--peer N=HOST:PORT`, `--bootstrap`,
+`--election-timeout-ms`, `--heartbeat-interval-ms` and `--version`. It prints one JSON
+event per line on stdout — `leader` or `follower` (only the winner prints `leader`),
+`applied` with the applied index, the revision and the per-partition count, request id
+and chain, `snapshot`, `authority`, `proposed` and `error` — and accepts one JSON
+command per line on stdin: `propose`, `authority`, `snapshot` and `shutdown`. The
+multi-process harness drives the group through that contract alone.
+
 ## Ownership and elections
 
 Metadata ownership epoch fences a shard's authority at the cluster placement layer; Raft term elects a leader **within** the authorized replica set. A local election cannot create a new global placement epoch. On leader change, reconcile lease/epoch with metadata snapshot, reject stale producer/consumer generations and only resume writes after legitimate leadership and majority. Two nodes must never both acknowledge writes for one shard/epoch, even during asymmetric partition.

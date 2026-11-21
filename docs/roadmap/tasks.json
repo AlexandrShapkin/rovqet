@@ -1003,13 +1003,64 @@
         "B-01",
         "C-02"
       ],
-      "status": "TODO",
+      "status": "DONE",
       "architecture": "07",
       "proof": "3-node durable-majority/snapshot storage tests",
       "paths": [
-        "crates/consensus/"
+        "benchmarks/evidence/c03-q2-raft/",
+        "crates/consensus/",
+        "crates/consensus/src/bin/q2-raft-node.rs",
+        "crates/consensus/src/log.rs",
+        "crates/consensus/src/network.rs",
+        "crates/consensus/src/sm.rs",
+        "crates/consensus/src/types.rs",
+        "crates/consensus/tests/three_voters.rs",
+        "docs/architecture/07-q2-consensus.md",
+        "docs/architecture/14-verification.md",
+        "scripts/test_q2_raft.py"
       ],
-      "evidence": null
+      "evidence": {
+        "commit": "PENDING_FINAL_HEAD",
+        "verification": "PASS: the Q2 Raft storage adapter is implemented on OpenRaft 0.9.26 as its own consensus group and verified end to end: durable log storage, a deterministic shard state machine with per-partition committed state and digest chains, durable snapshots with compaction and installation, bounded TCP networking, a real three-voter group, and an independent multi-process campaign whose journals are certified by a dedicated oracle. Metadata Raft and the Q1 WAL remain separate durability domains.",
+        "implementation": "crates/consensus (package rovqet-consensus). Identity: a Q2 group is (cluster_id, shard_id); the identity is pinned in the data directory at first start and a mismatch is refused before open. Log storage: a versioned QRL1 format (len | crc32c | payload JSON), records keyed by the entry's own log_id.index (no internal sequence counter, no sentinel LogId), a shared index so live readers observe later appends, inclusive truncate, purge with a persisted purge point, LogFlushed signalled only after fsync, fail-closed on an uncertain durable write, recovery of a purge pointer that outran its file and refusal of a real gap or of committed corruption. State machine: several logical partitions per shard group, apply only committed entries, exactly one response per entry including blank and membership, deterministic stale-epoch rejection, idempotence per request id, a per-partition sha256 digest chain over the committed prefix, atomic state persistence; snapshots carry the group identity, the included log id, the membership and the per-partition state with a version and a checksum, installation validates all of it before activation and refuses a foreign identity, a bad checksum or an inconsistent index, and an interrupted publication leaves the previous recovery point intact. Network and lifecycle: bounded length-prefixed CRC32C JSON frames over loopback with one connection per RPC and a bounded peer server, explicit bootstrap that refuses initialized storage, election, proposal through the leader or a single forward from a follower, a pre-submission metadata-epoch check that creates no entry when it refuses, applied-state publication and shutdown. q2-raft-node is the observable process.",
+        "durable_majority": "A committed result is only reported after the library persisted the entry, a durable majority of the RF=3 voters stored it and the committed boundary advanced, and the deterministic state machine applied it. The campaign verifies it externally: for every committed proposal at least two distinct voters report the same applied index and the same partition chain digest, and the committed request identity is present in their states. No COMMITTED_QUORUM client acknowledgement is emitted in C-03: the applied result stays internal for C-04 to translate only after the ownership and producer requirements are satisfied.",
+        "campaign": "scripts/test_q2_raft.py starts three real q2-raft-node processes on three independently persisted directories over loopback and executes eighteen scenarios, each with a parent-owned fsynced journal under benchmarks/evidence/c03-q2-raft/: fresh bootstrap and election; three-voter replication; majority agreement on one entry; leader SIGKILL after a durable commit; replacement leader retaining the committed prefix; one follower unavailable with 2/3 continuing; two voters unavailable with no new committed entry; an old leader reconnecting with an uncommitted divergent tail; that tail never becoming committed; follower restart and catch-up; snapshot creation and committed log compaction; a lagging follower recovering through snapshot installation; all three nodes restarting from their original directories; a torn uncommitted tail being refused or safely recovered; committed corruption failing closed; an interrupted append never fabricating a committed result; a corrupted and a foreign snapshot being rejected; and the on-disk separation from the Q1 WAL and the metadata Raft log.",
+        "oracle": "q1_oracle.reconcile_q2_raft establishes the properties from the parent's own observations: a committed result needs a majority of distinct voters reporting the same index and chain for the same request identity; a previously committed count never decreases across a restart; equal counts must have equal chains; a lone voter acknowledgement is never a commit; a non-committed request never appears in a later committed state; an injected corruption must have an observed outcome; a snapshot never lowers committed counts; a commit after a lost quorum is refused; the cluster and shard identity never change; and a journal whose own conclusion is not PASS is never reported as PASS. Fourteen negative fixtures prove the rejections.",
+        "observed_result": "376 Rust workspace tests pass with zero failures and zero ignored tests (consensus 22 unit plus 1 three-voter integration, metadata-raft 12 suites, wal 2 plus 29, server 71). Process suites: check_docs PASS (49 markdown files, 36 roadmap tasks), test_metadata_raft 5, test_cluster_routing 3, test_q1_migration 7, test_q1_migration_bundle 6, test_q1_replay 8, test_q1_oracle 59, test_q2_raft 18 of 18 scenarios PASS with an oracle PASS per scenario, test_q1_migration_crash 16 of 16, test_q1_migration_partition PASS, test_q1_dlq_uncertainty D1+D2+D3 PASS, test_q1_consumer 6, test_q1_terminal 12, test_q1_durability 9, test_q1_faults 20, q0_smoke PASS, q1_smoke --check-hooks-disabled PASS, git diff --check clean.",
+        "evidence": "benchmarks/evidence/c03-q2-raft/scenario-01.jsonl .. scenario-18.jsonl (one fsynced parent-owned journal per scenario, each with its harness records, an oracle_verdict record and a final conclusion). The campaign prints the per-scenario harness verdict, the oracle verdict with its counts and the evidence directory.",
+        "limitations": "The three processes run on one host, so the campaign proves protocol behaviour and not independent physical failure domains. The digest chain is recorded only at its latest value per partition in a journal observation, so the oracle compares chains at equal counts and compares counts strictly; a full per-index chain history is not persisted in the journal. Compaction is observed through the log file size and the first stored index rather than a library metric. The Q2 data plane, logical offsets, producer deduplication and consumer ACK semantics are C-04 and C-05 and are not implemented here; no client-facing COMMITTED_QUORUM acknowledgement is emitted.",
+        "remaining_work": "None for C-03. C-04 (Q2 publish, logical offsets and producer dedup) is the next unblocked package.",
+        "next_unblocked": [
+          "C-04"
+        ],
+        "next_note": "C-04 may start: C-03 is DONE with executed multi-process consensus evidence. C-05 stays blocked on C-04.",
+        "test_command": [
+          "cargo fmt --all -- --check",
+          "cargo check --workspace --locked",
+          "cargo test -p rovqet-consensus --locked",
+          "cargo test -p rovqet-metadata-raft --locked",
+          "cargo test -p rovqet-wal --locked",
+          "cargo test --workspace --locked",
+          "python3 scripts/check_docs.py",
+          "python3 scripts/test_metadata_raft.py",
+          "python3 scripts/test_cluster_routing.py",
+          "python3 scripts/test_q1_migration.py",
+          "python3 scripts/test_q1_migration_bundle.py",
+          "python3 scripts/test_q1_migration_crash.py",
+          "python3 scripts/test_q1_migration_partition.py",
+          "python3 scripts/test_q1_dlq_uncertainty.py",
+          "python3 scripts/test_q2_raft.py",
+          "python3 scripts/test_q1_replay.py",
+          "python3 scripts/test_q1_consumer.py",
+          "python3 scripts/test_q1_terminal.py",
+          "python3 scripts/test_q1_durability.py",
+          "python3 scripts/test_q1_faults.py",
+          "python3 scripts/test_q1_oracle.py",
+          "python3 scripts/q0_smoke.py",
+          "python3 scripts/q1_smoke.py --check-hooks-disabled",
+          "git diff --check"
+        ]
+      }
     },
     {
       "id": "C-04",

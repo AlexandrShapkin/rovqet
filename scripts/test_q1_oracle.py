@@ -567,5 +567,239 @@ class SafetyOracle(unittest.TestCase):
 
 
 
+class Q2RaftOracle(unittest.TestCase):
+    """The Q2 Raft oracle must reject every fabricated or contradictory commit."""
+
+    PARTITION = "1:3:0"
+
+    def state(self, node, *, index=2, count=1, chain="aa", request_id="1",
+              event="applied_state"):
+        return {
+            "event": event,
+            "node": node,
+            "applied_index": index,
+            "revision": 1,
+            "partitions": [
+                {
+                    "partition": self.PARTITION,
+                    "count": count,
+                    "chain": chain,
+                    "request_id": request_id,
+                }
+            ],
+        }
+
+    def result(self, node, request_id, *, ok=True, index=2):
+        return {
+            "event": "proposal_result",
+            "node": node,
+            "request_id": request_id,
+            "ok": ok,
+            "index": index,
+            "applied_count": 1,
+            "reason": None if ok else "no quorum",
+        }
+
+    def base(self) -> list[dict]:
+        """A complete, consistent journal: one command committed by all three."""
+        return [
+            {"event": "scenario_started", "scenario": 2,
+             "barrier": "committed_replication", "build": "test"},
+            {"event": "cluster_started", "cluster_id": 31002, "shard_id": 7,
+             "nodes": [1, 2, 3]},
+            {"event": "quorum_observed", "available_nodes": 3, "quorum": 2},
+            {"event": "proposal_attempt", "node": 1, "request_id": 1},
+            self.result(1, 1),
+            self.state(1),
+            self.state(2),
+            self.state(3),
+        ]
+
+    def reconcile(self, records: list[dict]) -> dict:
+        return oracle.reconcile_q2_raft(concluded(records))
+
+    def test_a_consistent_journal_passes(self):
+        result = self.reconcile(self.base())
+        self.assertEqual(result["verdict"], oracle.PASS, result)
+        self.assertEqual(result["counts"]["scenarios"], 1)
+        self.assertEqual(result["counts"]["observations"], 3)
+        self.assertEqual(result["counts"]["majority_proofs"], 1)
+
+    def test_a_commit_backed_by_one_node_fails(self):
+        records = [
+            record
+            for record in self.base()
+            if not (
+                record.get("event") == "applied_state" and record.get("node") != 1
+            )
+        ]
+        result = self.reconcile(records)
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+        self.assertTrue(
+            any("supported by 1 voter" in reason for reason in result["reasons"]),
+            result["reasons"],
+        )
+
+    def test_a_disappearing_command_after_a_restart_fails(self):
+        records = [
+            {"event": "scenario_started", "scenario": 4, "build": "test"},
+            {"event": "cluster_started", "cluster_id": 31004, "shard_id": 7},
+            {"event": "proposal_result", "node": 1, "request_id": 1, "ok": True},
+            self.state(1, count=2, chain="bb", request_id="2"),
+            self.state(2, count=2, chain="bb", request_id="2"),
+            self.state(3, count=2, chain="bb", request_id="2"),
+            {"event": "process_restarted", "node": 2},
+            self.state(2, count=1, chain="aa", request_id="1"),
+        ]
+        result = self.reconcile(records)
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+        self.assertTrue(
+            any("lost a committed command" in reason for reason in result["reasons"]),
+            result["reasons"],
+        )
+
+    def test_divergent_committed_chains_fail(self):
+        records = self.base()
+        for record in records:
+            if record.get("event") == "applied_state" and record["node"] == 3:
+                record["partitions"][0]["chain"] = "ff"
+        result = self.reconcile(records)
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+        self.assertTrue(
+            any("divergent committed chains" in reason for reason in result["reasons"]),
+            result["reasons"],
+        )
+
+    def test_a_lone_voter_acknowledgement_fails(self):
+        records = self.base()
+        records.append({"event": "proposal_attempt", "node": 1, "request_id": 2})
+        records.append(self.result(1, 2, index=3))
+        # Only the proposing node ever shows request 2 in its committed state; the
+        # other two carry the earlier request while claiming the same count.
+        records.append(self.state(1, index=3, count=2, chain="bb", request_id="2"))
+        records.append(self.state(2, index=3, count=2, chain="bb", request_id="1"))
+        records.append(self.state(3, index=3, count=2, chain="bb", request_id="1"))
+        result = self.reconcile(records)
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+        self.assertTrue(
+            any("reported by 1 node" in reason for reason in result["reasons"]),
+            result["reasons"],
+        )
+
+    def test_an_uncommitted_tail_presented_as_committed_fails(self):
+        records = self.base()
+        records.append(
+            {"event": "outcome_classified", "node": 3, "request_id": 2,
+             "classification": "uncommitted"}
+        )
+        records.append(self.state(1, count=2, chain="bb", request_id="2"))
+        result = self.reconcile(records)
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+        self.assertTrue(
+            any("later reports it" in reason for reason in result["reasons"]),
+            result["reasons"],
+        )
+
+    def test_a_missing_corruption_outcome_is_invalid(self):
+        records = self.base()
+        records.append(
+            {"event": "corruption_injected", "node": 2, "partition": self.PARTITION}
+        )
+        result = self.reconcile(records)
+        self.assertEqual(result["verdict"], oracle.INVALID, result)
+        self.assertTrue(
+            any("the corruption outcome was never observed" in reason
+                for reason in result["reasons"]),
+            result["reasons"],
+        )
+
+    def test_a_snapshot_that_lowers_committed_counts_fails(self):
+        records = [
+            {"event": "scenario_started", "scenario": 12, "build": "test"},
+            {"event": "cluster_started", "cluster_id": 31012, "shard_id": 7},
+            {"event": "proposal_result", "node": 1, "request_id": 1, "ok": True},
+            self.state(1, count=2, chain="bb", request_id="2"),
+            self.state(2, count=2, chain="bb", request_id="2"),
+            self.state(3, count=2, chain="bb", request_id="2"),
+            {"event": "snapshot_installed", "node": 1, "included_index": 5},
+            self.state(1, count=1, chain="aa", request_id="1"),
+        ]
+        result = self.reconcile(records)
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+        self.assertTrue(
+            any("after its snapshot" in reason for reason in result["reasons"]),
+            result["reasons"],
+        )
+
+    def test_a_commit_after_a_lost_quorum_fails(self):
+        records = self.base()
+        records.append({"event": "quorum_observed", "available_nodes": 1, "quorum": 2})
+        records.append(self.result(1, 2, index=3))
+        records.append(self.state(1, index=3, count=2, chain="bb", request_id="2"))
+        records.append(self.state(2, index=3, count=2, chain="bb", request_id="2"))
+        result = self.reconcile(records)
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+        self.assertTrue(
+            any("while only 1 voter" in reason for reason in result["reasons"]),
+            result["reasons"],
+        )
+
+    def test_a_changed_cluster_or_shard_identity_fails(self):
+        records = self.base()
+        records.append({"event": "cluster_started", "cluster_id": 31099, "shard_id": 7})
+        records.append({"event": "cluster_started", "cluster_id": 31002, "shard_id": 8})
+        result = self.reconcile(records)
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+        self.assertTrue(
+            any("cluster identity changed" in reason for reason in result["reasons"]),
+            result["reasons"],
+        )
+        self.assertTrue(
+            any("shard identity changed" in reason for reason in result["reasons"]),
+            result["reasons"],
+        )
+
+    def test_a_failed_scenario_conclusion_is_never_a_pass(self):
+        result = oracle.reconcile_q2_raft(
+            concluded(
+                self.base(),
+                verdict="FAIL",
+                reason="the majority never applied the command",
+            )
+        )
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+        self.assertTrue(
+            any("the scenario concluded FAIL" in reason for reason in result["reasons"]),
+            result["reasons"],
+        )
+        self.assertTrue(
+            any("the majority never applied the command" in reason
+                for reason in result["reasons"]),
+            result["reasons"],
+        )
+
+    def test_state_observations_without_request_identity_are_invalid(self):
+        records = self.base()
+        for record in records:
+            if record.get("event") == "applied_state":
+                record["partitions"][0].pop("request_id")
+        result = self.reconcile(records)
+        self.assertEqual(result["verdict"], oracle.INVALID, result)
+        self.assertTrue(
+            any("carry no request identity" in reason for reason in result["reasons"]),
+            result["reasons"],
+        )
+
+    def test_a_missing_conclusion_is_invalid(self):
+        result = oracle.reconcile_q2_raft(self.base())
+        self.assertEqual(result["verdict"], oracle.INVALID, result)
+
+    def test_an_empty_journal_is_invalid_or_not_run(self):
+        result = oracle.reconcile_q2_raft([])
+        self.assertEqual(result["verdict"], oracle.INVALID, result)
+        result = oracle.reconcile_q2_raft([], require_conclusion=False)
+        self.assertEqual(result["verdict"], oracle.NOT_RUN, result)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

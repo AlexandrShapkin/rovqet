@@ -1,0 +1,181 @@
+{
+  "broker_cpu_jiffies": 4,
+  "broker_peak_rss_kib": 11160,
+  "consume": {
+    "ack": {
+      "max_ns": 783045,
+      "min_ns": 255956,
+      "n": 200,
+      "p50_ns": 308346,
+      "p95_ns": 410726,
+      "p999_ns": 783045,
+      "p99_ns": 548110
+    },
+    "acked": 200,
+    "delivered": 200,
+    "elapsed_ns": 81531181,
+    "fetch": {
+      "max_ns": 5477302,
+      "min_ns": 891242,
+      "n": 4,
+      "p50_ns": 5222839,
+      "p95_ns": 5477302,
+      "p999_ns": 5477302,
+      "p99_ns": 5477302
+    },
+    "mode": "consume",
+    "next": 384,
+    "schema": "rovqet-q1-measure-v1"
+  },
+  "final_metrics": "BROKER_METRICS {\"time_mono_ns\":178513479,\"max_connections\":1024,\"connection_envelope_bytes\":1380352,\"offered\":0,\"admitted\":0,\"rejected\":0,\"enqueued\":0,\"dropped_overflow\":0,\"dropped_expired\":0,\"dropped_unsubscribed\":0,\"dropped_shutdown_ingress\":0,\"egress_rejected\":0,\"flow_rejected\":0,\"overload_transitions\":0,\"overload_state\":\"Drain\",\"delivered\":0,\"delivered_bytes\":0,\"outbound_enqueued\":0,\"writer_expired\":0,\"write_failed\":0,\"dropped_newest\":0,\"dropped_oldest\":0,\"coalesced\":0,\"dropped_closed\":0,\"dropped_shutdown_outbound\":0,\"ingress_messages\":0,\"ingress_bytes\":0,\"egress_messages\":0,\"egress_bytes\":0,\"active_subscriptions\":0,\"broker_work_sessions\":0}",
+  "machine": {
+    "cpu_count": 4,
+    "filesystem": "ext4",
+    "kernel": "7.0.0-38-generic",
+    "machine": "x86_64",
+    "os_release": {
+      "BUG_REPORT_URL": "https://bugs.launchpad.net/ubuntu/",
+      "HOME_URL": "https://www.ubuntu.com/",
+      "ID": "ubuntu",
+      "ID_LIKE": "debian",
+      "LOGO": "ubuntu-logo",
+      "NAME": "Ubuntu",
+      "PRETTY_NAME": "Ubuntu 26.04.1 LTS",
+      "PRIVACY_POLICY_URL": "https://www.ubuntu.com/legal/terms-and-policies/privacy-policy",
+      "SUPPORT_URL": "https://help.ubuntu.com/",
+      "UBUNTU_CODENAME": "resolute",
+      "VERSION": "26.04.1 LTS (Resolute Raccoon)",
+      "VERSION_CODENAME": "resolute",
+      "VERSION_ID": "26.04"
+    },
+    "platform": "Linux-7.0.0-38-generic-x86_64-with-glibc2.43",
+    "python": "3.14.4",
+    "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)"
+  },
+  "publish": {
+    "count": 200,
+    "elapsed_ns": 70563912,
+    "first_offset": 0,
+    "last_offset": 398,
+    "latency": {
+      "max_ns": 2562987,
+      "min_ns": 271741,
+      "n": 200,
+      "p50_ns": 307838,
+      "p95_ns": 456030,
+      "p999_ns": 2562987,
+      "p99_ns": 983282
+    },
+    "mode": "publish",
+    "payload_bytes": 128,
+    "schema": "rovqet-q1-measure-v1"
+  },
+  "read": {
+    "elapsed_ns": 17499008,
+    "latency_ns": 17498257,
+    "mode": "read",
+    "next": 607,
+    "records": 200,
+    "schema": "rovqet-q1-measure-v1"
+  },
+  "recovery_seconds": [
+    {
+      "scenario": "consumer-before-append-seed44",
+      "seconds": 0.003242966951802373
+    },
+    {
+      "scenario": "consumer-before-append-seed45",
+      "seconds": 0.007559778983704746
+    },
+    {
+      "scenario": "consumer-after-append-before-sync-seed44",
+      "seconds": 0.00990594900213182
+    },
+    {
+      "scenario": "consumer-after-append-before-sync-seed45",
+      "seconds": 0.009867470944300294
+    },
+    {
+      "scenario": "consumer-after-sync-before-reply-seed44",
+      "seconds": 0.009938414092175663
+    },
+    {
+      "scenario": "consumer-after-sync-before-reply-seed45",
+      "seconds": 0.00984747102484107
+    },
+    {
+      "scenario": "consumer-checkpoint-after-append-before-sync-seed44",
+      "seconds": 0.009978004964068532
+    },
+    {
+      "scenario": "consumer-checkpoint-after-append-before-sync-seed45",
+      "seconds": 0.01012042595539242
+    },
+    {
+      "scenario": "publication-before-append-seed42",
+      "seconds": 0.006671342998743057
+    },
+    {
+      "scenario": "publication-before-append-seed43",
+      "seconds": 0.006760503980331123
+    },
+    {
+      "scenario": "publication-after-append-before-sync-seed42",
+      "seconds": 0.006790771964006126
+    },
+    {
+      "scenario": "publication-after-append-before-sync-seed43",
+      "seconds": 0.008754128008149564
+    },
+    {
+      "scenario": "publication-after-sync-before-reply-seed42",
+      "seconds": 0.008871691999956965
+    },
+    {
+      "scenario": "publication-after-sync-before-reply-seed43",
+      "seconds": 0.008963856031186879
+    }
+  ],
+  "schema": "rovqet-q1-durability-measurements-v1",
+  "source_sha": "c86b5fa7626624d6b3a60d2a34539729f46a40e5",
+  "unavailable": {
+    "active_groups_and_leases": "UNAVAILABLE: internal actor state",
+    "active_producers_and_outcomes": "UNAVAILABLE: internal actor state",
+    "p99_9_interpretation": "n=200 nearest-rank; p99.9 is not statistically stable",
+    "q1_queue_utilization": "UNAVAILABLE: no Q1 queue metric endpoint",
+    "sparse_ack_entries": "UNAVAILABLE: internal actor state"
+  },
+  "wal_fsync": {
+    "append": {
+      "max_ns": 71248,
+      "min_ns": 32543,
+      "p50_ns": 33486,
+      "p95_ns": 35860,
+      "p999_ns": 71248,
+      "p99_ns": 40276
+    },
+    "append_plus_sync": {
+      "max_ns": 115264,
+      "min_ns": 63124,
+      "p50_ns": 64718,
+      "p95_ns": 72535,
+      "p999_ns": 115264,
+      "p99_ns": 90953
+    },
+    "committed_position": 399,
+    "count": 200,
+    "directory": "/tmp/rovqet-b07-fsync-4u23313m",
+    "payload_bytes": 128,
+    "records": 400,
+    "schema": "rovqet-wal-fsync-profile-v1",
+    "sync": {
+      "max_ns": 58491,
+      "min_ns": 30570,
+      "p50_ns": 31180,
+      "p95_ns": 37346,
+      "p999_ns": 58491,
+      "p99_ns": 53862
+    },
+    "wall_ns": 13372890
+  }
+}

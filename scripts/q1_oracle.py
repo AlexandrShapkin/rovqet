@@ -1152,3 +1152,488 @@ def reconcile_safety(records: list[dict], *, require_conclusion: bool = True) ->
         "dispositions": len(dispositions),
     }
     return _result(FAIL if reasons else PASS, reasons, counts)
+
+
+# -- Q2 Raft acceptance ------------------------------------------------------
+
+# The three-voter Q2 cluster commits with two of three voters.
+MAJORITY = 2
+
+# Both event names describe the committed state of one node: `applied_state` is the
+# live applied view and `recovered_state` is the same view taken after a restart or
+# catch-up. A majority proof may draw on either, but never on a broker's own claim.
+Q2_STATE_EVENTS = ("applied_state", "recovered_state")
+
+
+def _q2_int(value) -> int | None:
+    """A count or index that may serialise as a JSON number or a decimal string."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _q2_request_ids(value) -> set[str]:
+    """Normalise one or many request identities into decimal strings."""
+    if value is None or isinstance(value, bool):
+        return set()
+    if isinstance(value, (list, tuple, set)):
+        ids: set[str] = set()
+        for item in value:
+            ids |= _q2_request_ids(item)
+        return ids
+    number = _q2_int(value)
+    if number is not None:
+        return {str(number)}
+    text = str(value).strip()
+    return {text} if text else set()
+
+
+def _q2_partition_key(value) -> str | None:
+    if isinstance(value, dict):
+        return "{" + ",".join(f"{key}={value[key]}" for key in sorted(value)) + "}"
+    return None if value is None else str(value)
+
+
+def _q2_state(record: dict) -> dict:
+    """One committed-state observation with normalised partitions."""
+    partitions = []
+    for entry in record.get("partitions") or []:
+        if not isinstance(entry, dict):
+            continue
+        partitions.append(
+            {
+                "key": _q2_partition_key(entry.get("partition")),
+                "count": _q2_int(entry.get("count")),
+                "chain": entry.get("chain"),
+                "request_ids": _q2_request_ids(entry.get("request_id"))
+                | _q2_request_ids(entry.get("request_ids")),
+            }
+        )
+    return {
+        "seq": record.get("seq"),
+        "event": record.get("event"),
+        "node": record.get("node"),
+        "applied_index": _q2_int(record.get("applied_index")),
+        "request_ids": _q2_request_ids(record.get("request_id"))
+        | _q2_request_ids(record.get("request_ids")),
+        "partitions": partitions,
+    }
+
+
+def _q2_state_request_ids(state: dict) -> set[str]:
+    ids = set(state["request_ids"])
+    for partition in state["partitions"]:
+        ids |= partition["request_ids"]
+    return ids
+
+
+def _q2_classification(record: dict) -> str:
+    for field in ("classification", "class", "outcome", "kind"):
+        value = record.get(field)
+        if value not in (None, ""):
+            return str(value)
+    return ""
+
+
+def _q2_committed_classification(record: dict) -> bool:
+    """Whether a classified outcome claims a durable commit."""
+    explicit = record.get("committed")
+    if isinstance(explicit, bool):
+        return explicit
+    text = _q2_classification(record).strip().lower()
+    if not text:
+        return False
+    if text.startswith(
+        ("un", "not", "non", "never", "reject", "discard", "drop", "truncat",
+         "partial", "timeout", "fail", "lose", "lost", "abort", "orphan")
+    ):
+        return False
+    return "commit" in text or text in {"applied", "durable", "replicated"}
+
+
+def _q2_state_regression(
+    label: str,
+    marker: str,
+    node,
+    marker_seq,
+    previous: dict,
+    later: dict,
+    reasons: list[str],
+) -> None:
+    """Compare the last state before a marker with one state after it.
+
+    Counts are compared strictly in every case. Chains are compared only when the
+    counts are equal, because a journal records one latest chain per partition and
+    the chain of an extended count legitimately differs from the shorter prefix.
+    """
+    for partition in previous["partitions"]:
+        if partition["key"] is None or partition["count"] is None:
+            continue
+        match = next(
+            (entry for entry in later["partitions"] if entry["key"] == partition["key"]),
+            None,
+        )
+        if match is None or match["count"] is None:
+            reasons.append(
+                f"{label}: node {node} no longer reports partition {partition['key']} "
+                f"after {marker} at seq {marker_seq}; its committed count "
+                f"{partition['count']} disappeared"
+            )
+            continue
+        if match["count"] < partition["count"]:
+            reasons.append(
+                f"{label}: node {node} lost a committed command after {marker} at seq "
+                f"{marker_seq}: partition {partition['key']} count {partition['count']} "
+                f"-> {match['count']}"
+            )
+        elif match["count"] == partition["count"] and match["chain"] != partition["chain"]:
+            reasons.append(
+                f"{label}: node {node} reports another chain for partition "
+                f"{partition['key']} at the unchanged count {partition['count']} after "
+                f"{marker} at seq {marker_seq}"
+            )
+
+
+def reconcile_q2_raft(records: list[dict], *, require_conclusion: bool = True) -> dict:
+    """Independent correctness oracle for the Q2 Raft acceptance journals.
+
+    The journal is written by the parent harness from externally observed node output
+    only: the process lifecycle, the applied/recovered state each node printed, the
+    results a client received, the quorum it observed, the corruption it injected and
+    its own classification of an outcome. The oracle never trusts a broker's claim that
+    a command committed: a committed result needs a majority of distinct voters that
+    report the same committed command from their own state.
+
+    A broken safety invariant is FAIL, missing or contradictory evidence is INVALID and
+    a journal without scenario or cluster evidence is NOT_RUN. A journal whose own
+    conclusion is not PASS is never reported as PASS. Nothing is inferred from a clock.
+
+    The journals record one latest chain digest per partition, so a chain can only be
+    compared when two observations report the same count. Across a restart or a
+    snapshot the count must never decrease, and at an unchanged count the chain must be
+    identical. An extended count yields a different chain by construction and is not a
+    divergence. The same limitation means a state observation that carries no request
+    identity cannot prove which proposal it contains; such a journal is INVALID rather
+    than a pass, because the majority acknowledgement is then unverifiable.
+    """
+    reasons: list[str] = []
+    if require_conclusion and (not records or records[-1].get("event") != "conclusion"):
+        return _result(INVALID, ["missing conclusion"], {})
+    # The journal order is the observation order: a fixture without an explicit
+    # sequence number keeps the position it was written at.
+    records = [
+        record if record.get("seq") is not None else {**record, "seq": index}
+        for index, record in enumerate(records)
+    ]
+
+    invalid: list[str] = []
+
+    # 0. The scenario's own conclusion must be a success. A scenario that concluded
+    # FAIL, INVALID or NOT_RUN can never be reported as a successful safety verdict.
+    conclusions = [r for r in records if r.get("event") == "conclusion"]
+    if conclusions:
+        conclusion = conclusions[-1]
+        own_verdict = conclusion.get("verdict")
+        if own_verdict != PASS:
+            detail = conclusion.get("reason")
+            if detail:
+                reasons.append(f"the scenario concluded {own_verdict}: {detail}")
+            else:
+                reasons.append(f"the scenario concluded {own_verdict}")
+
+    started = [r for r in records if r.get("event") == "scenario_started"]
+    clusters = [r for r in records if r.get("event") == "cluster_started"]
+    if not started and not clusters and not reasons:
+        return _result(NOT_RUN, ["no Q2 Raft scenario evidence"], {})
+
+    # The journal is grouped by scenario; a record before the first scenario_started
+    # belongs to the journal itself so that no evidence is silently dropped.
+    groups: list[tuple[object, list[dict]]] = []
+    current: list[dict] | None = None
+    for record in records:
+        if record.get("event") == "scenario_started":
+            current = [record]
+            groups.append((record.get("scenario", len(groups)), current))
+        elif current is None:
+            current = [record]
+            groups.append((None, current))
+        else:
+            current.append(record)
+
+    counts = {
+        "scenarios": 0,
+        "observations": 0,
+        "kills": 0,
+        "restarts": 0,
+        "majority_proofs": 0,
+        "snapshots": 0,
+    }
+    state_total = 0
+    proposal_total = 0
+
+    for scenario_key, group in groups:
+        label = (
+            f"the scenario {scenario_key}" if scenario_key is not None else "the journal"
+        )
+        counts["scenarios"] += 1
+        states = [_q2_state(r) for r in group if r.get("event") in Q2_STATE_EVENTS]
+        proposals = [r for r in group if r.get("event") == "proposal_result"]
+        kills = [r for r in group if r.get("event") == "process_killed"]
+        restarts = [r for r in group if r.get("event") == "process_restarted"]
+        quorums = [r for r in group if r.get("event") == "quorum_observed"]
+        outcomes = [r for r in group if r.get("event") == "outcome_classified"]
+        corruptions = [r for r in group if r.get("event") == "corruption_injected"]
+        snapshots = [
+            r for r in group
+            if r.get("event") in ("snapshot_installed", "snapshot_observed")
+        ]
+        group_conclusions = [r for r in group if r.get("event") == "conclusion"]
+        counts["observations"] += len(states)
+        counts["kills"] += len(kills)
+        counts["restarts"] += len(restarts)
+        counts["snapshots"] += len(snapshots)
+        state_total += len(states)
+        proposal_total += len(proposals)
+
+        # 1. A committed applied state needs a majority of distinct voters that report
+        # the same (applied_index, chain) for the same partition. One node's committed
+        # index is a claim, never a majority proof.
+        committed_states = [
+            state
+            for state in states
+            if state["event"] == "applied_state"
+            and state["applied_index"] is not None
+            and any(
+                entry["key"] is not None
+                and entry["count"] not in (None, 0)
+                for entry in state["partitions"]
+            )
+        ]
+        proofs: set[tuple] = set()
+        for state in committed_states:
+            for partition in state["partitions"]:
+                if partition["key"] is None or partition["count"] in (None, 0):
+                    continue
+                witnesses = {
+                    other["node"]
+                    for other in committed_states
+                    if other["applied_index"] == state["applied_index"]
+                    and any(
+                        entry["key"] == partition["key"]
+                        and entry["chain"] == partition["chain"]
+                        for entry in other["partitions"]
+                    )
+                }
+                if len(witnesses) < MAJORITY:
+                    reasons.append(
+                        f"{label}: node {state['node']} records a committed applied "
+                        f"state at index {state['applied_index']} for partition "
+                        f"{partition['key']} supported by {len(witnesses)} voter(s) "
+                        f"{sorted(map(str, witnesses))}; {MAJORITY} voters must report "
+                        "the same index and chain"
+                    )
+                else:
+                    proofs.add(
+                        (
+                            state["applied_index"],
+                            partition["key"],
+                            repr(partition["chain"]),
+                        )
+                    )
+        counts["majority_proofs"] += len(proofs)
+
+        # 2. A committed command never disappears across a restart of the same node.
+        by_node: dict[object, list[dict]] = {}
+        for state in states:
+            by_node.setdefault(state["node"], []).append(state)
+        for node, observations in by_node.items():
+            for restart in restarts:
+                if restart.get("node") != node:
+                    continue
+                before = [s for s in observations if s["seq"] < restart["seq"]]
+                after = [s for s in observations if s["seq"] > restart["seq"]]
+                if not before or not after:
+                    continue
+                for later in after:
+                    _q2_state_regression(
+                        label, "its restart", node, restart["seq"], before[-1],
+                        later, reasons,
+                    )
+
+        # 3a. Two nodes that report the same count must report the same committed
+        # chain; a divergent committed prefix is a safety violation.
+        chains: dict[tuple, set] = {}
+        for state in states:
+            for partition in state["partitions"]:
+                if partition["key"] is None or partition["count"] in (None, 0):
+                    continue
+                chains.setdefault(
+                    (partition["key"], partition["count"]), set()
+                ).add((state["node"], repr(partition["chain"])))
+        for (key, count), observed in chains.items():
+            if len({chain for _, chain in observed}) > 1:
+                reasons.append(
+                    f"{label}: divergent committed chains for partition {key} at count "
+                    f"{count}: "
+                    f"{sorted((str(node), chain) for node, chain in observed)}"
+                )
+
+        # 3b/4. A committed result and an `ok` acknowledgement both need a majority of
+        # distinct voters that later report the request id in their committed state.
+        carrying = any(_q2_state_request_ids(state) for state in states)
+        unverifiable_reported = False
+        for proposal in proposals:
+            if proposal.get("ok") is not True:
+                continue
+            ids = _q2_request_ids(proposal.get("request_id"))
+            if not ids:
+                invalid.append(
+                    f"{label}: a committed proposal at seq {proposal['seq']} carries "
+                    "no request identity"
+                )
+                continue
+            if not carrying:
+                if not unverifiable_reported:
+                    invalid.append(
+                        f"{label}: the state observations carry no request identity, "
+                        "so the committed acknowledgement cannot be verified"
+                    )
+                    unverifiable_reported = True
+                continue
+            holders = {
+                state["node"]
+                for state in states
+                if state["seq"] > proposal["seq"]
+                and ids & _q2_state_request_ids(state)
+            }
+            if len(holders) < MAJORITY:
+                reasons.append(
+                    f"{label}: the committed result of request {sorted(ids)[0]} is "
+                    f"reported by {len(holders)} node(s) {sorted(map(str, holders))}; "
+                    f"{MAJORITY} voters must carry the committed command"
+                )
+
+        # 5. An uncommitted tail is never presented as committed: a request the harness
+        # classified as not committed may not appear in any later committed state.
+        for outcome in outcomes:
+            if _q2_committed_classification(outcome):
+                continue
+            ids = _q2_request_ids(outcome.get("request_id")) | _q2_request_ids(
+                outcome.get("request_ids")
+            )
+            if not ids:
+                continue
+            for state in states:
+                if state["seq"] <= outcome["seq"]:
+                    continue
+                hits = ids & _q2_state_request_ids(state)
+                if hits:
+                    reasons.append(
+                        f"{label}: request {sorted(hits)[0]} was classified "
+                        f"{_q2_classification(outcome) or 'not committed'} but node "
+                        f"{state['node']} later reports it in its committed state"
+                    )
+
+        # 6. Injected corruption is never silently ignored: its outcome must have been
+        # observed. A PASS conclusion additionally needs applied state evidence.
+        for corruption in corruptions:
+            later = [o for o in outcomes if o["seq"] > corruption["seq"]]
+            if not later:
+                invalid.append(
+                    f"{label}: the corruption outcome was never observed (node "
+                    f"{corruption.get('node')}, seq {corruption['seq']})"
+                )
+        if group_conclusions and group_conclusions[-1].get("verdict") == PASS:
+            if not any(state["event"] == "applied_state" for state in states):
+                invalid.append(
+                    f"{label}: concluded PASS without any applied state observation"
+                )
+
+        # 7. A snapshot never changes a previously committed identity: the count must
+        # not decrease and an unchanged count keeps its chain.
+        for snap in snapshots:
+            node = snap.get("node")
+            before = [s for s in states if s["node"] == node and s["seq"] < snap["seq"]]
+            after = [s for s in states if s["node"] == node and s["seq"] > snap["seq"]]
+            if not before or not after:
+                continue
+            for later in after:
+                _q2_state_regression(
+                    label, "its snapshot", node, snap["seq"], before[-1], later, reasons
+                )
+
+        # 8. A commit never happens while fewer than a majority of voters are
+        # available. Availability is an observation of the current cluster, so the
+        # latest quorum record before the commit is the one that governs it: a later
+        # restart that restored the majority clears the earlier outage.
+        for proposal in proposals:
+            if proposal.get("ok") is not True:
+                continue
+            observed_quorums = [q for q in quorums if q["seq"] < proposal["seq"]]
+            if not observed_quorums:
+                continue
+            quorum = observed_quorums[-1]
+            available = _q2_int(quorum.get("available_nodes"))
+            if available is None or available >= MAJORITY:
+                continue
+            reasons.append(
+                f"{label}: request {proposal.get('request_id')} committed at seq "
+                f"{proposal['seq']} while only {available} voter(s) were available "
+                f"at seq {quorum['seq']}"
+            )
+
+        # 9. The cluster and the shard identity never change. An observation that
+        # carries no identity cannot contradict one; a recorded change is a failure.
+        identities = []
+        for record in group:
+            if record.get("event") == "cluster_started" or (
+                record.get("event") in Q2_STATE_EVENTS
+                and (
+                    record.get("cluster_id") is not None
+                    or record.get("shard_id") is not None
+                )
+            ):
+                identities.append(
+                    (record.get("cluster_id"), record.get("shard_id"), record["seq"])
+                )
+        baseline = next(
+            ((c, s) for c, s, _ in identities if c is not None or s is not None),
+            None,
+        )
+        if identities and baseline is None:
+            invalid.append(f"{label}: no cluster or shard identity was recorded")
+        elif baseline is not None:
+            for cluster_id, shard_id, seq in identities:
+                if (
+                    cluster_id is not None
+                    and baseline[0] is not None
+                    and _q2_int(cluster_id) != _q2_int(baseline[0])
+                ):
+                    reasons.append(
+                        f"{label}: the cluster identity changed from {baseline[0]} to "
+                        f"{cluster_id} at seq {seq}"
+                    )
+                if (
+                    shard_id is not None
+                    and baseline[1] is not None
+                    and _q2_int(shard_id) != _q2_int(baseline[1])
+                ):
+                    reasons.append(
+                        f"{label}: the shard identity changed from {baseline[1]} to "
+                        f"{shard_id} at seq {seq}"
+                    )
+
+    reasons = list(dict.fromkeys(reasons))
+    invalid = list(dict.fromkeys(invalid))
+    if reasons:
+        return _result(FAIL, reasons, counts)
+    if invalid:
+        return _result(INVALID, invalid, counts)
+    if state_total == 0 and proposal_total == 0:
+        return _result(NOT_RUN, ["no Q2 Raft state evidence"], counts)
+    return _result(PASS, [], counts)
