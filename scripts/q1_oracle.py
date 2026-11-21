@@ -862,3 +862,249 @@ def reconcile_bundle(records: list[dict], *, require_conclusion: bool = True) ->
         "restarts": len(restarts),
     }
     return _result(FAIL if reasons else PASS, reasons, counts)
+
+
+def reconcile_safety(records: list[dict], *, require_conclusion: bool = True) -> dict:
+    """Reconciles a crash, isolation or uncertainty journal.
+
+    The journal is written by the parent harness from externally observed results only:
+    the process lifecycle, the committed transition reports of the brokers, the results a
+    client received and the histories an external reader saw after a restart. The verifier
+    establishes the safety properties from that data and never from a broker's own claim
+    that it did the right thing.
+
+    A contradiction is INVALID, a broken safety invariant is FAIL and a journal without
+    evidence is NOT_RUN. A missed barrier, a missing observation or an absent journal is
+    never a pass.
+    """
+    reasons: list[str] = []
+    if require_conclusion and (not records or records[-1]["event"] != "conclusion"):
+        return _result(INVALID, ["missing conclusion"], {})
+    # The journal order is the observation order: a fixture without an explicit sequence
+    # number keeps the position it was written at.
+    records = [
+        record if record.get("seq") is not None else {**record, "seq": index}
+        for index, record in enumerate(records)
+    ]
+
+    scenarios = [r for r in records if r["event"] == "scenario_started"]
+    barriers = [r for r in records if r["event"] == "barrier_reached"]
+    kills = [r for r in records if r["event"] == "process_killed"]
+    restarts = [r for r in records if r["event"] == "process_restarted"]
+    attempts = [r for r in records if r["event"] == "publication_attempt"]
+    commits = [r for r in records if r["event"] == "publication_committed"]
+    failures = [r for r in records if r["event"] == "publication_failed"]
+    histories = [r for r in records if r["event"] == "history_observed"]
+    routes = [r for r in records if r["event"] == "route_active"]
+    stages = [r for r in records if r["event"] == "migration_stage"]
+    fences = [r for r in records if r["event"] == "fence_confirmed"]
+    transfers = [r for r in records if r["event"] == "transfer_verified"]
+    dispositions = [r for r in records if r["event"] == "dlq_disposition"]
+    cursors = [r for r in records if r["event"] == "cursor_observed"]
+    receipts = [r for r in records if r["event"] == "chunk_receipts"]
+
+    if not scenarios:
+        return _result(NOT_RUN, ["no scenario evidence"], {})
+
+    # 1. A scenario that never reached its barrier is never a pass.
+    for scenario in scenarios:
+        if scenario.get("barrier"):
+            reached = [b for b in barriers if b.get("barrier") == scenario["barrier"]]
+            if not reached:
+                reasons.append(
+                    f"the scenario {scenario.get('scenario')} never reached its barrier "
+                    f"{scenario['barrier']}"
+                )
+        if not scenario.get("build"):
+            reasons.append(f"the scenario {scenario.get('scenario')} has no build identity")
+
+    # 2. A killed process must be restarted on its original storage.
+    killed = {r.get("process") for r in kills}
+    restarted = {r.get("process") for r in restarts}
+    for process in killed - restarted:
+        reasons.append(f"the killed process {process} was never restarted")
+
+    # 3. No acknowledged publication may disappear.
+    acknowledged = {}
+    for commit in commits:
+        key = (commit.get("node"), commit.get("producer"), commit.get("epoch"),
+               commit.get("sequence"))
+        previous = acknowledged.get(key)
+        if previous is None:
+            acknowledged[key] = commit
+            continue
+        if previous.get("offset") != commit.get("offset"):
+            reasons.append(f"the producer token {key} changed its offset")
+        if previous.get("message_id") != commit.get("message_id"):
+            reasons.append(f"the producer token {key} changed its message identity")
+    for history in histories:
+        node = history.get("node")
+        for record in history.get("records", []):
+            key = (node, record.get("producer"), record.get("epoch"),
+                   record.get("sequence"))
+            observed = acknowledged.get(key)
+            if observed is None:
+                continue
+            if observed.get("offset") != record.get("offset"):
+                reasons.append(
+                    f"the recovered record of {key} changed its offset"
+                )
+            if observed.get("message_id") != record.get("message_id"):
+                reasons.append(
+                    f"the recovered record of {key} changed its message identity"
+                )
+            if observed.get("digest") and record.get("digest") \
+                    and observed["digest"] != record["digest"]:
+                reasons.append(
+                    f"the recovered payload of {key} changed its digest"
+                )
+    # Every acknowledged publication must survive in a history that was observed after the
+    # acknowledgement. A node whose history was never observed after the acknowledgement
+    # carries no evidence either way.
+    for key, commit in acknowledged.items():
+        node = key[0]
+        later = [
+            history for history in histories
+            if history.get("node") == node and history["seq"] > commit["seq"]
+        ]
+        if not later:
+            continue
+        recovered_here = [
+            record
+            for history in later
+            for record in history.get("records", [])
+            if record.get("offset") == commit.get("offset")
+            and record.get("message_id") == commit.get("message_id")
+        ]
+        if not recovered_here:
+            reasons.append(
+                f"the acknowledged publication {key} is missing from the recovered history"
+            )
+
+    # 4. An uncertain outcome is never a definite noncommit.
+    for failure in failures:
+        if failure.get("outcome") == "timeout" and failure.get("committed") is True:
+            reasons.append("a timeout was reported as a committed outcome")
+    for attempt in attempts:
+        key = (attempt.get("node"), attempt.get("producer"), attempt.get("epoch"),
+               attempt.get("sequence"))
+        if key in acknowledged and attempt.get("outcome") == "timeout":
+            reasons.append(
+                f"the attempt {key} is both uncertain and acknowledged without an outcome"
+            )
+
+    # 5. The incarnation of an intact history never changes.
+    incarnations = {
+        record.get("incarnation")
+        for history in histories
+        for record in history.get("records", [])
+        if record.get("incarnation")
+    }
+    if len(incarnations) > 1:
+        reasons.append(f"the log incarnation changed: {sorted(map(str, incarnations))}")
+
+    # 6. No target commit may precede the verified activation.
+    activations = [s for s in stages if s.get("stage") == "activate_new"]
+    for commit in commits:
+        if commit.get("node") != "target":
+            continue
+        if not activations:
+            reasons.append("the target committed without a committed activation")
+            break
+        if commit["seq"] < activations[0]["seq"]:
+            reasons.append(
+                f"the target committed at seq {commit['seq']} before the activation"
+            )
+
+    # 7. No old owner commit may follow its effective durable fence.
+    for commit in commits:
+        if commit.get("node") != "source":
+            continue
+        later = [f for f in fences if f["seq"] < commit["seq"]]
+        if later:
+            reasons.append(
+                f"the old owner committed at seq {commit['seq']} after its fence at "
+                f"{later[0]['seq']}"
+            )
+
+    # 8. No activation may happen without a verified transfer.
+    for activation in activations:
+        prior = [t for t in transfers if t["seq"] < activation["seq"]]
+        if not prior:
+            reasons.append("the activation has no verified transfer")
+        if not any(t.get("member") == "source" for t in prior):
+            reasons.append("the activation has no verified source inventory")
+        if any(t.get("member") == "dependent" for t in prior) and not any(
+            t.get("member") == "dependent" and t.get("verified") for t in prior
+        ):
+            reasons.append("the activation has no verified dependent inventory")
+
+    # 9. The committed stage never moves backwards and never skips.
+    order: list[tuple[int, str]] = []
+    for record in stages:
+        stage = record.get("stage")
+        if stage not in MIGRATION_STAGES:
+            reasons.append(f"unknown migration stage {stage}")
+            continue
+        order.append((MIGRATION_STAGES.index(stage), stage))
+    for previous, current in zip(order, order[1:]):
+        if current[0] < previous[0]:
+            reasons.append(f"the migration stage moved back from {previous[1]} to {current[1]}")
+        elif current[0] > previous[0] + 1:
+            reasons.append(f"the migration stage jumped from {previous[1]} to {current[1]}")
+
+    # 10. A repeated committed transition never creates a second revision.
+    revisions: dict[str, set[int]] = {}
+    for record in stages:
+        revisions.setdefault(record.get("stage", ""), set()).add(record.get("revision"))
+    for stage, values in revisions.items():
+        if len(values) > 1:
+            reasons.append(f"the stage {stage} was committed with several revisions: {values}")
+
+    # 11. No committed disposition is duplicated and every disposition is proved.
+    ids = [d.get("disposition_id") for d in dispositions]
+    if len(ids) != len(set(ids)):
+        reasons.append(f"a disposition was published twice: {ids}")
+    for disposition in dispositions:
+        if disposition.get("verified") is not True:
+            reasons.append(
+                f"the disposition {disposition.get('disposition_id')} is not verified"
+            )
+
+    # 12. The cursor never moves backwards and never skips an unacknowledged record.
+    by_node: dict[object, list[int]] = {}
+    for cursor in cursors:
+        by_node.setdefault(cursor.get("node"), []).append(cursor.get("cursor"))
+    for node, values in by_node.items():
+        for previous, current in zip(values, values[1:]):
+            if current < previous:
+                reasons.append(f"the cursor of {node} moved back from {previous} to {current}")
+
+    # 13. The staged chunk receipts are unique per chunk identity.
+    for observation in receipts:
+        seen: dict[tuple, str] = {}
+        for entry in observation.get("chunks", []):
+            key = (entry.get("file_index"), entry.get("offset"))
+            digest = entry.get("digest")
+            if key in seen and seen[key] != digest:
+                reasons.append(f"the chunk receipt {key} changed its digest")
+            seen[key] = digest
+        expected = observation.get("expected_chunks")
+        if expected is not None and len(seen) != expected:
+            reasons.append(
+                f"the staging area holds {len(seen)} chunk receipts, expected {expected}"
+            )
+
+    counts = {
+        "scenarios": len(scenarios),
+        "barriers": len(barriers),
+        "kills": len(kills),
+        "restarts": len(restarts),
+        "commits": len(commits),
+        "histories": len(histories),
+        "stages": len(stages),
+        "fences": len(fences),
+        "transfers": len(transfers),
+        "dispositions": len(dispositions),
+    }
+    return _result(FAIL if reasons else PASS, reasons, counts)

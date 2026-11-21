@@ -344,5 +344,150 @@ class JournalIntegrity(unittest.TestCase):
                 oracle.load(path)
 
 
+class SafetyOracle(unittest.TestCase):
+    """The safety verifier must reject fabricated and contradictory evidence."""
+
+    def base(self) -> list[dict]:
+        """A complete, consistent journal of one crash scenario."""
+        return [
+            {"event": "scenario_started", "scenario": "C1", "barrier": "before_fence",
+             "build": "abc123"},
+            {"event": "barrier_reached", "barrier": "before_fence", "process": "source"},
+            {"event": "process_killed", "process": "source"},
+            {"event": "process_restarted", "process": "source"},
+            {"event": "publication_attempt", "node": "source", "producer": 11,
+             "epoch": 1, "sequence": 0},
+            {"event": "publication_committed", "node": "source", "producer": 11,
+             "epoch": 1, "sequence": 0, "offset": 0, "message_id": 100, "digest": "aa"},
+            {"event": "transfer_verified", "member": "source", "verified": True,
+             "inventory": "ff"},
+            {"event": "migration_stage", "stage": "catch_up", "revision": 6},
+            {"event": "migration_stage", "stage": "fence_old", "revision": 7},
+            {"event": "fence_confirmed", "node": "source", "epoch": 7},
+            {"event": "transfer_verified", "member": "source", "verified": True,
+             "inventory": "ff"},
+            {"event": "migration_stage", "stage": "activate_new", "revision": 8},
+            {"event": "route_active", "node": "target"},
+            {"event": "publication_attempt", "node": "target", "producer": 11,
+             "epoch": 1, "sequence": 0},
+            {"event": "publication_committed", "node": "target", "producer": 11,
+             "epoch": 1, "sequence": 0, "offset": 0, "message_id": 100, "digest": "aa"},
+            {"event": "history_observed", "node": "target",
+             "records": [{"incarnation": 42, "offset": 0, "message_id": 100,
+                          "digest": "aa", "producer": 11, "epoch": 1, "sequence": 0}]},
+        ]
+
+    def reconcile(self, records: list[dict]) -> dict:
+        result = oracle.reconcile_safety(concluded(records))
+        return result
+
+    def test_a_consistent_journal_passes(self):
+        result = self.reconcile(self.base())
+        self.assertEqual(result["verdict"], oracle.PASS, result)
+
+    def test_a_fabricated_activation_without_a_verified_transfer_fails(self):
+        records = self.base()
+        records = [r for r in records if r.get("member") != "source"]
+        result = self.reconcile(records)
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+        self.assertTrue(
+            any("verified transfer" in reason for reason in result["reasons"]),
+            result["reasons"],
+        )
+
+    def test_a_missing_acknowledged_record_fails(self):
+        records = self.base()
+        for record in records:
+            if record.get("event") == "history_observed":
+                record["records"] = []
+        result = self.reconcile(records)
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+        self.assertTrue(
+            any("missing from the recovered history" in reason
+                for reason in result["reasons"]),
+            result["reasons"],
+        )
+
+    def test_a_changed_payload_digest_fails(self):
+        records = self.base()
+        for record in records:
+            if record.get("event") == "history_observed":
+                record["records"][0]["digest"] = "bb"
+        result = self.reconcile(records)
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+
+    def test_overlapping_owner_commits_fail(self):
+        records = self.base()
+        # The old owner commits after its durable fence.
+        records.append({"event": "publication_committed", "node": "source", "producer": 11,
+                        "epoch": 1, "sequence": 1, "offset": 2, "message_id": 101,
+                        "digest": "cc"})
+        result = self.reconcile(records)
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+        self.assertTrue(
+            any("after its fence" in reason for reason in result["reasons"]),
+            result["reasons"],
+        )
+
+    def test_a_target_commit_before_the_activation_fails(self):
+        records = self.base()
+        activation = [r for r in records if r.get("stage") == "activate_new"][0]
+        early = dict(records[0])
+        early.update({"event": "publication_committed", "node": "target", "producer": 11,
+                      "epoch": 1, "sequence": 0, "offset": 0, "message_id": 100,
+                      "digest": "aa", "seq": 0})
+        records.append(early)
+        result = self.reconcile(records)
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+
+    def test_a_missing_dlq_proof_fails(self):
+        records = self.base()
+        records.append({"event": "dlq_disposition", "disposition_id": 5,
+                        "verified": False})
+        result = self.reconcile(records)
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+
+    def test_a_duplicated_disposition_fails(self):
+        records = self.base()
+        records.append({"event": "dlq_disposition", "disposition_id": 5, "verified": True})
+        records.append({"event": "dlq_disposition", "disposition_id": 5, "verified": True})
+        result = self.reconcile(records)
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+
+    def test_a_missed_barrier_is_never_a_pass(self):
+        records = self.base()
+        records = [r for r in records if r.get("event") != "barrier_reached"]
+        result = self.reconcile(records)
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+        self.assertTrue(
+            any("never reached its barrier" in reason for reason in result["reasons"]),
+            result["reasons"],
+        )
+
+    def test_a_missing_conclusion_is_invalid(self):
+        result = oracle.reconcile_safety(self.base())
+        self.assertEqual(result["verdict"], oracle.INVALID, result)
+
+    def test_an_empty_journal_is_not_run(self):
+        result = oracle.reconcile_safety([])
+        self.assertEqual(result["verdict"], oracle.INVALID, result)
+
+    def test_a_cursor_that_moves_backwards_fails(self):
+        records = self.base()
+        records.append({"event": "cursor_observed", "node": "target", "cursor": 4})
+        records.append({"event": "cursor_observed", "node": "target", "cursor": 2})
+        result = self.reconcile(records)
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+
+    def test_a_chunk_receipt_that_changed_its_digest_fails(self):
+        records = self.base()
+        records.append({"event": "chunk_receipts", "expected_chunks": 1,
+                        "chunks": [{"file_index": 0, "offset": 0, "digest": "aa"},
+                                   {"file_index": 0, "offset": 0, "digest": "bb"}]})
+        result = self.reconcile(records)
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

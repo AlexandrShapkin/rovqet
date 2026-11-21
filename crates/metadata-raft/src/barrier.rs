@@ -22,6 +22,10 @@ pub const BARRIER_RELEASE_ENV: &str = "ROVQET_MIGRATION_BARRIER_RELEASE";
 /// but before the caller receives the confirmation.
 pub const AFTER_MIGRATION_COMMIT: &str = "after_migration_commit";
 
+/// The barrier that fires when a migration transition reached the leader but was not
+/// committed yet.
+pub const AFTER_MIGRATION_PROPOSAL: &str = "after_migration_proposal";
+
 #[cfg(feature = "fault-injection")]
 pub fn barrier(name: &str) {
     if std::env::var(BARRIER_ENV).ok().as_deref() != Some(name) {

@@ -171,6 +171,17 @@ impl MetadataNode {
                         tokio::spawn(async move {
                             let response = match read_rpc(&mut stream).await {
                                 Ok(RaftRpc::ClientWrite(command)) => {
+                                    // A migration transition that reached the leader but
+                                    // was not committed yet is a real pending window: the
+                                    // parent can kill the leader in exactly that state.
+                                    if matches!(
+                                        command,
+                                        crate::types::MetadataCommand::AdvanceMigration { .. }
+                                    ) {
+                                        crate::barrier::barrier(
+                                            crate::barrier::AFTER_MIGRATION_PROPOSAL,
+                                        );
+                                    }
                                     // A follower forwards the proposal to the leader of the
                                     // group; the committed answer is returned verbatim.
                                     match raft.client_write(command).await {
@@ -308,6 +319,11 @@ impl MetadataNode {
         &self,
         command: MetadataCommand,
     ) -> Result<crate::types::MetadataCommandResponse, MetadataError> {
+        // A migration transition that this node submits to itself is pending from here until
+        // the entry is committed: the barrier lets the parent kill the leader there.
+        if matches!(command, crate::types::MetadataCommand::AdvanceMigration { .. }) {
+            crate::barrier::barrier(crate::barrier::AFTER_MIGRATION_PROPOSAL);
+        }
         match self.raft.client_write(command.clone()).await {
             Ok(response) => Ok(response.data),
             Err(error) => {
