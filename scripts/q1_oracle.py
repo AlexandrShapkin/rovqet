@@ -1637,3 +1637,589 @@ def reconcile_q2_raft(records: list[dict], *, require_conclusion: bool = True) -
     if state_total == 0 and proposal_total == 0:
         return _result(NOT_RUN, ["no Q2 Raft state evidence"], counts)
     return _result(PASS, [], counts)
+
+
+# --- Q2 publication (C-04) -------------------------------------------------------
+#
+# A Q2 publication journal is written by the parent campaign from two observations it
+# owns: the JSON line the SDK example printed for each attempt, and a copy of each
+# voter's committed `state.json` read from that voter's own data directory after the
+# attempt. The oracle never derives a commit from the broker's own startup line or from
+# a proposal being sent: a COMMITTED_QUORUM outcome needs a majority of distinct voters
+# whose committed state contains the acknowledged message.
+
+Q2_PUBLISH_MAJORITY = 2
+
+
+def _q2_hex(value) -> str | None:
+    """A digest as lowercase hex, from a hex string or a list of bytes."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value.lower()
+    if isinstance(value, (bytes, bytearray, list, tuple)):
+        try:
+            return bytes(value).hex()
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _q2_payload_hex(value) -> str | None:
+    """A committed payload as lowercase hex, or None when it is absent entirely.
+
+    None (no payload observation) is deliberately distinct from an empty payload,
+    which serialises as the empty string. The campaign journals the payload bytes
+    explicitly so a digest alone can never stand in for the message it describes.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value.strip().lower()
+    if isinstance(value, (bytes, bytearray, list, tuple)):
+        try:
+            return bytes(value).hex()
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _q2_payload_bytes(value: str | None) -> bytes | None:
+    """Decode a hex payload observation back into the exact committed bytes."""
+    if not isinstance(value, str) or len(value) % 2 != 0:
+        return None
+    try:
+        return bytes.fromhex(value)
+    except ValueError:
+        return None
+
+
+def _q2_publish_key(record: dict):
+    producer = _q2_int(record.get("producer", record.get("producer_id")))
+    epoch = _q2_int(record.get("epoch", record.get("producer_epoch")))
+    sequence = _q2_int(record.get("sequence"))
+    if producer is None or epoch is None or sequence is None:
+        return None
+    return (producer, epoch, sequence)
+
+
+def _q2_publish_messages(record: dict) -> dict[int, dict]:
+    """The retained messages of one voter state keyed by logical offset."""
+    messages: dict[int, dict] = {}
+    for entry in record.get("messages") or []:
+        if not isinstance(entry, dict):
+            continue
+        offset = _q2_int(entry.get("offset", entry.get("logical_offset")))
+        if offset is None:
+            continue
+        messages[offset] = {
+            "offset": offset,
+            "message_id": _q2_int(entry.get("message_id")),
+            "digest": _q2_hex(entry.get("digest", entry.get("payload_digest"))),
+            "payload": _q2_payload_hex(entry.get("payload", entry.get("payload_hex"))),
+            "producer": _q2_int(entry.get("producer", entry.get("producer_id"))),
+            "epoch": _q2_int(entry.get("epoch", entry.get("producer_epoch"))),
+            "sequence": _q2_int(entry.get("sequence")),
+        }
+    return messages
+
+
+def _q2_publish_outcomes(record: dict) -> dict:
+    """The retained producer outcomes of one voter state keyed by producer token."""
+    outcomes: dict[tuple, dict] = {}
+    for entry in record.get("outcomes") or []:
+        if not isinstance(entry, dict):
+            continue
+        key = _q2_publish_key(entry)
+        if key is None:
+            continue
+        offset = _q2_int(entry.get("offset", entry.get("logical_offset")))
+        if offset is None:
+            continue
+        outcomes[key] = {
+            "offset": offset,
+            "message_id": _q2_int(entry.get("message_id")),
+            "digest": _q2_hex(entry.get("digest", entry.get("payload_digest"))),
+        }
+    return outcomes
+
+
+def _q2_publish_states(records: list[dict]) -> list[dict]:
+    states = []
+    for record in records:
+        if record.get("event") != "voter_state":
+            continue
+        states.append(
+            {
+                "seq": record.get("seq"),
+                "node": record.get("node"),
+                "applied_index": _q2_int(record.get("applied_index")),
+                "partition": _q2_partition_key(record.get("partition")),
+                "count": _q2_int(record.get("count")),
+                "chain": _q2_hex(record.get("chain", record.get("chain_digest"))),
+                "next_logical_offset": _q2_int(record.get("next_logical_offset")),
+                "messages": _q2_publish_messages(record),
+                "outcomes": _q2_publish_outcomes(record),
+            }
+        )
+    return states
+
+
+def _q2_publish_state_consistency(
+    states: list[dict], reasons: list[str], invalid: list[str]
+) -> None:
+    """Per-node monotonicity and cross-node agreement of committed state."""
+    by_node: dict[object, list[dict]] = {}
+    for state in states:
+        if state["node"] is None or state["partition"] is None or state["count"] is None:
+            invalid.append(
+                f"voter state at seq {state['seq']} has no node, partition or committed "
+                "count"
+            )
+            continue
+        by_node.setdefault(state["node"], []).append(state)
+        if state["next_logical_offset"] is not None:
+            for offset in state["messages"]:
+                if offset >= state["next_logical_offset"]:
+                    reasons.append(
+                        f"node {state['node']} reports message offset {offset} beyond "
+                        f"its next logical offset {state['next_logical_offset']}"
+                    )
+    for node, observations in by_node.items():
+        previous_by_partition: dict[str, dict] = {}
+        for state in sorted(observations, key=lambda item: item["seq"] or 0):
+            previous = previous_by_partition.get(state["partition"])
+            if previous is not None:
+                if state["count"] < previous["count"]:
+                    reasons.append(
+                        f"node {node} lost committed publications on partition "
+                        f"{state['partition']}: count {previous['count']} -> "
+                        f"{state['count']}"
+                    )
+                elif (
+                    state["count"] == previous["count"]
+                    and state["chain"] != previous["chain"]
+                ):
+                    reasons.append(
+                        f"node {node} reports another committed chain for partition "
+                        f"{state['partition']} at the unchanged count {state['count']}"
+                    )
+                if (
+                    state["next_logical_offset"] is not None
+                    and previous["next_logical_offset"] is not None
+                    and state["next_logical_offset"] < previous["next_logical_offset"]
+                ):
+                    reasons.append(
+                        f"node {node} moved its next logical offset backwards on "
+                        f"partition {state['partition']}: "
+                        f"{previous['next_logical_offset']} -> "
+                        f"{state['next_logical_offset']}"
+                    )
+            previous_by_partition[state["partition"]] = state
+    # A retained payload is immutable: a later observation (for example after a
+    # restart or catch-up) must reproduce the exact bytes an earlier observation
+    # already reported, and may not silently drop them.
+    payloads: dict[tuple, str | None] = {}
+    for state in states:
+        if state["node"] is None or state["partition"] is None:
+            continue
+        for offset, message in state["messages"].items():
+            identity = (
+                state["node"],
+                state["partition"],
+                offset,
+                message["message_id"],
+            )
+            if identity not in payloads:
+                payloads[identity] = message["payload"]
+                continue
+            previous_payload = payloads[identity]
+            if previous_payload is not None and message["payload"] is None:
+                reasons.append(
+                    f"node {state['node']} no longer reports the payload of offset "
+                    f"{offset} on partition {state['partition']} that it reported before"
+                )
+            elif (
+                previous_payload is not None
+                and message["payload"] is not None
+                and previous_payload != message["payload"]
+            ):
+                reasons.append(
+                    f"node {state['node']} reports different payload bytes for offset "
+                    f"{offset} on partition {state['partition']} than it reported before"
+                )
+    chains: dict[tuple, set] = {}
+    for state in states:
+        if state["partition"] is None or state["count"] is None or state["chain"] is None:
+            continue
+        chains.setdefault((state["partition"], state["count"]), set()).add(state["chain"])
+    for (partition, count), observed in chains.items():
+        if len(observed) > 1:
+            reasons.append(
+                f"voters disagree about the committed chain of partition {partition} "
+                f"at count {count}: {sorted(observed)}"
+            )
+
+
+def reconcile_q2_publish(
+    records: list[dict], *, require_conclusion: bool = True
+) -> dict:
+    """Independent oracle for the C-04 Q2 publication campaign.
+
+    A COMMITTED_QUORUM outcome is accepted only when at least two distinct voters'
+    committed state (read from their own data directories by the parent) contains the
+    acknowledged message at the acknowledged logical offset with the same message
+    identity, the same exact payload bytes (whose digest must equal the acknowledged
+    digest), and the same applied index and partition chain. A vote that carries the
+    digest but no payload can never prove what was recovered: it is INVALID, while a
+    payload whose bytes contradict the digest or the attempted payload is FAIL. A
+    retry of the same producer token must report the original offset and must not
+    create a second message. A definite rejection must leave the committed state
+    untouched. An uncertain outcome is recorded as uncertain, never as a commit or as
+    a failure.
+
+    A safety violation is FAIL, missing or contradictory evidence is INVALID, and a
+    journal with no committed publication at all is NOT_RUN. A journal whose own
+    conclusion is not PASS is never reported as PASS.
+    """
+    reasons: list[str] = []
+    invalid: list[str] = []
+    if require_conclusion and (not records or records[-1].get("event") != "conclusion"):
+        return _result(INVALID, ["missing conclusion"], {})
+    records = [
+        record if record.get("seq") is not None else {**record, "seq": index}
+        for index, record in enumerate(records)
+    ]
+    conclusions = [record for record in records if record.get("event") == "conclusion"]
+    own_verdict = conclusions[-1].get("verdict") if conclusions else None
+    if conclusions and own_verdict != PASS:
+        detail = conclusions[-1].get("reason")
+        reasons.append(
+            f"the scenario concluded {own_verdict}"
+            + (f": {detail}" if detail else "")
+        )
+
+    started = [record for record in records if record.get("event") == "scenario_started"]
+    not_run_required = [
+        record
+        for record in records
+        if record.get("event") == "scenario_not_run"
+        and record.get("required", True) is not False
+    ]
+    # One producer token may be attempted several times with the same identity (the
+    # idempotent retry) and, deliberately, once with another identity (the sequence
+    # conflict fixture). Every attempt is kept: a commitment has to match one of them.
+    attempts: dict[tuple, list[dict]] = {}
+    for record in records:
+        if record.get("event") != "publication_attempt":
+            continue
+        key = _q2_publish_key(record)
+        if key is None:
+            invalid.append(f"attempt at seq {record.get('seq')} has no producer token")
+            continue
+        if record.get("digest") is None or _q2_hex(record.get("digest")) is None:
+            invalid.append(f"attempt {key} has no payload digest")
+            continue
+        if _q2_int(record.get("message_id")) is None:
+            invalid.append(f"attempt {key} has no message id")
+            continue
+        attempts.setdefault(key, []).append(record)
+
+    def matching_attempt(key, record):
+        for attempt in attempts.get(key, []):
+            if (
+                _q2_int(attempt.get("message_id")) == _q2_int(record.get("message_id"))
+                and _q2_hex(attempt.get("digest")) == _q2_hex(record.get("digest"))
+                and _q2_int(attempt.get("incarnation"))
+                == _q2_int(record.get("incarnation"))
+            ):
+                return attempt
+        return None
+
+    states = _q2_publish_states(records)
+    _q2_publish_state_consistency(states, reasons, invalid)
+    committed: list[dict] = []
+    rejected: list[dict] = []
+    unknown: list[dict] = []
+    for record in records:
+        event = record.get("event")
+        if event not in (
+            "publication_committed",
+            "publication_rejected",
+            "publication_unknown",
+        ):
+            continue
+        key = _q2_publish_key(record)
+        offset = _q2_int(record.get("offset"))
+        outcome = record.get("outcome")
+        if event == "publication_committed":
+            if outcome != "committed_quorum":
+                reasons.append(
+                    f"a committed publication at seq {record.get('seq')} reports "
+                    f"outcome {outcome!r}; a Q2 commit must be committed_quorum"
+                )
+            if key is None:
+                invalid.append(
+                    f"committed publication at seq {record.get('seq')} has no producer token"
+                )
+                continue
+            if key not in attempts:
+                invalid.append(
+                    f"committed publication {key} has no matching attempt observation"
+                )
+                continue
+            attempt = matching_attempt(key, record)
+            if attempt is None:
+                reasons.append(
+                    f"committed publication {key} acknowledges a message identity "
+                    "that was never attempted"
+                )
+                continue
+            if offset is None:
+                invalid.append(f"committed publication {key} has no logical offset")
+                continue
+            committed.append(record)
+        elif event == "publication_rejected":
+            if key is None:
+                invalid.append(
+                    f"rejection at seq {record.get('seq')} has no producer token"
+                )
+            else:
+                if not record.get("code"):
+                    invalid.append(f"rejection {key} has no error code")
+                rejected.append(record)
+        else:
+            if outcome == "committed_quorum" or offset is not None:
+                reasons.append(
+                    f"an uncertain outcome at seq {record.get('seq')} claims a commit"
+                )
+            if key is None:
+                invalid.append(
+                    f"uncertain outcome at seq {record.get('seq')} has no producer token"
+                )
+            else:
+                unknown.append(record)
+
+    # Idempotency and offset allocation.
+    ack_by_key: dict[tuple, list[dict]] = {}
+    ack_by_offset: dict[int, dict] = {}
+    ack_by_message: dict[int, dict] = {}
+    for ack in committed:
+        key = _q2_publish_key(ack)
+        offset = _q2_int(ack["offset"])
+        ack_by_key.setdefault(key, []).append(ack)
+        previous = ack_by_offset.get(offset)
+        if previous is not None and _q2_publish_key(previous) != key:
+            reasons.append(
+                f"logical offset {offset} was acknowledged for two different producer "
+                f"tokens {_q2_publish_key(previous)} and {key}"
+            )
+        else:
+            ack_by_offset[offset] = ack
+        message_id = _q2_int(ack.get("message_id"))
+        previous_message = ack_by_message.get(message_id)
+        if previous_message is not None and _q2_int(previous_message["offset"]) != offset:
+            reasons.append(
+                f"message id {message_id} was committed at two logical offsets "
+                f"{_q2_int(previous_message['offset'])} and {offset}"
+            )
+        else:
+            ack_by_message[message_id] = ack
+    for key, acks in ack_by_key.items():
+        offsets = {_q2_int(ack["offset"]) for ack in acks}
+        if len(offsets) > 1:
+            reasons.append(
+                f"retries of producer token {key} reported different logical offsets "
+                f"{sorted(offsets)}"
+            )
+        message_ids = {_q2_int(ack.get("message_id")) for ack in acks}
+        if len(message_ids) > 1:
+            reasons.append(
+                f"retries of producer token {key} changed the message id: "
+                f"{sorted(message_ids)}"
+            )
+    sequences: dict[tuple, list[int]] = {}
+    for key in ack_by_key:
+        sequences.setdefault((key[0], key[1]), []).append(key[2])
+    for token, accepted in sequences.items():
+        ordered = sorted(set(accepted))
+        if ordered != list(range(ordered[0], ordered[-1] + 1)):
+            reasons.append(
+                f"producer {token} committed a sequence gap: accepted {ordered}"
+            )
+        offsets = [
+            _q2_int(ack_by_key[(token[0], token[1], sequence)][0]["offset"])
+            for sequence in ordered
+        ]
+        if offsets != sorted(offsets) or len(set(offsets)) != len(offsets):
+            reasons.append(
+                f"producer {token} does not map its committed sequences to strictly "
+                f"increasing logical offsets: {offsets}"
+            )
+    for rejection in rejected:
+        key = _q2_publish_key(rejection)
+        rejection_identity = (
+            _q2_int(rejection.get("message_id")),
+            _q2_hex(rejection.get("digest")),
+        )
+        for ack in ack_by_key.get(key, []):
+            if (
+                _q2_int(ack.get("message_id")),
+                _q2_hex(ack.get("digest")),
+            ) == rejection_identity:
+                reasons.append(
+                    f"producer token {key} was both committed and definitively "
+                    "rejected with the same message identity"
+                )
+
+    # A commit needs a majority of distinct voters whose own state carries the message.
+    majority_proofs = 0
+    for ack in committed:
+        key = _q2_publish_key(ack)
+        offset = _q2_int(ack["offset"])
+        message_id = _q2_int(ack.get("message_id"))
+        digest = _q2_hex(ack.get("digest"))
+        # The attempt the acknowledgment is bound to, used to compare the recovered
+        # bytes with the bytes that were actually published.
+        ack_attempt = matching_attempt(key, ack) or {}
+        partition_ack = ack.get("partition")
+        partition_ack = _q2_partition_key(partition_ack)
+        witnesses: dict[tuple, set] = {}
+        contradicted = False
+        for state in states:
+            if partition_ack is not None and state["partition"] != partition_ack:
+                continue
+            message = state["messages"].get(offset)
+            outcome = state["outcomes"].get(key)
+            if outcome is not None and outcome["offset"] != offset:
+                reasons.append(
+                    f"node {state['node']} retains outcome {key} at offset "
+                    f"{outcome['offset']}, not the acknowledged {offset}"
+                )
+                contradicted = True
+            if message is None:
+                continue
+            if message["message_id"] != message_id or message["digest"] != digest:
+                reasons.append(
+                    f"node {state['node']} has a different message at acknowledged "
+                    f"offset {offset} for {key}"
+                )
+                contradicted = True
+                continue
+            retained_payload = message["payload"]
+            retained_bytes = _q2_payload_bytes(retained_payload)
+            if retained_payload is None:
+                invalid.append(
+                    f"node {state['node']} retains offset {offset} for {key} without "
+                    "the committed payload; the recovered bytes cannot be verified"
+                )
+                contradicted = True
+                continue
+            if retained_bytes is None:
+                invalid.append(
+                    f"node {state['node']} retains an undecodable payload for offset "
+                    f"{offset} of {key}"
+                )
+                contradicted = True
+                continue
+            if digest_hex(retained_bytes) != digest:
+                reasons.append(
+                    f"node {state['node']} retains payload bytes at offset {offset} "
+                    f"for {key} whose digest does not match the acknowledged {digest}"
+                )
+                contradicted = True
+                continue
+            attempted_payload = ack_attempt.get("payload")
+            if (
+                isinstance(attempted_payload, str)
+                and retained_bytes != attempted_payload.encode()
+            ):
+                reasons.append(
+                    f"node {state['node']} retains payload bytes at offset {offset} "
+                    f"for {key} that differ from the attempted payload"
+                )
+                contradicted = True
+                continue
+            if (
+                message["producer"] not in (None, key[0])
+                or message["epoch"] not in (None, key[1])
+                or message["sequence"] not in (None, key[2])
+            ):
+                reasons.append(
+                    f"node {state['node']} attributes offset {offset} to another "
+                    f"producer token than {key}"
+                )
+                contradicted = True
+                continue
+            witnesses.setdefault(
+                (state["applied_index"], state["count"], state["chain"]), set()
+            ).add(state["node"])
+        best = max((len(nodes) for nodes in witnesses.values()), default=0)
+        if contradicted:
+            continue
+        if not states:
+            invalid.append(
+                f"committed publication {key} at offset {offset} has no voter state "
+                "observation; the majority cannot be established"
+            )
+            continue
+        if best < Q2_PUBLISH_MAJORITY:
+            reasons.append(
+                f"committed publication {key} at offset {offset} is present in the "
+                f"committed state of {best} distinct voter(s); "
+                f"{Q2_PUBLISH_MAJORITY} are required"
+            )
+        else:
+            majority_proofs += 1
+    for state in states:
+        for key, outcome in state["outcomes"].items():
+            for rejection in rejected:
+                if _q2_publish_key(rejection) != key:
+                    continue
+                if (
+                    _q2_int(rejection.get("message_id")),
+                    _q2_hex(rejection.get("digest")),
+                ) == (outcome["message_id"], outcome["digest"]):
+                    reasons.append(
+                        f"node {state['node']} committed token {key} that another "
+                        "observation reports as definitively rejected with the same "
+                        "message identity"
+                    )
+
+    counts = {
+        "scenarios": len(started),
+        "attempts": len(attempts),
+        "committed": len(committed),
+        "retries": sum(len(acks) - 1 for acks in ack_by_key.values()),
+        "rejected": len(rejected),
+        "unknown": len(unknown),
+        "voter_states": len(states),
+        "majority_proofs": majority_proofs,
+    }
+    reasons = list(dict.fromkeys(reasons))
+    invalid = list(dict.fromkeys(invalid))
+    if reasons:
+        return _result(FAIL, reasons, counts)
+    if invalid:
+        return _result(INVALID, invalid, counts)
+    if own_verdict == FAIL:
+        return _result(FAIL, ["the scenario concluded FAIL"], counts)
+    if own_verdict == INVALID:
+        return _result(INVALID, ["the scenario concluded INVALID"], counts)
+    if own_verdict == NOT_RUN:
+        return _result(NOT_RUN, ["the scenario concluded NOT_RUN"], counts)
+    if not committed:
+        return _result(NOT_RUN, ["no committed Q2 publication evidence"], counts)
+    if not_run_required:
+        return _result(
+            NOT_RUN,
+            [
+                "a required C-04 scenario was not run: "
+                + "; ".join(
+                    f"{record.get('scenario')}: {record.get('reason', 'no reason')}"
+                    for record in not_run_required
+                )
+            ],
+            counts,
+        )
+    return _result(PASS, [], counts)

@@ -1,0 +1,1347 @@
+#!/usr/bin/env python3
+"""C-04 Q2 publication campaign and its independent-oracle negative fixtures.
+
+The campaign starts three real brokers in cluster mode, each with one embedded Q2
+shard voter. A real SDK client binary (`target/debug/examples/q2_publish`) publishes
+over TCP; every acknowledgment it prints is journaled verbatim. After each attempt the
+campaign reads each voter's own committed `state.json` from that voter's data directory
+and journals a copy. The oracle in `q1_oracle.reconcile_q2_publish` then establishes
+the properties from those observations: a COMMITTED_QUORUM acknowledgment needs a
+majority of distinct voters whose committed state carries the acknowledged message at
+the acknowledged offset with the same exact payload bytes; an idempotent retry reports
+the original offset and creates no second message; a definite rejection leaves the
+committed state untouched; and an uncertain outcome is never counted as a commit. A
+digest without the payload bytes cannot prove what a voter recovered, and a payload
+whose bytes contradict their digest is a failure.
+
+The required proof "leader crash strictly before a durable majority" is NOT_RUN here:
+the prototype broker exposes no deterministic pause before the quorum boundary, so a
+crash at that exact point cannot be provoked without fabricating evidence. That
+scenario is journaled as NOT_RUN with `required: true`, and the oracle therefore never
+reports the campaign as a complete PASS. The pre-majority case remains open for C-04.
+
+Default invocation runs the negative fixtures and then the campaign. `--fixtures-only`
+runs only the oracle fixture suite. Missing binaries are a real NOT_RUN observation,
+not a silent pass; the campaign exits 2 in that case.
+"""
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import traceback
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import q1_oracle as oracle  # noqa: E402
+
+ROOT = Path(__file__).resolve().parents[1]
+SERVER = ROOT / "target" / "debug" / "rovqet"
+EXAMPLE = ROOT / "target" / "debug" / "examples" / "q2_publish"
+EVIDENCE_DIR = ROOT / "benchmarks" / "evidence" / "c04-q2-publish"
+JOURNAL_PATH = EVIDENCE_DIR / "q2-publish.jsonl"
+
+PASS = "PASS"
+FAIL = "FAIL"
+INVALID = "INVALID"
+NOT_RUN = "NOT_RUN"
+
+CLUSTER = 4242
+SHARD = 7
+TOPIC = "durable-q2"
+TENANT = 1
+TOPIC_ID = 4
+PARTITION = 0
+INCARNATION = 42
+OWNER_EPOCH = 5
+PARTITION_KEY = f"{TENANT}:{TOPIC_ID}:{PARTITION}"
+
+T_READY = 45.0
+T_APPLIED = 30.0
+T_PUBLISH = 60.0
+T_POLL = 0.05
+
+
+class CheckFailure(Exception):
+    """A harness observation contradicted the C-04 contract."""
+
+
+def digest_hex(payload: str) -> str:
+    return oracle.digest_hex(payload.encode())
+
+
+def payload_hex(payload: str) -> str:
+    """The exact committed payload bytes as the JSON-safe hex the journal carries."""
+    return payload.encode().hex()
+
+
+def append_voter_state(journal: oracle.Journal, state: dict) -> dict:
+    """Journal one voter-state observation without reusing the event keyword.
+
+    `Node.read_state` returns a complete journal record, including its `event` field.
+    `Journal.append(event, **fields)` owns that keyword, so the embedded copy is
+    dropped here and the record is written with the single explicit event name.
+    """
+    fields = {key: value for key, value in state.items() if key != "event"}
+    return journal.append("voter_state", **fields)
+
+
+# --- Oracle fixtures ------------------------------------------------------------
+
+
+def state(node: int, *, offset_count=1, chain="cc", **overrides) -> dict:
+    record = {
+        "event": "voter_state",
+        "node": node,
+        "applied_index": 2,
+        "partition": {"tenant_id": TENANT, "topic_id": TOPIC_ID, "partition_id": PARTITION},
+        "count": offset_count,
+        "chain": chain,
+        "next_logical_offset": offset_count,
+        "messages": [
+            {
+                "offset": index,
+                "message_id": 100 + index,
+                "digest": digest_hex("alpha"),
+                "payload": payload_hex("alpha"),
+                "producer": 11,
+                "producer_epoch": 0,
+                "sequence": index,
+            }
+            for index in range(offset_count)
+        ],
+        "outcomes": [
+            {
+                "producer": 11,
+                "producer_epoch": 0,
+                "sequence": index,
+                "offset": index,
+                "message_id": 100 + index,
+                "digest": digest_hex("alpha"),
+            }
+            for index in range(offset_count)
+        ],
+    }
+    record.update(overrides)
+    return record
+
+
+def attempt(**overrides) -> dict:
+    record = {
+        "event": "publication_attempt",
+        "producer": 11,
+        "epoch": 0,
+        "sequence": 0,
+        "message_id": 100,
+        "digest": digest_hex("alpha"),
+        "incarnation": INCARNATION,
+        "owner_epoch": OWNER_EPOCH,
+    }
+    record.update(overrides)
+    return record
+
+
+def committed(**overrides) -> dict:
+    record = {
+        "event": "publication_committed",
+        "outcome": "committed_quorum",
+        "producer": 11,
+        "epoch": 0,
+        "sequence": 0,
+        "message_id": 100,
+        "digest": digest_hex("alpha"),
+        "incarnation": INCARNATION,
+        "offset": 0,
+        "partition": {
+            "tenant_id": TENANT,
+            "topic_id": TOPIC_ID,
+            "partition_id": PARTITION,
+        },
+    }
+    record.update(overrides)
+    return record
+
+
+def base() -> list[dict]:
+    return [
+        {"event": "scenario_started", "scenario": 1},
+        attempt(),
+        committed(),
+        state(1),
+        state(2),
+        state(3),
+    ]
+
+
+def concluded(records: list[dict], verdict: str = PASS, reason: str | None = None):
+    return records + [{"event": "conclusion", "verdict": verdict, "reason": reason}]
+
+
+class Q2PublishOracleFixtures(unittest.TestCase):
+    """Deliberately corrupted Q2 publication evidence must never pass."""
+
+    def reconcile(self, records):
+        return oracle.reconcile_q2_publish(concluded(records))
+
+    def test_consistent_journal_passes(self):
+        result = self.reconcile(base())
+        self.assertEqual(result["verdict"], oracle.PASS, result)
+        self.assertEqual(result["counts"]["committed"], 1)
+        self.assertEqual(result["counts"]["majority_proofs"], 1)
+
+    def test_empty_journal_is_not_run(self):
+        result = self.reconcile([{"event": "scenario_started", "scenario": 1}])
+        self.assertEqual(result["verdict"], oracle.NOT_RUN, result)
+
+    def test_missing_conclusion_is_invalid(self):
+        result = oracle.reconcile_q2_publish(base())
+        self.assertEqual(result["verdict"], oracle.INVALID, result)
+
+    def test_a_scenario_that_concluded_fail_is_never_a_pass(self):
+        result = oracle.reconcile_q2_publish(
+            concluded(base(), FAIL, "witness missing")
+        )
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+
+    def test_committed_ack_without_voter_state_is_invalid(self):
+        result = self.reconcile([attempt(), committed()])
+        self.assertEqual(result["verdict"], oracle.INVALID, result)
+
+    def test_one_voter_is_not_a_quorum(self):
+        result = self.reconcile([attempt(), committed(), state(1)])
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+
+    def test_voters_disagreeing_on_chain_fail(self):
+        result = self.reconcile(
+            [attempt(), committed(), state(1), state(2, chain="dd"), state(3)]
+        )
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+
+    def test_fabricated_acknowledgment_without_the_message_fails(self):
+        forged = committed(offset=5)
+        result = self.reconcile([attempt(), forged, state(1), state(2), state(3)])
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+
+    def test_changed_retry_offset_fails(self):
+        result = self.reconcile(
+            [attempt(), committed(offset=0), committed(offset=1),
+             state(1, offset_count=2), state(2, offset_count=2),
+             state(3, offset_count=2)]
+        )
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+
+    def test_retry_with_a_different_message_id_fails(self):
+        result = self.reconcile(
+            [attempt(), committed(message_id=100), committed(offset=0, message_id=101),
+             state(1), state(2), state(3)]
+        )
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+
+    def test_a_wrong_outcome_code_fails(self):
+        result = self.reconcile(
+            [attempt(), committed(outcome="committed_local"), state(1), state(2),
+             state(3)]
+        )
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+
+    def test_a_changed_payload_digest_fails(self):
+        result = self.reconcile(
+            [attempt(), committed(digest=digest_hex("other")), state(1), state(2),
+             state(3)]
+        )
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+
+    def test_a_digest_only_voter_state_without_payload_is_invalid(self):
+        without = state(1)
+        del without["messages"][0]["payload"]
+        result = self.reconcile(
+            [attempt(), committed(), without, state(2), state(3)]
+        )
+        self.assertEqual(result["verdict"], oracle.INVALID, result)
+
+    def test_a_voter_state_with_a_null_payload_is_invalid(self):
+        without = state(1)
+        without["messages"][0]["payload"] = None
+        result = self.reconcile(
+            [attempt(), committed(), without, state(2), state(3)]
+        )
+        self.assertEqual(result["verdict"], oracle.INVALID, result)
+
+    def test_a_payload_mutated_after_recovery_fails(self):
+        mutated = state(1)
+        mutated["messages"][0]["payload"] = payload_hex("tampered")
+        result = self.reconcile(
+            [attempt(), committed(), mutated, state(2), state(3)]
+        )
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+
+    def test_a_payload_mutated_on_one_recovered_voter_fails(self):
+        tampered = state(3)
+        tampered["messages"][0]["payload"] = payload_hex("tampered")
+        result = self.reconcile(
+            [attempt(), committed(), state(1), state(2), tampered]
+        )
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+
+    def test_a_payload_that_changes_between_observations_fails(self):
+        before = state(1)
+        after = state(1)
+        after["messages"][0]["payload"] = payload_hex("tampered")
+        result = self.reconcile(
+            [attempt(), committed(), before, state(2), state(3), after]
+        )
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+
+    def test_an_undecodable_payload_is_invalid(self):
+        broken = state(1)
+        broken["messages"][0]["payload"] = "not-hex"
+        result = self.reconcile(
+            [attempt(), committed(), broken, state(2), state(3)]
+        )
+        self.assertEqual(result["verdict"], oracle.INVALID, result)
+
+    def test_a_committed_count_that_regresses_fails(self):
+        later = state(1, offset_count=0, messages=[], outcomes=[], next_logical_offset=0)
+        result = self.reconcile(
+            [attempt(), committed(), state(1), state(2), state(3), later]
+        )
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+
+    def test_a_committed_message_does_not_require_a_retained_outcome(self):
+        without = state(1, outcomes=[])
+        result = self.reconcile(
+            [attempt(), committed(), without, state(2), state(3)]
+        )
+        # The oracle only needs the message; the missing outcome is not a contradiction.
+        self.assertEqual(result["verdict"], oracle.PASS, result)
+
+    def test_a_definite_rejection_of_the_committed_identity_fails(self):
+        rejection = {
+            "event": "publication_rejected",
+            "producer": 11,
+            "epoch": 0,
+            "sequence": 0,
+            "message_id": 100,
+            "digest": digest_hex("alpha"),
+            "code": "SequenceConflict",
+        }
+        result = self.reconcile(
+            [attempt(), committed(), rejection, state(1), state(2), state(3)]
+        )
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+
+    def test_an_uncertain_attempt_is_not_a_commit_and_not_a_failure(self):
+        unknown = {
+            "event": "publication_unknown",
+            "producer": 12,
+            "epoch": 0,
+            "sequence": 0,
+            "message_id": 200,
+            "digest": digest_hex("uncertain"),
+            "reason": "OutcomeUnknown",
+        }
+        result = self.reconcile([attempt(), unknown, committed(), state(1), state(2),
+                                 state(3)])
+        self.assertEqual(result["verdict"], oracle.PASS, result)
+        self.assertEqual(result["counts"]["unknown"], 1)
+
+    def test_an_uncertain_record_that_claims_a_commit_fails(self):
+        unknown = {
+            "event": "publication_unknown",
+            "producer": 12,
+            "epoch": 0,
+            "sequence": 0,
+            "message_id": 200,
+            "digest": digest_hex("uncertain"),
+            "outcome": "committed_quorum",
+            "offset": 1,
+        }
+        result = self.reconcile([attempt(), unknown, committed(), state(1), state(2),
+                                 state(3)])
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+
+    def test_two_tokens_claiming_one_offset_fail(self):
+        second = attempt(producer=12, message_id=200, digest=digest_hex("other"))
+        second_ack = committed(producer=12, message_id=200,
+                               digest=digest_hex("other"), offset=0)
+        result = self.reconcile(
+            [attempt(), committed(), second, second_ack, state(1), state(2), state(3)]
+        )
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+
+    def test_an_acknowledgment_without_an_attempt_is_invalid(self):
+        result = self.reconcile([committed(), state(1), state(2), state(3)])
+        self.assertEqual(result["verdict"], oracle.INVALID, result)
+
+    def test_an_improperly_written_journal_is_not_evidence(self):
+        broken = [
+            {"schema": oracle.SCHEMA, "run": "x", "seq": 0, "event": "conclusion",
+             "verdict": PASS},
+            {"schema": oracle.SCHEMA, "run": "x", "seq": 2, "event": "conclusion",
+             "verdict": PASS},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "journal.jsonl"
+            path.write_text("\n".join(json.dumps(item) for item in broken) + "\n")
+            with self.assertRaises(oracle.JournalError):
+                oracle.load(path)
+
+    def test_an_unrun_required_scenario_is_not_run(self):
+        result = self.reconcile(
+            base() + [{"event": "scenario_not_run", "scenario": 12,
+                       "required": True, "reason": "no deterministic hook"}]
+        )
+        self.assertEqual(result["verdict"], oracle.NOT_RUN, result)
+
+    def test_an_unrun_optional_scenario_still_passes(self):
+        result = self.reconcile(
+            base() + [{"event": "scenario_not_run", "scenario": 12,
+                       "required": False, "reason": "not required"}]
+        )
+        self.assertEqual(result["verdict"], oracle.PASS, result)
+
+
+class Q2JournalRecordingFixtures(unittest.TestCase):
+    """The campaign's own journal path must accept a complete voter-state record."""
+
+    def test_voter_state_recording_does_not_duplicate_the_event_keyword(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "journal.jsonl"
+            journal = oracle.Journal(path, "recording-fixture")
+            try:
+                record = append_voter_state(journal, state(1))
+                journal.append(
+                    "publication_attempt",
+                    producer=11,
+                    epoch=0,
+                    sequence=0,
+                    message_id=100,
+                    digest=digest_hex("alpha"),
+                    incarnation=INCARNATION,
+                )
+                journal.append(
+                    "publication_committed",
+                    outcome="committed_quorum",
+                    producer=11,
+                    epoch=0,
+                    sequence=0,
+                    message_id=100,
+                    digest=digest_hex("alpha"),
+                    incarnation=INCARNATION,
+                    offset=0,
+                    partition={
+                        "tenant_id": TENANT,
+                        "topic_id": TOPIC_ID,
+                        "partition_id": PARTITION,
+                    },
+                )
+                append_voter_state(journal, state(2))
+                append_voter_state(journal, state(3))
+                journal.conclusion(PASS)
+            finally:
+                journal.close()
+            records = oracle.load(path)
+            voter_states = [item for item in records if item["event"] == "voter_state"]
+            self.assertEqual(len(voter_states), 3)
+            self.assertEqual(voter_states[0]["node"], 1)
+            self.assertIn("messages", voter_states[0])
+            self.assertEqual(record["event"], "voter_state")
+            result = oracle.reconcile_q2_publish(records)
+            self.assertEqual(result["verdict"], oracle.PASS, result)
+
+
+# --- Live campaign --------------------------------------------------------------
+
+
+def free_port(used: set[int]) -> int:
+    for _ in range(1000):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        if port not in used:
+            used.add(port)
+            return port
+    raise CheckFailure("no free loopback port available")
+
+
+class Node:
+    """One broker process with its own cluster identity and Q2 data directory."""
+
+    def __init__(self, harness: "Campaign", number: int):
+        self.harness = harness
+        self.number = number
+        self.directory = harness.directory / f"node{number}"
+        self.directory.mkdir()
+        # The campaign allocates every port once, before any node exists: the metadata
+        # and every peer list must name the ports the processes really bind.
+        self.client_port = harness.ports[number]["client"]
+        self.cluster_port = harness.ports[number]["cluster"]
+        self.q2_port = harness.ports[number]["q2"]
+        self.metadata = harness.directory / f"metadata{number}.json"
+        self.metadata.write_text(
+            json.dumps(
+                {
+                    "cluster_id": CLUSTER,
+                    "revision": 1,
+                    "issued_at_ms": 1,
+                    "revalidate_after_ms": 600_000,
+                    "acl_revision": 1,
+                    "policy_revision": 1,
+                    "capability_revision": 1,
+                    "nodes": [
+                        {"node": member, "address": f"127.0.0.1:{harness.ports[member]['cluster']}"}
+                        for member in (1, 2, 3)
+                    ],
+                    "topics": [
+                        {"topic_id": TOPIC_ID, "durable_class": 2, "policy_revision": 1}
+                    ],
+                    "partitions": [
+                        {
+                            "tenant_id": TENANT,
+                            "topic_id": TOPIC_ID,
+                            "partition_id": PARTITION,
+                            "owner": 1,
+                            "ownership_epoch": OWNER_EPOCH,
+                            "lease_valid_for_ms": 600_000,
+                            "desired_replicas": 3,
+                            "shard_id": SHARD,
+                            "required_policy_revision": 1,
+                        }
+                    ],
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        self.process: subprocess.Popen | None = None
+        self.lines: list[str] = []
+
+    def arguments(self, bootstrap: bool) -> list[str]:
+        cluster_peers = [
+            value
+            for value in (
+                ["--cluster-peer", f"{member}=127.0.0.1:{self.harness.ports[member]['cluster']}"]
+                for member in (1, 2, 3)
+                if member != self.number
+            )
+            for value in value
+        ]
+        q2_peers = [
+            value
+            for member in (1, 2, 3)
+            for value in (
+                "--q2-peer",
+                f"{member}=127.0.0.1:{self.harness.ports[member]['q2']}",
+            )
+        ]
+        return [
+            str(SERVER),
+            "--listen",
+            f"127.0.0.1:{self.client_port}",
+            "--cluster-id",
+            str(CLUSTER),
+            "--node-id",
+            str(self.number),
+            "--cluster-listen",
+            f"127.0.0.1:{self.cluster_port}",
+            *cluster_peers,
+            "--cluster-metadata",
+            str(self.metadata),
+            "--q2-data-dir",
+            str(self.directory),
+            "--q2-topic",
+            TOPIC,
+            "--q2-tenant-id",
+            str(TENANT),
+            "--q2-topic-id",
+            str(TOPIC_ID),
+            "--q2-partition-id",
+            str(PARTITION),
+            "--q2-shard-id",
+            str(SHARD),
+            "--q2-incarnation",
+            str(INCARNATION),
+            "--q2-raft-listen",
+            f"127.0.0.1:{self.q2_port}",
+            *q2_peers,
+            "--q2-bootstrap",
+            "true" if bootstrap else "false",
+        ]
+
+    def start(self, *, bootstrap: bool) -> None:
+        self.lines = []
+        self.process = subprocess.Popen(
+            self.arguments(bootstrap),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        threading.Thread(target=self._read, daemon=True).start()
+        self.harness.journal.append(
+            "broker_started",
+            node=self.number,
+            client_port=self.client_port,
+            cluster_port=self.cluster_port,
+            q2_port=self.q2_port,
+            bootstrap=bootstrap,
+        )
+
+    def _read(self) -> None:
+        assert self.process is not None and self.process.stderr is not None
+        for line in self.process.stderr:
+            self.lines.append(line.rstrip())
+
+    def wait_ready(self, timeout: float = T_READY) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if any("listening on" in line for line in self.lines):
+                return
+            if self.process is not None and self.process.poll() is not None:
+                raise CheckFailure(
+                    f"node {self.number} exited before readiness: "
+                    + " | ".join(self.lines[-5:])
+                )
+            time.sleep(T_POLL)
+        raise CheckFailure(
+            f"node {self.number} did not become ready: "
+            + " | ".join(self.lines[-5:])
+        )
+
+    def wait_authority(self, timeout: float = T_READY) -> None:
+        marker = f"Q2 authority: epoch={OWNER_EPOCH} owner=1"
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if any(marker in line for line in self.lines):
+                return
+            if self.process is not None and self.process.poll() is not None:
+                raise CheckFailure(
+                    f"node {self.number} exited before installing authority: "
+                    + " | ".join(self.lines[-5:])
+                )
+            time.sleep(T_POLL)
+        raise CheckFailure(f"node {self.number} did not install the Q2 authority")
+
+    def stop(self, *, sig: int = signal.SIGINT, timeout: float = 20.0) -> int | None:
+        if self.process is None or self.process.poll() is not None:
+            return None if self.process is None else self.process.returncode
+        self.process.send_signal(sig)
+        try:
+            self.process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait(timeout=10)
+        self.harness.journal.append(
+            "broker_stopped", node=self.number, exit_code=self.process.returncode
+        )
+        return self.process.returncode
+
+    def kill(self) -> None:
+        if self.process is not None and self.process.poll() is None:
+            self.process.kill()
+            self.process.wait(timeout=10)
+            self.harness.journal.append(
+                "broker_killed", node=self.number, exit_code=self.process.returncode
+            )
+
+    def read_state(self) -> dict | None:
+        path = self.directory / "state" / "state.json"
+        if not path.exists():
+            return None
+        document = json.loads(path.read_text(encoding="utf-8"))
+        state = document["state"]
+        partition = state.get("partitions", {}).get(PARTITION_KEY)
+        last_applied = state.get("last_applied") or {}
+        if partition is None:
+            return {
+                "event": "voter_state",
+                "node": self.number,
+                "applied_index": (last_applied.get("index")),
+                "partition": {
+                    "tenant_id": TENANT,
+                    "topic_id": TOPIC_ID,
+                    "partition_id": PARTITION,
+                },
+                "count": 0,
+                "chain": "00" * 32,
+                "next_logical_offset": 0,
+                "messages": [],
+                "outcomes": [],
+            }
+        outcomes = []
+        for producer_key, producer in (partition.get("producers") or {}).items():
+            principal, producer_id = producer_key.split(":", 1)
+            for sequence, outcome in (producer.get("outcomes") or {}).items():
+                outcomes.append(
+                    {
+                        "producer": int(producer_id),
+                        "producer_epoch": producer.get("epoch"),
+                        "sequence": int(sequence),
+                        "offset": outcome.get("logical_offset"),
+                        "message_id": outcome.get("message_id"),
+                        "digest": bytes(outcome.get("payload_digest") or []).hex(),
+                    }
+                )
+        return {
+            "event": "voter_state",
+            "node": self.number,
+            "applied_index": last_applied.get("index"),
+            "partition": {
+                "tenant_id": TENANT,
+                "topic_id": TOPIC_ID,
+                "partition_id": PARTITION,
+            },
+            "count": partition.get("applied_count"),
+            "chain": bytes(partition.get("chain_digest") or []).hex(),
+            "next_logical_offset": partition.get("next_logical_offset"),
+            "messages": [
+                {
+                    "offset": message.get("logical_offset"),
+                    "message_id": message.get("message_id"),
+                    "digest": bytes(message.get("payload_digest") or []).hex(),
+                    "payload": (
+                        bytes(message["payload"]).hex()
+                        if isinstance(message.get("payload"), list)
+                        else None
+                    ),
+                    "producer": message.get("producer_id"),
+                    "producer_epoch": message.get("producer_epoch"),
+                    "sequence": message.get("sequence"),
+                }
+                for message in (partition.get("messages") or [])
+            ],
+            "outcomes": outcomes,
+        }
+
+
+class Campaign:
+    def __init__(self, journal: oracle.Journal, directory: Path):
+        self.journal = journal
+        self.directory = directory
+        self._ports: set[int] = set()
+        self.ports: dict[int, dict] = {}
+        for number in (1, 2, 3):
+            self.ports[number] = {
+                "client": self.port(),
+                "cluster": self.port(),
+                "q2": self.port(),
+            }
+        self.nodes = {number: Node(self, number) for number in (1, 2, 3)}
+
+    def port(self) -> int:
+        return free_port(self._ports)
+
+    def check(self, ok: bool, detail: str, **fields) -> None:
+        self.journal.append("evidence", check=detail, ok=bool(ok), **fields)
+        if not ok:
+            raise CheckFailure(detail)
+
+    def live(self) -> list[int]:
+        return [
+            number
+            for number, node in self.nodes.items()
+            if node.process is not None and node.process.poll() is None
+        ]
+
+    def start(self, numbers, *, bootstrap_only_node: int | None = None) -> None:
+        for number in numbers:
+            self.nodes[number].start(bootstrap=number == bootstrap_only_node)
+            time.sleep(0.3)
+        for number in numbers:
+            self.nodes[number].wait_ready()
+        self.nodes[1].wait_authority()
+
+    def publish(
+        self,
+        producer: int,
+        epoch: int,
+        sequence: int,
+        message_id: int,
+        payload: str,
+        *,
+        incarnation: int = INCARNATION,
+        owner_epoch: int = OWNER_EPOCH,
+        timeout: float = T_PUBLISH,
+    ) -> dict:
+        self.journal.append(
+            "publication_attempt",
+            producer=producer,
+            epoch=epoch,
+            sequence=sequence,
+            message_id=message_id,
+            digest=digest_hex(payload),
+            payload=payload,
+            incarnation=incarnation,
+            owner_epoch=owner_epoch,
+            partition={
+                "tenant_id": TENANT,
+                "topic_id": TOPIC_ID,
+                "partition_id": PARTITION,
+            },
+        )
+        result = subprocess.run(
+            [
+                str(EXAMPLE),
+                TOPIC,
+                str(TENANT),
+                str(TOPIC_ID),
+                str(PARTITION),
+                str(incarnation),
+                str(owner_epoch),
+                str(producer),
+                str(epoch),
+                str(sequence),
+                str(message_id),
+                payload,
+                "1",
+            ],
+            env=dict(os.environ, ROVQET_ADDR=f"127.0.0.1:{self.nodes[1].client_port}"),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if result.returncode != 0:
+            raise CheckFailure(
+                f"the SDK example exited {result.returncode}: {result.stderr.strip()}"
+            )
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        if not lines:
+            raise CheckFailure("the SDK example printed no outcome")
+        try:
+            observed = json.loads(lines[-1])
+        except json.JSONDecodeError as error:
+            raise CheckFailure(f"unparseable SDK output {lines[-1]!r}: {error}") from error
+        outcome = observed.get("outcome")
+        if outcome == "committed_quorum":
+            self.journal.append(
+                "publication_committed",
+                outcome="committed_quorum",
+                producer=producer,
+                epoch=epoch,
+                sequence=sequence,
+                message_id=message_id,
+                digest=digest_hex(payload),
+                incarnation=incarnation,
+                offset=observed.get("offset"),
+                partition={
+                    "tenant_id": TENANT,
+                    "topic_id": TOPIC_ID,
+                    "partition_id": PARTITION,
+                },
+            )
+        elif outcome == "rejected":
+            self.journal.append(
+                "publication_rejected",
+                producer=producer,
+                epoch=epoch,
+                sequence=sequence,
+                message_id=message_id,
+                digest=digest_hex(payload),
+                code=observed.get("detail"),
+            )
+        elif outcome == "unknown":
+            self.journal.append(
+                "publication_unknown",
+                producer=producer,
+                epoch=epoch,
+                sequence=sequence,
+                message_id=message_id,
+                digest=digest_hex(payload),
+                reason=observed.get("detail", "OutcomeUnknown"),
+            )
+        else:
+            self.journal.append(
+                "publication_unexpected",
+                producer=producer,
+                epoch=epoch,
+                sequence=sequence,
+                message_id=message_id,
+                digest=digest_hex(payload),
+                detail=observed,
+            )
+            raise CheckFailure(f"unexpected SDK outcome {observed!r}")
+        return observed
+
+    def publish_until_certain(
+        self,
+        producer: int,
+        epoch: int,
+        sequence: int,
+        message_id: int,
+        payload: str,
+        *,
+        timeout: float = 60.0,
+        **kwargs,
+    ) -> dict:
+        """Retry the identical token while the leader election is still settling.
+
+        An uncertain result is not a commit; the idempotent token makes the retry
+        safe, and every attempt stays in the journal so the oracle sees the uncertainty.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            observed = self.publish(
+                producer, epoch, sequence, message_id, payload, **kwargs
+            )
+            if observed.get("outcome") in ("committed_quorum", "rejected"):
+                return observed
+            if time.monotonic() >= deadline:
+                raise CheckFailure(
+                    f"publication {producer}:{epoch}:{sequence} never became certain: "
+                    f"{observed!r}"
+                )
+            time.sleep(0.3)
+
+    def record_states(self, numbers=None) -> dict[int, dict | None]:
+        numbers = self.live() if numbers is None else numbers
+        states = {}
+        for number in numbers:
+            state = self.nodes[number].read_state()
+            states[number] = state
+            if state is not None:
+                append_voter_state(self.journal, state)
+        return states
+
+    @staticmethod
+    def message(state: dict | None, offset: int) -> dict | None:
+        if state is None:
+            return None
+        for message in state["messages"]:
+            if message.get("offset") == offset:
+                return message
+        return None
+
+    def await_message(
+        self, offset: int, message_id: int, *, timeout: float = T_APPLIED
+    ) -> dict[int, dict]:
+        deadline = time.monotonic() + timeout
+        last = {}
+        while time.monotonic() < deadline:
+            last = self.record_states()
+            if all(
+                (message := self.message(state, offset)) is not None
+                and message.get("message_id") == message_id
+                for state in last.values()
+                if state is not None
+            ) and len([state for state in last.values() if state is not None]) == len(
+                self.live()
+            ):
+                return {number: state for number, state in last.items() if state}
+            time.sleep(T_POLL)
+        raise CheckFailure(
+            f"offset {offset} with message {message_id} never reached every live "
+            f"voter: {json.dumps(last)[:1500]}"
+        )
+
+    def expect_committed(self, observed: dict, offset: int) -> None:
+        self.check(
+            observed.get("outcome") == "committed_quorum",
+            f"the SDK observed COMMITTED_QUORUM for logical offset {offset}",
+            observed=observed,
+        )
+        self.check(
+            observed.get("offset") == offset,
+            f"the acknowledged logical offset is {offset}",
+            observed=observed,
+        )
+        self.check(
+            observed.get("incarnation") == INCARNATION,
+            "the acknowledgment carries the configured log incarnation",
+            observed=observed,
+        )
+
+    def expect_rejected(self, observed: dict, code: str) -> None:
+        self.check(
+            observed.get("outcome") == "rejected",
+            f"the broker definitively rejected the publication with {code}",
+            observed=observed,
+        )
+        self.check(
+            observed.get("detail") == code,
+            f"the rejection names {code}",
+            observed=observed,
+        )
+
+    def expect_unchanged(self, states: dict, count: int, next_offset: int) -> None:
+        for number, state in states.items():
+            if state is None:
+                continue
+            self.check(
+                state["next_logical_offset"] == next_offset,
+                f"node {number} kept its next logical offset at {next_offset}",
+                node=number,
+                state=state,
+            )
+            self.check(
+                len(state["messages"]) == count,
+                f"node {number} kept {count} retained message(s)",
+                node=number,
+                state=state,
+            )
+
+
+def run_campaign(campaign: Campaign) -> None:
+    campaign.journal.append(
+        "scenario_started", scenario=1, name="three-broker-q2-group-startup"
+    )
+    campaign.start([1, 2, 3], bootstrap_only_node=1)
+    # Let the first election finish before the first publication; an early attempt is
+    # still safe but would only add an uncertain observation.
+    time.sleep(1.5)
+    campaign.check(
+        len(campaign.live()) == 3,
+        "all three brokers are running with an embedded Q2 voter",
+        live=campaign.live(),
+    )
+    campaign.journal.append("scenario_conclusion", scenario=1, verdict=PASS)
+
+    campaign.journal.append(
+        "scenario_started", scenario=2, name="committed-quorum-publish"
+    )
+    observed = campaign.publish_until_certain(11, 0, 0, 100, "alpha")
+    campaign.expect_committed(observed, 0)
+    states = campaign.await_message(0, 100)
+    campaign.check(
+        all(
+            campaign.message(state, 0)["digest"] == digest_hex("alpha")
+            and campaign.message(state, 0)["payload"] == payload_hex("alpha")
+            for state in states.values()
+        ),
+        "every voter retained the committed payload bytes and digest at offset 0",
+        states={str(k): v for k, v in states.items()},
+    )
+    campaign.check(
+        all(state["next_logical_offset"] == 1 for state in states.values()),
+        "every voter allocated exactly offset 0",
+        states={str(k): v for k, v in states.items()},
+    )
+    campaign.journal.append("scenario_conclusion", scenario=2, verdict=PASS)
+
+    campaign.journal.append(
+        "scenario_started", scenario=3, name="idempotent-retry-same-offset"
+    )
+    observed = campaign.publish_until_certain(11, 0, 0, 100, "alpha")
+    campaign.expect_committed(observed, 0)
+    states = campaign.await_message(0, 100)
+    campaign.check(
+        all(
+            state is not None
+            and state["next_logical_offset"] == 1
+            and len(state["messages"]) == 1
+            for state in states.values()
+        ),
+        "the idempotent retry consumed no second offset and created no second message",
+        states={str(k): v for k, v in states.items()},
+    )
+    campaign.journal.append("scenario_conclusion", scenario=3, verdict=PASS)
+
+    campaign.journal.append(
+        "scenario_started", scenario=4, name="sequence-and-offset-progress"
+    )
+    observed = campaign.publish_until_certain(11, 0, 1, 101, "beta")
+    campaign.expect_committed(observed, 1)
+    states = campaign.await_message(1, 101)
+    campaign.check(
+        all(
+            state["next_logical_offset"] == 2
+            and sorted(message["offset"] for message in state["messages"]) == [0, 1]
+            for state in states.values()
+        ),
+        "sequence 1 was committed at offset 1 and the next offset advanced to 2",
+        states={str(k): v for k, v in states.items()},
+    )
+    campaign.journal.append("scenario_conclusion", scenario=4, verdict=PASS)
+
+    campaign.journal.append(
+        "scenario_started", scenario=5, name="sequence-conflict-rejection"
+    )
+    observed = campaign.publish_until_certain(14, 0, 0, 202, "delta")
+    campaign.expect_committed(observed, 2)
+    campaign.await_message(2, 202)
+    observed = campaign.publish(14, 0, 0, 203, "other")
+    campaign.expect_rejected(observed, "SequenceConflict")
+    states = campaign.record_states()
+    campaign.check(
+        all(
+            state is None
+            or (
+                state["next_logical_offset"] == 3
+                and all(
+                    message.get("message_id") != 203 for message in state["messages"]
+                )
+            )
+            for state in states.values()
+        ),
+        "a conflicting retry created no message and consumed no offset",
+        states={str(k): v for k, v in states.items()},
+    )
+    campaign.journal.append("scenario_conclusion", scenario=5, verdict=PASS)
+
+    campaign.journal.append(
+        "scenario_started", scenario=6, name="stale-ownership-epoch-rejection"
+    )
+    observed = campaign.publish(12, 0, 0, 200, "stale", owner_epoch=OWNER_EPOCH - 1)
+    campaign.expect_rejected(observed, "StaleEpoch")
+    states = campaign.record_states()
+    campaign.expect_unchanged(states, 3, 3)
+    campaign.journal.append("scenario_conclusion", scenario=6, verdict=PASS)
+
+    campaign.journal.append(
+        "scenario_started", scenario=7, name="wrong-incarnation-rejection"
+    )
+    observed = campaign.publish(13, 0, 0, 201, "inc", incarnation=INCARNATION - 1)
+    campaign.expect_rejected(observed, "ReplayNotAvailable")
+    states = campaign.record_states()
+    campaign.expect_unchanged(states, 3, 3)
+    campaign.journal.append("scenario_conclusion", scenario=7, verdict=PASS)
+
+    campaign.journal.append(
+        "scenario_started", scenario=8, name="lost-quorum-no-false-commit"
+    )
+    for number in (2, 3):
+        campaign.nodes[number].kill()
+    campaign.check(
+        campaign.live() == [1],
+        "two of three voters are unavailable",
+        live=campaign.live(),
+    )
+    observed = campaign.publish(11, 0, 2, 102, "gamma", timeout=75)
+    campaign.journal.append(
+        "quorum_observed", available=[1], majority=int(len(campaign.live()) >= 2)
+    )
+    campaign.check(
+        observed.get("outcome") == "unknown",
+        "a publication without a quorum is uncertain, never a commit",
+        observed=observed,
+    )
+    states = campaign.record_states([1])
+    campaign.check(
+        all(
+            state is None
+            or (
+                campaign.message(state, 3) is None
+                and state["next_logical_offset"] == 3
+            )
+            for state in states.values()
+        ),
+        "the lone voter applied no message for the uncertain publication",
+        states={str(k): v for k, v in states.items()},
+    )
+    campaign.journal.append("scenario_conclusion", scenario=8, verdict=PASS)
+
+    campaign.journal.append(
+        "scenario_started", scenario=9, name="quorum-restored-retry-settles"
+    )
+    campaign.start([2, 3])
+    deadline = time.monotonic() + 45
+    observed = campaign.publish(11, 0, 2, 102, "gamma", timeout=75)
+    while observed.get("outcome") == "unknown" and time.monotonic() < deadline:
+        time.sleep(0.5)
+        observed = campaign.publish(11, 0, 2, 102, "gamma", timeout=75)
+    campaign.expect_committed(observed, 3)
+    states = campaign.await_message(3, 102, timeout=45)
+    campaign.check(
+        all(
+            state["next_logical_offset"] == 4
+            and len([m for m in state["messages"] if m.get("message_id") == 102]) == 1
+            for state in states.values()
+        ),
+        "the settled retry is present exactly once at offset 3 on every voter",
+        states={str(k): v for k, v in states.items()},
+    )
+    campaign.journal.append("scenario_conclusion", scenario=9, verdict=PASS)
+
+    campaign.journal.append(
+        "scenario_started", scenario=10, name="owner-crash-after-quorum"
+    )
+    before = campaign.nodes[1].read_state()
+    campaign.check(before is not None, "the owner state exists before the crash")
+    campaign.nodes[1].kill()
+    campaign.check(
+        1 not in campaign.live(),
+        "the owner broker was killed after a quorum-committed prefix",
+        live=campaign.live(),
+    )
+    campaign.start([1])
+    after = campaign.nodes[1].read_state()
+    campaign.check(
+        after is not None
+        and before is not None
+        and after["count"] >= before["count"]
+        and after["chain"] == before["chain"]
+        and all(
+            campaign.message(after, offset) is not None
+            and campaign.message(before, offset) is not None
+            and campaign.message(after, offset)["payload"] is not None
+            and campaign.message(after, offset)["payload"]
+            == campaign.message(before, offset)["payload"]
+            for offset in (0, 1, 2, 3)
+        ),
+        "the restarted owner retained the quorum-committed chain and payload bytes",
+        before=before,
+        after=after,
+    )
+    observed = campaign.publish_until_certain(11, 0, 3, 103, "omega")
+    campaign.expect_committed(observed, 4)
+    states = campaign.await_message(4, 103, timeout=45)
+    campaign.check(
+        all(state["next_logical_offset"] == 5 for state in states.values()),
+        "the publication after the owner restart used the next offset",
+        states={str(k): v for k, v in states.items()},
+    )
+    campaign.journal.append("scenario_conclusion", scenario=10, verdict=PASS)
+
+    campaign.journal.append(
+        "scenario_started", scenario=11, name="graceful-stop-keeps-committed-state"
+    )
+    for number in (1, 2, 3):
+        campaign.nodes[number].stop()
+    campaign.check(
+        campaign.live() == [],
+        "all brokers stopped gracefully",
+        live=campaign.live(),
+    )
+    for number in (1, 2, 3):
+        state = campaign.nodes[number].read_state()
+        campaign.check(
+            state is not None
+            and state["next_logical_offset"] == 5
+            and all(
+                campaign.message(state, offset) is not None for offset in (0, 1, 2, 3, 4)
+            ),
+            f"node {number} kept its quorum-committed state on disk after shutdown",
+            node=number,
+            state=state,
+        )
+    campaign.journal.append("scenario_conclusion", scenario=11, verdict=PASS)
+
+    campaign.journal.append(
+        "scenario_started", scenario=12, name="leader-crash-before-majority"
+    )
+    campaign.journal.append(
+        "scenario_not_run",
+        scenario=12,
+        name="leader-crash-before-majority",
+        required=True,
+        reason=(
+            "the prototype broker exposes no deterministic pause between the leader's "
+            "local append and the durable majority; provoking that exact crash would "
+            "require an unimplemented fault hook, so no evidence is claimed"
+        ),
+    )
+    campaign.journal.append("scenario_conclusion", scenario=12, verdict=NOT_RUN)
+
+
+def preflight_problem() -> str | None:
+    missing = [
+        str(path)
+        for path in (SERVER, EXAMPLE)
+        if not (path.is_file() and os.access(path, os.X_OK))
+    ]
+    if missing:
+        return "missing executable(s): " + ", ".join(missing)
+    return None
+
+
+def main() -> int:
+    if "--fixtures-only" not in sys.argv:
+        EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
+        problem = preflight_problem()
+        if problem is not None:
+            path = EVIDENCE_DIR / "q2-publish-not-run.jsonl"
+            journal = oracle.Journal(path, "c04-q2-publish-not-run")
+            try:
+                journal.append("scenario_started", scenario=0, name="preflight")
+                journal.append(
+                    "scenario_not_run",
+                    scenario=0,
+                    name="preflight",
+                    required=True,
+                    reason=problem,
+                )
+                journal.conclusion(NOT_RUN, problem)
+            finally:
+                journal.close()
+            print(f"NOT_RUN  {problem}")
+            print(f"journal: {path}")
+            return 2
+
+    loader = unittest.defaultTestLoader
+    suite = unittest.TestSuite(
+        [
+            loader.loadTestsFromTestCase(Q2PublishOracleFixtures),
+            loader.loadTestsFromTestCase(Q2JournalRecordingFixtures),
+        ]
+    )
+    result = unittest.TextTestRunner(verbosity=2).run(suite)
+    if not result.wasSuccessful():
+        print("FAIL  the oracle fixture suite failed", file=sys.stderr)
+        return 1
+    print(f"PASS  {result.testsRun} oracle fixture tests")
+
+    if "--fixtures-only" in sys.argv:
+        return 0
+
+    EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
+    journal = oracle.Journal(JOURNAL_PATH, "c04-q2-publish")
+    directory = Path(tempfile.mkdtemp(prefix="rovqet-c04-", dir="/tmp"))
+    campaign = Campaign(journal, directory)
+    failure: str | None = None
+    try:
+        run_campaign(campaign)
+    except CheckFailure as error:
+        failure = str(error)
+    except Exception:  # noqa: BLE001 - every unexpected failure is a failed campaign
+        failure = traceback.format_exc()
+    finally:
+        for node in campaign.nodes.values():
+            try:
+                node.stop()
+            except Exception:  # noqa: BLE001 - best effort cleanup
+                pass
+        records = oracle.load(JOURNAL_PATH, require_conclusion=False)
+        verdict = oracle.reconcile_q2_publish(records, require_conclusion=False)
+        journal.append(
+            "oracle_verdict",
+            verdict=verdict["verdict"],
+            reasons=verdict["reasons"],
+            counts=verdict["counts"],
+        )
+        if failure is not None:
+            journal.conclusion(FAIL, failure)
+        elif verdict["verdict"] == PASS:
+            journal.conclusion(PASS)
+        elif verdict["verdict"] == INVALID:
+            journal.conclusion(INVALID, "; ".join(verdict["reasons"]))
+        elif verdict["verdict"] == NOT_RUN:
+            journal.conclusion(NOT_RUN, "; ".join(verdict["reasons"]))
+        else:
+            journal.conclusion(FAIL, "; ".join(verdict["reasons"]))
+        journal.close()
+        shutil.rmtree(directory, ignore_errors=True)
+
+    print(
+        f"campaign: {failure if failure is not None else 'all executed checks passed'}"
+    )
+    print(f"oracle: {verdict['verdict']} {verdict['reasons']}")
+    print(f"counts: {json.dumps(verdict['counts'], sort_keys=True)}")
+    print(f"journal: {JOURNAL_PATH}")
+    if failure is not None or verdict["verdict"] == FAIL:
+        return 1
+    if verdict["verdict"] == INVALID:
+        return 1
+    if verdict["verdict"] == NOT_RUN:
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
