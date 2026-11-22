@@ -1078,22 +1078,24 @@
         "crates/consensus/"
       ],
       "evidence": {
-        "verification": "IN_PROGRESS: Q2 publish, offsets and dedup are implemented and covered by tests; 38 Q2 oracle fixtures PASS. The live end-to-end campaign is incomplete: scenarios 1-11 PASS and the required scenario 12 (leader crash before a Q2 majority) is NOT_RUN because no deterministic pre-majority crash hook exists. CI runs 55-58 failed and remain unfixed. No C-04 PASS or DONE claim.",
+        "verification": "IN_PROGRESS: Q2 publish, offsets and dedup are implemented and covered by tests; PROOF_MATRIX.md formatting fixed. The 23-row proof matrix at benchmarks/evidence/c04-q2-publish/PROOF_MATRIX.md records 21 PASS and 2 NOT_RUN (properties 12 and 15). Live campaign scenarios 1-12 PASS with live oracle PASS. Final implementation commit 9f88929. CI still pending after the latest push; no green CI is claimed. No C-04 PASS or DONE claim.",
         "implementation_commits": [
           "a2e17e6",
           "723e584",
           "9238cdf",
-          "2d21bfa"
+          "2d21bfa",
+          "9f88929"
         ],
-        "implementation": "Q2 publish, sparse offsets and producer dedup/retry implemented and covered by unit/integration tests; the oracle fixture suite is 38 fixtures at 2d21bfa.",
+        "implementation": "Q2 publish, sparse offsets and producer dedup/retry implemented and covered by unit/integration tests; the oracle fixture suite is 38 fixtures at 2d21bfa; PROOF_MATRIX.md formatting fixed; final implementation commit 9f88929 (premajority leader-crash proof).",
         "fixtures": "38 Q2 oracle fixtures PASS at 2d21bfa, replacing the previously recorded 23.",
-        "campaign": "Live SDK-to-broker campaign scenarios 1-11 PASS (real external clients over loopback TCP). Scenario 12 (leader crash before majority) deliberately NOT_RUN, not passed.",
-        "live_oracle": "INCOMPLETE: scenario 12 NOT_RUN. The harness has no deterministic hook that terminates the leader after append but before the Q2 majority acknowledgment, so the pre-majority crash window is unexercised. No outcome is claimed for that window and the live oracle is not reported as PASS.",
-        "ci_status": "CI runs 55-58 for these implementation commits failed and have not been fixed or re-run; the failures are not waived and must be corrected before any DONE transition.",
+        "campaign": "Live SDK-to-broker campaign scenarios 1-12 PASS (real external clients over loopback TCP), including scenario 12 (leader crash before majority); journal benchmarks/evidence/c04-q2-publish/q2-publish.jsonl.",
+        "live_oracle": "PASS: all 12 campaign scenarios PASS and the recorded oracle_verdict at seq 169 is PASS (12 scenarios, 7 committed observations, 7 majority proofs, 2 rejections, 2 unknown outcomes, 34 voter states; counts re-read from the journal).",
+        "proof_matrix": "benchmarks/evidence/c04-q2-publish/PROOF_MATRIX.md: 23 rows, 21 PASS, 2 NOT_RUN - property 12 (no verified Q2 publication acknowledged while exactly one follower is unavailable) and property 15 (no verified majority-acknowledged-but-unanswered publication window).",
+        "ci_status": "CI still pending after the latest push (final implementation commit 9f88929); no green CI run is claimed and none may be inferred. Earlier runs 55-58 for these implementation commits failed and have not been re-run green.",
         "remaining_gates": [
-          "Add a deterministic pre-majority hook that kills the leader after append and before majority acknowledgment.",
-          "Execute scenario 12 and the complete live campaign; scenario 12 is currently NOT_RUN, not passing.",
-          "Fix the failing CI runs 55-58 and re-run to green.",
+          "Close proof-matrix property 12: a verified Q2 publication acknowledged while exactly one follower is unavailable (the q2-raft Inline command is not a publish).",
+          "Close proof-matrix property 15: a verified majority-acknowledged-but-unanswered publication window (leader crash after majority before response).",
+          "Obtain a green CI run after the latest push; CI is still pending.",
           "Re-verify C-04 end to end before any DONE transition."
         ]
       }
