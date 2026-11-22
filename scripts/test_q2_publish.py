@@ -11,8 +11,13 @@ majority of distinct voters whose committed state carries the acknowledged messa
 the acknowledged offset with the same exact payload bytes; an idempotent retry reports
 the original offset and creates no second message; a definite rejection leaves the
 committed state untouched; and an uncertain outcome is never counted as a commit. A
-digest without the payload bytes cannot prove what a voter recovered, and a payload
-whose bytes contradict their digest is a failure.
+conflicting retry of an already-committed token is an identity conflict, not a
+definite rejection of that token: the broker keeps the original commit and the
+journal records the conflict as its own event. A voter state missing any quorum
+witness field (node, partition, applied index, committed count, chain or message
+identity) is INVALID evidence and never counts toward the majority. A digest without
+the payload bytes cannot prove what a voter recovered, and a payload whose bytes
+contradict their digest is a failure.
 
 The required proof "leader crash strictly before a durable majority" is NOT_RUN here:
 the prototype broker exposes no deterministic pause before the quorum boundary, so a
@@ -309,6 +314,56 @@ class Q2PublishOracleFixtures(unittest.TestCase):
         )
         self.assertEqual(result["verdict"], oracle.INVALID, result)
 
+    def test_missing_applied_indexes_cannot_form_a_quorum(self):
+        # Without this check every state groups under (None, count, chain) and the
+        # three missing values would manufacture a majority out of missing evidence.
+        witnesses = [state(1), state(2), state(3)]
+        for record in witnesses:
+            record["applied_index"] = None
+        result = self.reconcile([attempt(), committed(), *witnesses])
+        self.assertEqual(result["verdict"], oracle.INVALID, result)
+        self.assertEqual(result["counts"]["majority_proofs"], 0, result)
+
+    def test_missing_chain_digests_cannot_form_a_quorum(self):
+        witnesses = [state(1), state(2), state(3)]
+        for record in witnesses:
+            record["chain"] = None
+        result = self.reconcile([attempt(), committed(), *witnesses])
+        self.assertEqual(result["verdict"], oracle.INVALID, result)
+        self.assertEqual(result["counts"]["majority_proofs"], 0, result)
+
+    def test_one_witness_without_an_applied_index_is_invalid(self):
+        incomplete = state(2)
+        incomplete["applied_index"] = None
+        result = self.reconcile(
+            [attempt(), committed(), state(1), incomplete, state(3)]
+        )
+        self.assertEqual(result["verdict"], oracle.INVALID, result)
+
+    def test_a_witness_without_a_node_identity_is_invalid(self):
+        incomplete = state(2)
+        incomplete["node"] = None
+        result = self.reconcile(
+            [attempt(), committed(), state(1), incomplete, state(3)]
+        )
+        self.assertEqual(result["verdict"], oracle.INVALID, result)
+
+    def test_a_witness_without_a_message_id_is_invalid(self):
+        incomplete = state(3)
+        incomplete["messages"][0]["message_id"] = None
+        result = self.reconcile(
+            [attempt(), committed(), state(1), state(2), incomplete]
+        )
+        self.assertEqual(result["verdict"], oracle.INVALID, result)
+
+    def test_a_witness_without_a_payload_digest_is_invalid(self):
+        incomplete = state(1)
+        incomplete["messages"][0]["digest"] = None
+        result = self.reconcile(
+            [attempt(), committed(), incomplete, state(2), state(3)]
+        )
+        self.assertEqual(result["verdict"], oracle.INVALID, result)
+
     def test_a_committed_count_that_regresses_fails(self):
         later = state(1, offset_count=0, messages=[], outcomes=[], next_logical_offset=0)
         result = self.reconcile(
@@ -338,6 +393,79 @@ class Q2PublishOracleFixtures(unittest.TestCase):
             [attempt(), committed(), rejection, state(1), state(2), state(3)]
         )
         self.assertEqual(result["verdict"], oracle.FAIL, result)
+        self.assertTrue(
+            any("same message identity" in reason for reason in result["reasons"]),
+            result,
+        )
+
+    def test_a_rejection_of_a_committed_token_with_another_identity_fails(self):
+        # The token is committed with message 100 and a definite rejection arrives
+        # for the same token with message 101: the identity differs, the token still
+        # may not be rejected.
+        rejection = {
+            "event": "publication_rejected",
+            "producer": 11,
+            "epoch": 0,
+            "sequence": 0,
+            "message_id": 101,
+            "digest": digest_hex("other"),
+            "code": "SequenceConflict",
+        }
+        result = self.reconcile(
+            [attempt(), committed(), rejection, state(1), state(2), state(3)]
+        )
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+        self.assertTrue(
+            any("different message identity" in reason for reason in result["reasons"]),
+            result,
+        )
+
+    def test_a_rejected_token_that_survives_in_recovered_state_fails(self):
+        # No acknowledgment exists for sequence 1, but the recovered voter state
+        # still carries its outcome and message while the token is definitively
+        # rejected: the rejection may not survive in the recovered state.
+        rejection = {
+            "event": "publication_rejected",
+            "producer": 11,
+            "epoch": 0,
+            "sequence": 1,
+            "message_id": 101,
+            "digest": digest_hex("beta"),
+            "code": "SequenceConflict",
+        }
+        result = self.reconcile(
+            [
+                attempt(),
+                committed(),
+                rejection,
+                state(1, offset_count=2),
+                state(2, offset_count=2),
+                state(3, offset_count=2),
+            ]
+        )
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+        self.assertTrue(
+            any("definitively rejected" in reason for reason in result["reasons"]),
+            result,
+        )
+
+    def test_a_conflicting_retry_of_a_committed_token_is_not_a_rejection(self):
+        # Scenario 5 journals exactly this: the broker rejects the conflicting
+        # identity of an already-committed token. That is an identity conflict, not
+        # a definite rejection of the token, and it must not fail the oracle.
+        conflict = {
+            "event": "publication_identity_conflict",
+            "producer": 11,
+            "epoch": 0,
+            "sequence": 0,
+            "message_id": 101,
+            "digest": digest_hex("other"),
+            "code": "SequenceConflict",
+        }
+        result = self.reconcile(
+            [attempt(), committed(), conflict, state(1), state(2), state(3)]
+        )
+        self.assertEqual(result["verdict"], oracle.PASS, result)
 
     def test_an_uncertain_attempt_is_not_a_commit_and_not_a_failure(self):
         unknown = {
@@ -770,6 +898,7 @@ class Campaign:
         incarnation: int = INCARNATION,
         owner_epoch: int = OWNER_EPOCH,
         timeout: float = T_PUBLISH,
+        rejection_event: str = "publication_rejected",
     ) -> dict:
         self.journal.append(
             "publication_attempt",
@@ -838,8 +967,12 @@ class Campaign:
                 },
             )
         elif outcome == "rejected":
+            # An identity conflict of an already-committed token is not a definite
+            # rejection of that token (the token keeps its original commit), so the
+            # caller may journal it under a distinct event; everything else is a
+            # definite rejection of the producer token.
             self.journal.append(
-                "publication_rejected",
+                rejection_event,
                 producer=producer,
                 epoch=epoch,
                 sequence=sequence,
@@ -1066,7 +1199,13 @@ def run_campaign(campaign: Campaign) -> None:
     observed = campaign.publish_until_certain(14, 0, 0, 202, "delta")
     campaign.expect_committed(observed, 2)
     campaign.await_message(2, 202)
-    observed = campaign.publish(14, 0, 0, 203, "other")
+    # The token (14, 0, 0) is already committed with message 202, so the broker's
+    # SequenceConflict on the retry with message 203 rejects the conflicting identity,
+    # not the producer token: journaling it as a definite token rejection would
+    # contradict the committed outcome the same journal records.
+    observed = campaign.publish(
+        14, 0, 0, 203, "other", rejection_event="publication_identity_conflict"
+    )
     campaign.expect_rejected(observed, "SequenceConflict")
     states = campaign.record_states()
     campaign.check(

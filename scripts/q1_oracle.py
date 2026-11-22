@@ -1870,13 +1870,19 @@ def reconcile_q2_publish(
     committed state (read from their own data directories by the parent) contains the
     acknowledged message at the acknowledged logical offset with the same message
     identity, the same exact payload bytes (whose digest must equal the acknowledged
-    digest), and the same applied index and partition chain. A vote that carries the
-    digest but no payload can never prove what was recovered: it is INVALID, while a
-    payload whose bytes contradict the digest or the attempted payload is FAIL. A
-    retry of the same producer token must report the original offset and must not
-    create a second message. A definite rejection must leave the committed state
-    untouched. An uncertain outcome is recorded as uncertain, never as a commit or as
-    a failure.
+    digest), and the same applied index and partition chain. Only a voter state whose
+    node, partition, applied index, committed count, chain and message identity are
+    all present may enter the quorum grouping: a missing witness field is INVALID and
+    never forms a majority by comparing missing values against each other. A vote that
+    carries the digest but no payload can never prove what was recovered: it is
+    INVALID, while a payload whose bytes contradict the digest or the attempted
+    payload is FAIL. A retry of the same producer token must report the original
+    offset and must not create a second message. A definite rejection must leave the
+    committed state untouched: a rejected producer token may not be acknowledged, may
+    not retain an outcome and may not retain a committed message, whatever the
+    message identity says, and the same and the different identity are reported
+    distinctly. An uncertain outcome is recorded as uncertain, never as a commit or
+    as a failure.
 
     A safety violation is FAIL, missing or contradictory evidence is INVALID, and a
     journal with no committed publication at all is NOT_RUN. A journal whose own
@@ -2063,13 +2069,20 @@ def reconcile_q2_publish(
             _q2_hex(rejection.get("digest")),
         )
         for ack in ack_by_key.get(key, []):
-            if (
+            ack_identity = (
                 _q2_int(ack.get("message_id")),
                 _q2_hex(ack.get("digest")),
-            ) == rejection_identity:
+            )
+            if ack_identity == rejection_identity:
                 reasons.append(
                     f"producer token {key} was both committed and definitively "
                     "rejected with the same message identity"
+                )
+            else:
+                reasons.append(
+                    f"producer token {key} was both committed and definitively "
+                    f"rejected with a different message identity: committed "
+                    f"{ack_identity}, rejected {rejection_identity}"
                 )
 
     # A commit needs a majority of distinct voters whose own state carries the message.
@@ -2086,6 +2099,7 @@ def reconcile_q2_publish(
         partition_ack = _q2_partition_key(partition_ack)
         witnesses: dict[tuple, set] = {}
         contradicted = False
+        incomplete = False
         for state in states:
             if partition_ack is not None and state["partition"] != partition_ack:
                 continue
@@ -2098,6 +2112,30 @@ def reconcile_q2_publish(
                 )
                 contradicted = True
             if message is None:
+                continue
+            # A witness may only be counted when every field the grouping compares is
+            # actually present. A missing field is missing evidence (INVALID), never a
+            # witness identity of its own: `None` must not be grouped with other `None`
+            # values to manufacture a majority.
+            absent = ", ".join(
+                f"no {label}"
+                for label, value in (
+                    ("node", state["node"]),
+                    ("partition", state["partition"]),
+                    ("applied index", state["applied_index"]),
+                    ("committed count", state["count"]),
+                    ("chain", state["chain"]),
+                    ("message id", message["message_id"]),
+                    ("payload digest", message["digest"]),
+                )
+                if value is None
+            )
+            if absent:
+                invalid.append(
+                    f"voter state at seq {state['seq']} cannot witness offset "
+                    f"{offset} for {key}: {absent}"
+                )
+                incomplete = True
                 continue
             if message["message_id"] != message_id or message["digest"] != digest:
                 reasons.append(
@@ -2155,7 +2193,9 @@ def reconcile_q2_publish(
                 (state["applied_index"], state["count"], state["chain"]), set()
             ).add(state["node"])
         best = max((len(nodes) for nodes in witnesses.values()), default=0)
-        if contradicted:
+        if contradicted or incomplete:
+            # Missing or contradictory evidence: the quorum cannot be established
+            # either way, and the recorded `invalid`/`reason` decides the verdict.
             continue
         if not states:
             invalid.append(
@@ -2171,19 +2211,55 @@ def reconcile_q2_publish(
             )
         else:
             majority_proofs += 1
+    # A definite rejection of a producer token may not survive anywhere in the
+    # recovered state: neither a retained outcome nor a retained committed message of
+    # that token may exist, whatever the message identity reports. The same and the
+    # different identity are reported distinctly so the contradiction stays readable.
     for state in states:
         for key, outcome in state["outcomes"].items():
             for rejection in rejected:
                 if _q2_publish_key(rejection) != key:
                     continue
-                if (
+                rejected_identity = (
                     _q2_int(rejection.get("message_id")),
                     _q2_hex(rejection.get("digest")),
-                ) == (outcome["message_id"], outcome["digest"]):
+                )
+                retained_identity = (outcome["message_id"], outcome["digest"])
+                if rejected_identity == retained_identity:
                     reasons.append(
                         f"node {state['node']} committed token {key} that another "
                         "observation reports as definitively rejected with the same "
                         "message identity"
+                    )
+                else:
+                    reasons.append(
+                        f"node {state['node']} committed token {key} that another "
+                        "observation reports as definitively rejected with a "
+                        f"different message identity: retained {retained_identity}, "
+                        f"rejected {rejected_identity}"
+                    )
+        for rejection in rejected:
+            key = _q2_publish_key(rejection)
+            rejected_identity = (
+                _q2_int(rejection.get("message_id")),
+                _q2_hex(rejection.get("digest")),
+            )
+            for message in state["messages"].values():
+                if (message["producer"], message["epoch"], message["sequence"]) != key:
+                    continue
+                retained_identity = (message["message_id"], message["digest"])
+                if rejected_identity == retained_identity:
+                    reasons.append(
+                        f"node {state['node']} retains the committed message of "
+                        f"token {key} that another observation reports as "
+                        "definitively rejected with the same message identity"
+                    )
+                else:
+                    reasons.append(
+                        f"node {state['node']} retains the committed message of "
+                        f"token {key} that another observation reports as "
+                        "definitively rejected with a different message identity: "
+                        f"retained {retained_identity}, rejected {rejected_identity}"
                     )
 
     counts = {
