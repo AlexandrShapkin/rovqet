@@ -31,6 +31,7 @@ serde = { version = "1", features = ["derive"] }
 fault-injection = [
     "rovqet-durable/fault-injection",
     "rovqet-metadata-raft/fault-injection",
+    "rovqet-consensus/fault-injection",
 ]
 
 [dev-dependencies]

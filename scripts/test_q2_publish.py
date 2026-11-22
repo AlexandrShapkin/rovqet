@@ -31,6 +31,15 @@ barrier, kills the leader, verifies no voter committed the entry, disarms the se
 restarts the node and retries the same producer token: the retry must settle at the
 next logical offset exactly once on every voter.
 
+The seam is compiled only into a build with the `fault-injection` cargo feature, so
+the live campaign needs the broker and the publishing example built with:
+
+    cargo build -p rovqet-server --features fault-injection --locked
+    cargo build -p rovqet-sdk --example q2_publish --locked
+
+A broker built without that feature has no active premajority behavior at all; the
+preflight reports it as NOT_RUN instead of letting scenario 12 fail at the barrier.
+
 Default invocation runs the negative fixtures and then the campaign. `--fixtures-only`
 runs only the oracle fixture suite. Missing binaries are a real NOT_RUN observation,
 not a silent pass; the campaign exits 2 in that case.
@@ -58,6 +67,10 @@ import q1_oracle as oracle  # noqa: E402
 ROOT = Path(__file__).resolve().parents[1]
 SERVER = ROOT / "target" / "debug" / "rovqet"
 EXAMPLE = ROOT / "target" / "debug" / "examples" / "q2_publish"
+# The barrier environment variable exists in the broker binary only when it was
+# built with the `fault-injection` feature, which is the only build that compiles
+# the pre-majority seam.
+SEAM_MARKER = b"ROVQET_Q2_PREMAJORITY_BARRIER"
 EVIDENCE_DIR = ROOT / "benchmarks" / "evidence" / "c04-q2-publish"
 JOURNAL_PATH = EVIDENCE_DIR / "q2-publish.jsonl"
 
@@ -1669,6 +1682,12 @@ def preflight_problem() -> str | None:
     ]
     if missing:
         return "missing executable(s): " + ", ".join(missing)
+    if SEAM_MARKER not in SERVER.read_bytes():
+        return (
+            "broker built without the fault-injection feature, so the pre-majority "
+            "seam does not exist: run "
+            "cargo build -p rovqet-server --features fault-injection --locked"
+        )
     return None
 
 
