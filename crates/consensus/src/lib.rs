@@ -371,10 +371,12 @@ impl ShardNode {
         // The metadata owns the epoch. A stale or foreign epoch is refused here, before
         // the command becomes a Raft entry: it must not be replicated at all.
         if let Some(authority) = self.authority() {
-            if command.metadata_epoch != authority.epoch {
+            if command.metadata_epoch() != authority.epoch {
                 return Err(ShardError::Rejected(format!(
                     "metadata epoch {} is not the installed epoch {} owned by node {}",
-                    command.metadata_epoch, authority.epoch, authority.owner
+                    command.metadata_epoch(),
+                    authority.epoch,
+                    authority.owner
                 )));
             }
         }

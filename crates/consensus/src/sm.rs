@@ -30,11 +30,31 @@
 //!
 //! Determinism is absolute: no clocks, no randomness, no leader-local counters appear in
 //! the applied result or in the persisted state.
+//!
+//! # Q2 PUBLISH
+//!
+//! [`ShardCommand::Publish`] applies the Q2 idempotent publication rules, mirrored from
+//! the Q1 producer contract: a scoped producer `(principal, producer_id)` deduplicates
+//! by `(producer_epoch, sequence)`. A replay of an already-committed token returns the
+//! ORIGINAL logical offset with `duplicate: true` and creates no second message; a
+//! newer producer epoch starts at sequence `0` and fences the older epoch; a gap, a
+//! conflict or a fenced epoch is refused deterministically. `logical_offset` is
+//! allocated at committed apply from `PartitionState::next_logical_offset` — a physical
+//! Raft index never becomes a public logical offset.
+//!
+//! Retention is count-bounded and admission-refused; there is NO time-based eviction
+//! at all: [`MAX_RETAINED_MESSAGES_PER_PARTITION`], [`MAX_OUTCOMES_PER_PRODUCER`] and
+//! [`MAX_PRODUCERS_PER_PARTITION`] are never silently exceeded and a retained outcome
+//! is never evicted inside the retention window — once the bound is reached, a new
+//! admission is refused with [`PublishErrorCode::ResourceExhausted`] (dedup replays of
+//! already-committed tokens keep working while the partition is full). The three
+//! bounds are prototype values, not tuned production figures.
 #![forbid(unsafe_code)]
 
 use crate::types::{
-    ShardCommand, ShardCommandResponse, ShardGroupIdentity, ShardNode, ShardNodeId, ShardPayload,
-    ShardRaftTypeConfig,
+    MAX_INLINE_PAYLOAD_BYTES, PublishErrorCode, ShardCommand, ShardCommandResponse,
+    ShardGroupIdentity, ShardNode, ShardNodeId, ShardPayload, ShardPublish, ShardRaftTypeConfig,
+    ShardRequest,
 };
 use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 use openraft::{
@@ -63,6 +83,41 @@ pub const SNAPSHOT_VERSION: u16 = 1;
 pub const MAX_SNAPSHOT_PARTITIONS: usize = 65_536;
 /// Largest snapshot image accepted while receiving or serving one.
 pub const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+/// Largest number of distinct producers one partition may retain. Prototype value.
+pub const MAX_PRODUCERS_PER_PARTITION: usize = 1024;
+/// Largest number of retained deduplication outcomes one producer may hold. Prototype
+/// value.
+pub const MAX_OUTCOMES_PER_PRODUCER: usize = 4096;
+/// Largest number of retained committed messages one partition may hold. Prototype
+/// value.
+pub const MAX_RETAINED_MESSAGES_PER_PARTITION: usize = 65_536;
+
+/// The publication bounds of one state machine.
+///
+/// The defaults are the prototype constants above; tests construct a machine (or drive
+/// [`ShardState::apply_command_with_limits`]) with small limits to exercise the
+/// [`PublishErrorCode::ResourceExhausted`] path without filling the production-sized
+/// bounds. The limits are construction-time configuration: they are never persisted,
+/// snapshotted or reloaded, so every member of a group applies the same default bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShardLimits {
+    /// Largest number of distinct producers per partition.
+    pub max_producers_per_partition: usize,
+    /// Largest number of retained outcomes per producer.
+    pub max_outcomes_per_producer: usize,
+    /// Largest number of retained committed messages per partition.
+    pub max_retained_messages_per_partition: usize,
+}
+
+impl Default for ShardLimits {
+    fn default() -> Self {
+        Self {
+            max_producers_per_partition: MAX_PRODUCERS_PER_PARTITION,
+            max_outcomes_per_producer: MAX_OUTCOMES_PER_PRODUCER,
+            max_retained_messages_per_partition: MAX_RETAINED_MESSAGES_PER_PARTITION,
+        }
+    }
+}
 
 /// Chain origin of a partition that has not been applied yet.
 const ZERO_DIGEST: [u8; 32] = [0u8; 32];
@@ -185,7 +240,130 @@ impl From<PartitionKey> for rovqet_core::PartitionRef {
     }
 }
 
+/// Identity of one producer inside one partition: the pair `(principal, producer_id)`.
+///
+/// The key is a JSON map key inside [`PartitionState::producers`], so it carries an
+/// explicit string representation `"{principal}:{producer_id}"`, exactly like
+/// [`PartitionKey`]: `serde_json` only accepts string map keys, and the string form is
+/// also the snapshot's representation inside its `(key, state)` pairs. Encoding and
+/// decoding are strict: a value with any other shape is refused, never defaulted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ProducerKey {
+    /// Principal the producer acts for.
+    pub principal: u128,
+    /// Producer identity inside the principal's scope.
+    pub producer_id: u128,
+}
+
+impl ProducerKey {
+    /// Parses the canonical `"{principal}:{producer_id}"` string form.
+    fn parse(text: &str) -> Result<Self, String> {
+        let parts: Vec<&str> = text.split(':').collect();
+        if parts.len() != 2 {
+            return Err(format!(
+                "producer key {text:?} must have exactly two ':'-separated parts, found {}",
+                parts.len()
+            ));
+        }
+        Ok(Self {
+            principal: parse_part(text, "principal", parts[0])?,
+            producer_id: parse_part(text, "producer_id", parts[1])?,
+        })
+    }
+}
+
+impl std::fmt::Display for ProducerKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}:{}", self.principal, self.producer_id)
+    }
+}
+
+impl serde::Serialize for ProducerKey {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ProducerKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ProducerKeyVisitor;
+
+        impl serde::de::Visitor<'_> for ProducerKeyVisitor {
+            type Value = ProducerKey;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a string of the form \"{principal}:{producer_id}\"")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                ProducerKey::parse(value).map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_str(ProducerKeyVisitor)
+    }
+}
+
+/// One committed Q2 message of a partition, in logical-offset order.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CommittedMessage {
+    /// Per-partition logical offset allocated at committed apply. It never becomes a
+    /// Raft index and never decreases.
+    pub logical_offset: u64,
+    /// Identity of the message, echoed to the submitter.
+    pub message_id: u128,
+    /// `sha256(payload)` as validated at apply.
+    pub payload_digest: [u8; 32],
+    /// Principal the message was published for.
+    pub principal: u128,
+    /// Producer that published the message.
+    pub producer_id: u128,
+    /// Producer epoch under which the message committed.
+    pub producer_epoch: u64,
+    /// Producer sequence under that epoch.
+    pub sequence: u64,
+}
+
+/// The retained outcome of one committed producer sequence.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProducerOutcome {
+    /// Logical offset of the message the sequence committed to.
+    pub logical_offset: u64,
+    /// Message id the sequence committed.
+    pub message_id: u128,
+    /// Payload digest the sequence committed.
+    pub payload_digest: [u8; 32],
+}
+
+/// Deduplication state of one producer inside one partition.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProducerState {
+    /// Current producer epoch. A newer epoch replaces this state entirely: the old
+    /// epoch is fenced and its outcomes are cleared.
+    pub epoch: u64,
+    /// Next acceptable sequence inside `epoch`.
+    pub next_sequence: u64,
+    /// Retained outcomes of committed sequences in this epoch, keyed by sequence.
+    /// Bounded by [`MAX_OUTCOMES_PER_PRODUCER`]; never evicted inside the window.
+    pub outcomes: BTreeMap<u64, ProducerOutcome>,
+}
+
 /// Committed state of one logical partition.
+///
+/// The `incarnation`, `next_logical_offset`, `messages` and `producers` fields carry
+/// the Q2 publication state; they are part of the same document as the C-03 fields, so
+/// the existing snapshot document covers them and a snapshot round trip restores all
+/// of them. They default to their "never published" values so a state written before
+/// Q2 PUBLISH existed still decodes.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PartitionState {
     /// Number of committed commands this partition has applied. It never decreases and
@@ -197,6 +375,23 @@ pub struct PartitionState {
     pub last_metadata_epoch: u64,
     /// Digest chain of this partition, see the module documentation.
     pub chain_digest: [u8; 32],
+    /// Incarnation of the first committed publication. Meaningful only once
+    /// `messages` is non-empty; a publication under a different incarnation is
+    /// refused with [`PublishErrorCode::IncarnationMismatch`]. It survives leader
+    /// changes, snapshots and recovery because it lives in this state.
+    #[serde(default)]
+    pub incarnation: u128,
+    /// Next logical offset to allocate; the count of accepted publications.
+    #[serde(default)]
+    pub next_logical_offset: u64,
+    /// Retained committed messages in logical-offset order, bounded by
+    /// [`MAX_RETAINED_MESSAGES_PER_PARTITION`].
+    #[serde(default)]
+    pub messages: Vec<CommittedMessage>,
+    /// Retained producer deduplication state, bounded by
+    /// [`MAX_PRODUCERS_PER_PARTITION`].
+    #[serde(default)]
+    pub producers: BTreeMap<ProducerKey, ProducerState>,
 }
 
 /// Committed, deterministic state of one Q2 shard group.
@@ -239,11 +434,33 @@ impl ShardState {
     /// prefix always produces the same responses and the same resulting state. A
     /// rejection is part of the replicated history — it consumes no partition state but
     /// the caller still advances `last_applied` to the entry's own log id.
+    ///
+    /// The default prototype [`ShardLimits`] apply; use
+    /// [`ShardState::apply_command_with_limits`] to drive the bound paths with small
+    /// limits.
     pub fn apply_command(
         &mut self,
         raft_index: u64,
         command: &ShardCommand,
     ) -> ShardCommandResponse {
+        self.apply_command_with_limits(raft_index, command, &ShardLimits::default())
+    }
+
+    /// Applies one committed command with explicit publication bounds.
+    pub fn apply_command_with_limits(
+        &mut self,
+        raft_index: u64,
+        command: &ShardCommand,
+        limits: &ShardLimits,
+    ) -> ShardCommandResponse {
+        match command {
+            ShardCommand::Request(request) => self.apply_request(raft_index, request),
+            ShardCommand::Publish(publish) => self.apply_publish(raft_index, publish, limits),
+        }
+    }
+
+    /// Applies the C-03 adapter request with its original idempotency semantics.
+    fn apply_request(&mut self, raft_index: u64, command: &ShardRequest) -> ShardCommandResponse {
         // Structural bound: the type already enforces it when a payload is built, but a
         // replicated command may have been produced by an older or foreign encoder.
         if let Err(error) = command.payload.validate() {
@@ -287,15 +504,17 @@ impl ShardState {
             &key,
             &payload_digest(&command.payload),
         );
-        self.partitions.insert(
-            key,
-            PartitionState {
-                applied_count,
-                last_request_id: command.request_id,
-                last_metadata_epoch: command.metadata_epoch,
-                chain_digest: digest,
-            },
-        );
+        // The C-03 fields advance while every Q2 publication field of the same
+        // partition is preserved: a request never resets offsets, messages, producers
+        // or the locked incarnation.
+        let partition = self
+            .partitions
+            .entry(key)
+            .or_insert_with(PartitionState::empty);
+        partition.applied_count = applied_count;
+        partition.last_request_id = command.request_id;
+        partition.last_metadata_epoch = command.metadata_epoch;
+        partition.chain_digest = digest;
         self.revision = self.revision.saturating_add(1);
 
         ShardCommandResponse::Applied {
@@ -303,6 +522,326 @@ impl ShardState {
             request_id: command.request_id,
             partition: command.partition.clone(),
             applied_count,
+        }
+    }
+
+    /// Applies one committed Q2 PUBLISH deterministically.
+    ///
+    /// Every outcome — acceptance, deduplication replay or refusal — consumes the
+    /// entry's Raft index and returns exactly one response. Only an accepted new
+    /// publication mutates partition state; a refusal or a duplicate consumes no
+    /// logical offset and never increments `applied_count` or `revision`.
+    fn apply_publish(
+        &mut self,
+        raft_index: u64,
+        command: &ShardPublish,
+        limits: &ShardLimits,
+    ) -> ShardCommandResponse {
+        let key = PartitionKey::from(&command.partition);
+        let rejected =
+            |code: PublishErrorCode, reason: String| ShardCommandResponse::PublishRejected {
+                index: raft_index,
+                code,
+                reason,
+            };
+
+        // 1. Structural validations, before any state is touched.
+        if command.durable_class != 2 {
+            return rejected(
+                PublishErrorCode::WrongClass,
+                format!(
+                    "durable class {} is not the Q2 class 2",
+                    command.durable_class
+                ),
+            );
+        }
+        if command.payload.len() > MAX_INLINE_PAYLOAD_BYTES {
+            return rejected(
+                PublishErrorCode::PayloadTooLarge,
+                format!(
+                    "inline payload of {} bytes exceeds the bound of {}",
+                    command.payload.len(),
+                    MAX_INLINE_PAYLOAD_BYTES
+                ),
+            );
+        }
+        if sha256(&command.payload) != command.payload_digest {
+            return rejected(
+                PublishErrorCode::PayloadDigestMismatch,
+                "payload digest does not match sha256(payload)".to_string(),
+            );
+        }
+        if let Some(existing) = self.partitions.get(&key) {
+            // Ownership epochs never move backwards for one partition.
+            if command.metadata_epoch < existing.last_metadata_epoch {
+                return rejected(
+                    PublishErrorCode::StaleEpoch,
+                    format!(
+                        "metadata epoch {} is older than the committed epoch {}",
+                        command.metadata_epoch, existing.last_metadata_epoch
+                    ),
+                );
+            }
+            // 2. The partition locks onto the incarnation of its first committed
+            // publication; a different incarnation afterwards is refused. An empty
+            // `messages` list means no publication committed yet, so this partition
+            // accepts the incarnation of its first one.
+            if !existing.messages.is_empty() && existing.incarnation != command.incarnation {
+                return rejected(
+                    PublishErrorCode::IncarnationMismatch,
+                    format!(
+                        "incarnation {} differs from the committed incarnation {}",
+                        command.incarnation, existing.incarnation
+                    ),
+                );
+            }
+        }
+
+        let producer_key = ProducerKey {
+            principal: command.principal,
+            producer_id: command.producer_id,
+        };
+        // 3. Producer lookup and epoch fencing, mirroring the Q1 producer rules.
+        enum Epoch {
+            Fresh,
+            Renew,
+            Keep,
+        }
+        let epoch_action = match self
+            .partitions
+            .get(&key)
+            .and_then(|p| p.producers.get(&producer_key))
+        {
+            None => {
+                if command.sequence != 0 {
+                    return rejected(
+                        PublishErrorCode::SequenceGap,
+                        format!(
+                            "unknown producer {producer_key} must start at sequence 0, got {}",
+                            command.sequence
+                        ),
+                    );
+                }
+                Epoch::Fresh
+            }
+            Some(state) if command.producer_epoch > state.epoch => {
+                if command.sequence != 0 {
+                    return rejected(
+                        PublishErrorCode::SequenceGap,
+                        format!(
+                            "new producer epoch {} must start at sequence 0, got {}",
+                            command.producer_epoch, command.sequence
+                        ),
+                    );
+                }
+                Epoch::Renew
+            }
+            Some(state) => {
+                if command.producer_epoch < state.epoch {
+                    return rejected(
+                        PublishErrorCode::ProducerFenced,
+                        format!(
+                            "producer epoch {} is fenced by the committed epoch {}",
+                            command.producer_epoch, state.epoch
+                        ),
+                    );
+                }
+                Epoch::Keep
+            }
+        };
+
+        // 4. Same-epoch deduplication, before any admission bound is consulted.
+        if matches!(epoch_action, Epoch::Keep) {
+            let state = self
+                .partitions
+                .get(&key)
+                .and_then(|partition| partition.producers.get(&producer_key))
+                .expect("a kept producer exists");
+            if command.sequence < state.next_sequence {
+                let outcome = state.outcomes.get(&command.sequence);
+                return match outcome {
+                    Some(outcome)
+                        if outcome.message_id == command.message_id
+                            && outcome.payload_digest == command.payload_digest =>
+                    {
+                        // Identical token: the ORIGINAL offset, no new offset, no new
+                        // message.
+                        ShardCommandResponse::Published {
+                            index: raft_index,
+                            partition: command.partition.clone(),
+                            logical_offset: outcome.logical_offset,
+                            message_id: outcome.message_id,
+                            duplicate: true,
+                        }
+                    }
+                    Some(_) => rejected(
+                        PublishErrorCode::SequenceConflict,
+                        format!(
+                            "producer {producer_key} sequence {} already committed with \
+                             different content",
+                            command.sequence
+                        ),
+                    ),
+                    None => rejected(
+                        PublishErrorCode::SequenceConflict,
+                        format!(
+                            "producer {producer_key} sequence {} is committed but its \
+                             outcome is outside the retention bound of {} outcomes",
+                            command.sequence, limits.max_outcomes_per_producer
+                        ),
+                    ),
+                };
+            }
+            if command.sequence > state.next_sequence {
+                return rejected(
+                    PublishErrorCode::SequenceGap,
+                    format!(
+                        "producer {producer_key} expects sequence {}, got {}",
+                        state.next_sequence, command.sequence
+                    ),
+                );
+            }
+            // sequence == next_sequence: admission below.
+        }
+
+        // 5. Admission: every bound is checked BEFORE an offset is allocated, and a
+        // retained outcome is never evicted inside the retention window — a full
+        // bound refuses admission instead.
+        let needs_producer = matches!(epoch_action, Epoch::Fresh);
+        if needs_producer
+            && self
+                .partitions
+                .get(&key)
+                .map(|partition| partition.producers.len())
+                .unwrap_or(0)
+                >= limits.max_producers_per_partition
+        {
+            return rejected(
+                PublishErrorCode::ResourceExhausted,
+                format!(
+                    "the partition already retains {} producers, bound {}",
+                    limits.max_producers_per_partition, limits.max_producers_per_partition
+                ),
+            );
+        }
+        let existing_outcomes = if matches!(epoch_action, Epoch::Renew) {
+            // A renewal replaces the producer state and clears its outcomes, so the
+            // old epoch's outcomes never count against the bound of the new epoch.
+            0
+        } else {
+            self.partitions
+                .get(&key)
+                .and_then(|partition| partition.producers.get(&producer_key))
+                .map(|state| state.outcomes.len())
+                .unwrap_or(0)
+        };
+        if existing_outcomes >= limits.max_outcomes_per_producer {
+            return rejected(
+                PublishErrorCode::ResourceExhausted,
+                format!(
+                    "producer {producer_key} already retains {} outcomes, bound {}",
+                    existing_outcomes, limits.max_outcomes_per_producer
+                ),
+            );
+        }
+        let retained = self
+            .partitions
+            .get(&key)
+            .map(|partition| partition.messages.len())
+            .unwrap_or(0);
+        if retained >= limits.max_retained_messages_per_partition {
+            return rejected(
+                PublishErrorCode::ResourceExhausted,
+                format!(
+                    "the partition already retains {retained} messages, bound {}",
+                    limits.max_retained_messages_per_partition
+                ),
+            );
+        }
+
+        // Allocation: the logical offset comes from the partition's own counter, never
+        // from the Raft index.
+        let partition = self
+            .partitions
+            .entry(key)
+            .or_insert_with(PartitionState::empty);
+        if partition.messages.is_empty() {
+            partition.incarnation = command.incarnation;
+        }
+        let logical_offset = partition.next_logical_offset;
+        partition.next_logical_offset = partition.next_logical_offset.saturating_add(1);
+        partition.messages.push(CommittedMessage {
+            logical_offset,
+            message_id: command.message_id,
+            payload_digest: command.payload_digest,
+            principal: command.principal,
+            producer_id: command.producer_id,
+            producer_epoch: command.producer_epoch,
+            sequence: command.sequence,
+        });
+        let producer = partition
+            .producers
+            .entry(producer_key)
+            .or_insert_with(|| ProducerState {
+                epoch: command.producer_epoch,
+                next_sequence: 0,
+                outcomes: BTreeMap::new(),
+            });
+        if matches!(epoch_action, Epoch::Renew) {
+            // A newer epoch fences the old one: its state is replaced entirely.
+            producer.epoch = command.producer_epoch;
+            producer.next_sequence = 0;
+            producer.outcomes.clear();
+        }
+        producer.outcomes.insert(
+            command.sequence,
+            ProducerOutcome {
+                logical_offset,
+                message_id: command.message_id,
+                payload_digest: command.payload_digest,
+            },
+        );
+        producer.next_sequence = producer.next_sequence.saturating_add(1);
+
+        // The digest chain extends exactly like the C-03 command's, with the logical
+        // offset added to the chain input so compaction and recovery stay provable.
+        let previous = partition.chain_digest;
+        partition.chain_digest = publish_chain_digest(
+            previous,
+            raft_index,
+            command.message_id,
+            &key,
+            logical_offset,
+            &command.payload_digest,
+        );
+        partition.applied_count = partition.applied_count.saturating_add(1);
+        if command.metadata_epoch > partition.last_metadata_epoch {
+            partition.last_metadata_epoch = command.metadata_epoch;
+        }
+        self.revision = self.revision.saturating_add(1);
+
+        ShardCommandResponse::Published {
+            index: raft_index,
+            partition: command.partition.clone(),
+            logical_offset,
+            message_id: command.message_id,
+            duplicate: false,
+        }
+    }
+}
+
+impl PartitionState {
+    /// The state of a partition that has never applied a command.
+    pub fn empty() -> Self {
+        Self {
+            applied_count: 0,
+            last_request_id: 0,
+            last_metadata_epoch: 0,
+            chain_digest: ZERO_DIGEST,
+            incarnation: 0,
+            next_logical_offset: 0,
+            messages: Vec::new(),
+            producers: BTreeMap::new(),
         }
     }
 }
@@ -347,6 +886,38 @@ fn chain_digest(
     buffer.extend_from_slice(&key.tenant_id.to_be_bytes());
     buffer.extend_from_slice(&key.topic_id.to_be_bytes());
     buffer.extend_from_slice(&key.partition_id.to_be_bytes());
+    buffer.extend_from_slice(payload_digest);
+    sha256(&buffer)
+}
+
+/// One link of a partition's Q2 publication digest chain. The layout is the C-03
+/// [`chain_digest`] layout with the allocated logical offset added to the chain input,
+/// and `message_id` in the request-id slot (a publish carries no request id):
+///
+/// ```text
+/// sha256(previous_chain_digest || raft_index || message_id
+///         || tenant || topic || partition || logical_offset || payload_digest)
+/// ```
+///
+/// Including the logical offset makes compaction and recovery provable: the same
+/// committed prefix always rebuilds the same digests, and a divergent offset sequence
+/// can never reproduce them. All integers are fixed-width big-endian.
+fn publish_chain_digest(
+    previous: [u8; 32],
+    raft_index: u64,
+    message_id: u128,
+    key: &PartitionKey,
+    logical_offset: u64,
+    payload_digest: &[u8; 32],
+) -> [u8; 32] {
+    let mut buffer = Vec::with_capacity(32 + 8 + 16 + 8 + 8 + 4 + 8 + 32);
+    buffer.extend_from_slice(&previous);
+    buffer.extend_from_slice(&raft_index.to_be_bytes());
+    buffer.extend_from_slice(&message_id.to_be_bytes());
+    buffer.extend_from_slice(&key.tenant_id.to_be_bytes());
+    buffer.extend_from_slice(&key.topic_id.to_be_bytes());
+    buffer.extend_from_slice(&key.partition_id.to_be_bytes());
+    buffer.extend_from_slice(&logical_offset.to_be_bytes());
     buffer.extend_from_slice(payload_digest);
     sha256(&buffer)
 }
@@ -754,6 +1325,9 @@ pub struct ShardStateMachine {
     state: ShardState,
     /// Handle the node (stage 3) uses to publish the applied state.
     shared: Arc<Mutex<ShardState>>,
+    /// Construction-time publication bounds; never persisted, so recovery and snapshot
+    /// installation keep them.
+    limits: ShardLimits,
 }
 
 impl ShardStateMachine {
@@ -764,6 +1338,16 @@ impl ShardStateMachine {
     pub fn open(
         directory: impl AsRef<Path>,
         identity: ShardGroupIdentity,
+    ) -> Result<Self, StorageError<ShardNodeId>> {
+        Self::open_with_limits(directory, identity, ShardLimits::default())
+    }
+
+    /// Opens the state machine with explicit publication bounds. Used by tests to
+    /// exercise [`PublishErrorCode::ResourceExhausted`] with small limits.
+    pub fn open_with_limits(
+        directory: impl AsRef<Path>,
+        identity: ShardGroupIdentity,
+        limits: ShardLimits,
     ) -> Result<Self, StorageError<ShardNodeId>> {
         let directory = directory.as_ref().to_path_buf();
         std::fs::create_dir_all(&directory)
@@ -796,6 +1380,7 @@ impl ShardStateMachine {
             directory,
             state,
             shared,
+            limits,
         })
     }
 
@@ -933,7 +1518,9 @@ impl RaftStateMachine<ShardRaftTypeConfig> for ShardStateMachine {
                     responses.push(ShardCommandResponse::Noop { index });
                 }
                 EntryPayload::Normal(command) => {
-                    let response = self.state.apply_command(index, &command);
+                    let response =
+                        self.state
+                            .apply_command_with_limits(index, &command, &self.limits);
                     responses.push(response);
                 }
             }
@@ -1087,7 +1674,7 @@ mod tests {
         payload: &[u8],
         metadata_epoch: u64,
     ) -> ShardCommand {
-        ShardCommand {
+        ShardCommand::Request(ShardRequest {
             request_id,
             partition: rovqet_core::PartitionRef {
                 tenant_id,
@@ -1096,6 +1683,71 @@ mod tests {
             },
             payload: ShardPayload::Inline(payload.to_vec()),
             metadata_epoch,
+        })
+    }
+
+    /// A well-formed Q2 publication with its digest computed by the builder, so a test
+    /// only varies what it means to vary.
+    fn publish(
+        tenant_id: u64,
+        topic_id: u64,
+        partition_id: u32,
+        principal: u128,
+        producer_id: u128,
+        producer_epoch: u64,
+        sequence: u64,
+        message_id: u128,
+        payload: Vec<u8>,
+    ) -> ShardPublish {
+        let payload_digest = sha256(&payload);
+        ShardPublish {
+            partition: rovqet_core::PartitionRef {
+                tenant_id,
+                topic_id,
+                partition_id,
+            },
+            durable_class: 2,
+            incarnation: 1,
+            metadata_epoch: 5,
+            principal,
+            producer_id,
+            producer_epoch,
+            sequence,
+            message_id,
+            payload,
+            payload_digest,
+        }
+    }
+
+    fn publish_command(publish: ShardPublish) -> ShardCommand {
+        ShardCommand::Publish(publish)
+    }
+
+    /// Asserts a `PublishRejected` with the expected code and returns its reason.
+    fn expect_rejected(response: ShardCommandResponse, code: PublishErrorCode) -> String {
+        match response {
+            ShardCommandResponse::PublishRejected {
+                code: observed,
+                reason,
+                ..
+            } => {
+                assert_eq!(observed, code, "unexpected refusal code, reason: {reason}");
+                reason
+            }
+            other => panic!("expected a {code} refusal, got {other:?}"),
+        }
+    }
+
+    /// Asserts a `Published` response and returns `(index, logical_offset, duplicate)`.
+    fn expect_published(response: ShardCommandResponse) -> (u64, u64, bool) {
+        match response {
+            ShardCommandResponse::Published {
+                index,
+                logical_offset,
+                duplicate,
+                ..
+            } => (index, logical_offset, duplicate),
+            other => panic!("expected a published response, got {other:?}"),
         }
     }
 
@@ -1644,6 +2296,7 @@ mod tests {
             last_request_id: 7,
             last_metadata_epoch: 5,
             chain_digest: [9u8; 32],
+            ..PartitionState::empty()
         };
 
         // Canonical encoding: a plain string, never a struct or a map.
@@ -1739,7 +2392,7 @@ mod tests {
         let oversized = vec![0u8; MAX_INLINE_PAYLOAD_BYTES + 1];
         let response = state.apply_command(
             0,
-            &ShardCommand {
+            &ShardCommand::Request(ShardRequest {
                 request_id: 1,
                 partition: rovqet_core::PartitionRef {
                     tenant_id: 1,
@@ -1748,7 +2401,7 @@ mod tests {
                 },
                 payload: ShardPayload::Inline(oversized),
                 metadata_epoch: 1,
-            },
+            }),
         );
         match response {
             ShardCommandResponse::Rejected { reason } => {
@@ -1761,5 +2414,779 @@ mod tests {
         }
         assert!(state.partitions.is_empty(), "nothing was applied");
         assert_eq!(state.revision, 0, "a rejection is not a mutation");
+    }
+
+    #[tokio::test]
+    async fn sequential_publications_receive_logical_offsets_zero_one_two_and_never_a_raft_index() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let mut machine = ShardStateMachine::open(directory.path(), identity()).expect("open");
+
+        // Raft indexes deliberately far apart from the logical offsets they carry.
+        let mut observed = Vec::new();
+        for (sequence, raft_index) in [(0u64, 7u64), (1, 8), (2, 11)] {
+            let responses = machine
+                .apply(vec![command_entry(
+                    raft_index,
+                    publish_command(publish(
+                        1,
+                        2,
+                        3,
+                        10,
+                        20,
+                        1,
+                        sequence,
+                        1000 + sequence as u128,
+                        format!("message {sequence}").into_bytes(),
+                    )),
+                )])
+                .await
+                .expect("apply");
+            let (index, logical_offset, duplicate) = expect_published(responses[0].clone());
+            assert_eq!(index, raft_index, "the response consumes its raft index");
+            assert!(!duplicate, "a first publication is not a duplicate");
+            assert_ne!(
+                logical_offset, raft_index,
+                "a physical raft index must never become a logical offset"
+            );
+            observed.push(logical_offset);
+        }
+        assert_eq!(
+            observed,
+            vec![0, 1, 2],
+            "offsets start at zero and grow by one"
+        );
+
+        let partition = machine.state().partition(&key(1, 2, 3)).expect("applied");
+        assert_eq!(partition.next_logical_offset, 3);
+        assert_eq!(partition.messages.len(), 3, "three committed messages");
+        let offsets: Vec<u64> = partition
+            .messages
+            .iter()
+            .map(|m| m.logical_offset)
+            .collect();
+        assert_eq!(offsets, vec![0, 1, 2]);
+        assert_eq!(
+            partition.incarnation, 1,
+            "the first publish locked the incarnation"
+        );
+        assert_eq!(partition.applied_count, 3, "three accepted publications");
+    }
+
+    #[tokio::test]
+    async fn two_partitions_in_one_group_have_independent_offset_sequences() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let mut machine = ShardStateMachine::open(directory.path(), identity()).expect("open");
+
+        for index in 0..4u64 {
+            // Alternates between the two partitions: (1,2,3) and (4,5,6).
+            let (tenant, topic, partition_id) = if index % 2 == 0 { (1, 2, 3) } else { (4, 5, 6) };
+            let responses = machine
+                .apply(vec![command_entry(
+                    index,
+                    publish_command(publish(
+                        tenant,
+                        topic,
+                        partition_id,
+                        10,
+                        20,
+                        1,
+                        index / 2,
+                        1000 + index as u128,
+                        format!("message {index}").into_bytes(),
+                    )),
+                )])
+                .await
+                .expect("apply");
+            let (_, logical_offset, _) = expect_published(responses[0].clone());
+            assert_eq!(
+                logical_offset,
+                index / 2,
+                "each partition counts its own offsets"
+            );
+        }
+
+        let first = machine.state().partition(&key(1, 2, 3)).expect("first");
+        let second = machine.state().partition(&key(4, 5, 6)).expect("second");
+        assert_eq!(
+            first.next_logical_offset, 2,
+            "two messages in the first partition"
+        );
+        assert_eq!(second.next_logical_offset, 2, "two messages in the second");
+        assert_eq!(first.messages[0].logical_offset, 0);
+        assert_eq!(
+            second.messages[0].logical_offset, 0,
+            "the second partition starts at 0"
+        );
+        assert_ne!(
+            first.chain_digest, second.chain_digest,
+            "the chains cover different partitions"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_identical_retry_of_an_older_token_returns_the_original_offset_without_a_second_message()
+     {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let mut machine = ShardStateMachine::open(directory.path(), identity()).expect("open");
+
+        let original = publish(1, 2, 3, 10, 20, 1, 0, 1000, b"first".to_vec());
+        machine
+            .apply(vec![command_entry(0, publish_command(original.clone()))])
+            .await
+            .expect("first");
+        for index in 1..=2u64 {
+            machine
+                .apply(vec![command_entry(
+                    index,
+                    publish_command(publish(
+                        1,
+                        2,
+                        3,
+                        10,
+                        20,
+                        1,
+                        index,
+                        1000 + index as u128,
+                        format!("message {index}").into_bytes(),
+                    )),
+                )])
+                .await
+                .expect("intervening commit");
+        }
+        let before = machine.state().clone();
+
+        // The identical token replays after two intervening commits.
+        let responses = machine
+            .apply(vec![command_entry(5, publish_command(original))])
+            .await
+            .expect("replay");
+        let (index, logical_offset, duplicate) = expect_published(responses[0].clone());
+        assert_eq!(index, 5, "the replay consumes its own raft index");
+        assert_eq!(logical_offset, 0, "the ORIGINAL offset is reported");
+        assert!(duplicate, "an identical replay is a duplicate");
+
+        let after = machine.state();
+        let partition = after.partition(&key(1, 2, 3)).expect("applied");
+        assert_eq!(
+            partition.messages.len(),
+            3,
+            "no second message was created for the replayed token"
+        );
+        assert_eq!(
+            partition.next_logical_offset, 3,
+            "no new offset was consumed"
+        );
+        assert_eq!(
+            partition.applied_count,
+            before.partitions[&key(1, 2, 3)].applied_count,
+            "a duplicate never increments the applied count"
+        );
+        assert_eq!(
+            partition.chain_digest,
+            before.partitions[&key(1, 2, 3)].chain_digest,
+            "a duplicate never extends the digest chain"
+        );
+        assert_eq!(
+            after.revision, before.revision,
+            "a duplicate is not a mutation"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_same_token_with_a_different_payload_digest_is_a_conflict() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let mut machine = ShardStateMachine::open(directory.path(), identity()).expect("open");
+
+        machine
+            .apply(vec![command_entry(
+                0,
+                publish_command(publish(1, 2, 3, 10, 20, 1, 0, 1000, b"original".to_vec())),
+            )])
+            .await
+            .expect("first");
+        let before = machine.state().clone();
+
+        // Same token, same message id, different payload (hence a different digest).
+        let responses = machine
+            .apply(vec![command_entry(
+                1,
+                publish_command(publish(1, 2, 3, 10, 20, 1, 0, 1000, b"tampered".to_vec())),
+            )])
+            .await
+            .expect("conflict");
+        expect_rejected(responses[0].clone(), PublishErrorCode::SequenceConflict);
+        assert_eq!(
+            machine.state().partitions,
+            before.partitions,
+            "a conflict must not mutate the partition state"
+        );
+        assert_eq!(
+            machine.state().revision,
+            before.revision,
+            "a conflict is no mutation"
+        );
+
+        // Same token and payload, but another message id: also a conflict.
+        let responses = machine
+            .apply(vec![command_entry(
+                2,
+                publish_command(publish(1, 2, 3, 10, 20, 1, 0, 999, b"original".to_vec())),
+            )])
+            .await
+            .expect("conflict");
+        expect_rejected(responses[0].clone(), PublishErrorCode::SequenceConflict);
+        assert_eq!(
+            machine
+                .state()
+                .partition(&key(1, 2, 3))
+                .unwrap()
+                .messages
+                .len(),
+            1,
+            "neither conflict created a message"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sequence_gap_and_a_fenced_producer_epoch_are_refused() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let mut machine = ShardStateMachine::open(directory.path(), identity()).expect("open");
+
+        // An unknown producer may not start anywhere but at sequence 0.
+        let responses = machine
+            .apply(vec![command_entry(
+                0,
+                publish_command(publish(1, 2, 3, 10, 20, 1, 3, 1003, b"gap".to_vec())),
+            )])
+            .await
+            .expect("gap");
+        expect_rejected(responses[0].clone(), PublishErrorCode::SequenceGap);
+
+        machine
+            .apply(vec![command_entry(
+                1,
+                publish_command(publish(1, 2, 3, 10, 20, 1, 0, 1000, b"zero".to_vec())),
+            )])
+            .await
+            .expect("zero");
+        // Skipping ahead of the next expected sequence is a gap.
+        let responses = machine
+            .apply(vec![command_entry(
+                2,
+                publish_command(publish(1, 2, 3, 10, 20, 1, 5, 1005, b"skip".to_vec())),
+            )])
+            .await
+            .expect("skip");
+        expect_rejected(responses[0].clone(), PublishErrorCode::SequenceGap);
+
+        // A newer epoch commits first...
+        machine
+            .apply(vec![command_entry(
+                3,
+                publish_command(publish(1, 2, 3, 10, 20, 2, 0, 2000, b"epoch 2".to_vec())),
+            )])
+            .await
+            .expect("epoch 2");
+        // ...so the old epoch is fenced even at sequence 0.
+        let responses = machine
+            .apply(vec![command_entry(
+                4,
+                publish_command(publish(1, 2, 3, 10, 20, 1, 0, 1111, b"old epoch".to_vec())),
+            )])
+            .await
+            .expect("fenced");
+        expect_rejected(responses[0].clone(), PublishErrorCode::ProducerFenced);
+
+        let partition = machine.state().partition(&key(1, 2, 3)).expect("applied");
+        assert_eq!(
+            partition.next_logical_offset, 2,
+            "the two rejected gaps and the fence consumed no offset"
+        );
+        assert_eq!(partition.messages.len(), 2);
+        assert_eq!(partition.applied_count, 2);
+    }
+
+    #[tokio::test]
+    async fn a_newer_producer_epoch_starts_at_zero_and_fences_the_older_epoch() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let mut machine = ShardStateMachine::open(directory.path(), identity()).expect("open");
+
+        for (sequence, index) in [(0u64, 0u64), (1, 1)] {
+            machine
+                .apply(vec![command_entry(
+                    index,
+                    publish_command(publish(
+                        1,
+                        2,
+                        3,
+                        10,
+                        20,
+                        1,
+                        sequence,
+                        1000 + sequence as u128,
+                        format!("epoch one {sequence}").into_bytes(),
+                    )),
+                )])
+                .await
+                .expect("epoch one");
+        }
+
+        // A newer epoch with sequence 0 is accepted and continues the offset sequence.
+        let responses = machine
+            .apply(vec![command_entry(
+                2,
+                publish_command(publish(1, 2, 3, 10, 20, 2, 0, 2000, b"epoch two".to_vec())),
+            )])
+            .await
+            .expect("epoch two");
+        let (_, logical_offset, _) = expect_published(responses[0].clone());
+        assert_eq!(
+            logical_offset, 2,
+            "the renewal continues the offset sequence"
+        );
+
+        {
+            let partition = machine.state().partition(&key(1, 2, 3)).expect("applied");
+            let producer = partition
+                .producers
+                .get(&ProducerKey {
+                    principal: 10,
+                    producer_id: 20,
+                })
+                .expect("producer");
+            assert_eq!(producer.epoch, 2, "the new epoch replaced the old state");
+            assert_eq!(producer.next_sequence, 1);
+            assert_eq!(
+                producer.outcomes.len(),
+                1,
+                "the old epoch outcomes were cleared on renewal"
+            );
+            assert_eq!(
+                producer.outcomes.get(&0).map(|outcome| outcome.message_id),
+                Some(2000),
+                "sequence 0 now belongs to the new epoch"
+            );
+        }
+
+        // Now every publication of the old epoch is fenced.
+        for epoch in [0u64, 1] {
+            let responses = machine
+                .apply(vec![command_entry(
+                    3 + epoch,
+                    publish_command(publish(
+                        1,
+                        2,
+                        3,
+                        10,
+                        20,
+                        epoch,
+                        0,
+                        3000 + epoch as u128,
+                        b"fenced".to_vec(),
+                    )),
+                )])
+                .await
+                .expect("fenced");
+            expect_rejected(responses[0].clone(), PublishErrorCode::ProducerFenced);
+        }
+
+        // The renewed producer keeps working: sequence 1 of the new epoch admits.
+        let responses = machine
+            .apply(vec![command_entry(
+                6,
+                publish_command(publish(
+                    1,
+                    2,
+                    3,
+                    10,
+                    20,
+                    2,
+                    1,
+                    2001,
+                    b"epoch two 1".to_vec(),
+                )),
+            )])
+            .await
+            .expect("continuation");
+        let (_, logical_offset, _) = expect_published(responses[0].clone());
+        assert_eq!(
+            logical_offset, 3,
+            "only accepted publications consume offsets"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_validation_refusals_are_deterministic_and_consume_no_offset() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let mut machine = ShardStateMachine::open(directory.path(), identity()).expect("open");
+
+        // Seed the partition with one accepted publication at raft index 0.
+        machine
+            .apply(vec![command_entry(
+                0,
+                publish_command(publish(1, 2, 3, 10, 20, 1, 0, 1000, b"seed".to_vec())),
+            )])
+            .await
+            .expect("seed");
+        let before = machine.state().clone();
+
+        let mut wrong_class = publish(1, 2, 3, 10, 20, 1, 1, 1001, b"class".to_vec());
+        wrong_class.durable_class = 1;
+
+        let oversized_payload = vec![0u8; MAX_INLINE_PAYLOAD_BYTES + 1];
+        let mut oversized = publish(1, 2, 3, 10, 20, 1, 1, 1001, oversized_payload.clone());
+        oversized.payload_digest = sha256(&oversized_payload);
+
+        let mut bad_digest = publish(1, 2, 3, 10, 20, 1, 1, 1001, b"digest".to_vec());
+        bad_digest.payload_digest = [0u8; 32];
+
+        let mut stale_epoch = publish(1, 2, 3, 10, 20, 1, 1, 1001, b"stale".to_vec());
+        stale_epoch.metadata_epoch = 4;
+
+        let mut wrong_incarnation = publish(1, 2, 3, 10, 20, 1, 1, 1001, b"inc".to_vec());
+        wrong_incarnation.incarnation = 99;
+
+        for (index, (command, code)) in [
+            (1u64, (wrong_class, PublishErrorCode::WrongClass)),
+            (2, (oversized, PublishErrorCode::PayloadTooLarge)),
+            (3, (bad_digest, PublishErrorCode::PayloadDigestMismatch)),
+            (4, (stale_epoch, PublishErrorCode::StaleEpoch)),
+            (
+                5,
+                (wrong_incarnation, PublishErrorCode::IncarnationMismatch),
+            ),
+        ] {
+            let responses = machine
+                .apply(vec![command_entry(index, publish_command(command))])
+                .await
+                .expect("refusal");
+            let reason = expect_rejected(responses[0].clone(), code);
+            assert!(
+                !reason.is_empty(),
+                "a refusal names its reason, code {code}"
+            );
+            assert_eq!(
+                machine.state().partitions,
+                before.partitions,
+                "a {code} refusal must not mutate the partition state"
+            );
+            assert_eq!(
+                machine.state().revision,
+                before.revision,
+                "a {code} refusal is no mutation"
+            );
+        }
+
+        // The next accepted publication takes the next number: no refusal consumed one.
+        let responses = machine
+            .apply(vec![command_entry(
+                6,
+                publish_command(publish(1, 2, 3, 10, 20, 1, 1, 1001, b"next".to_vec())),
+            )])
+            .await
+            .expect("admit");
+        let (_, logical_offset, _) = expect_published(responses[0].clone());
+        assert_eq!(logical_offset, 1, "only the seed consumed offset 0");
+    }
+
+    #[test]
+    fn the_producer_and_retention_bounds_refuse_admission_but_keep_deduplicating() {
+        // Small limits: two producers, two outcomes, one retained message per run.
+        let limits = ShardLimits {
+            max_producers_per_partition: 2,
+            max_outcomes_per_producer: 2,
+            max_retained_messages_per_partition: 64,
+        };
+        let mut state = ShardState::new(identity());
+
+        // Two producers fill the producer bound.
+        for (producer_id, index) in [(1u128, 0u64), (2, 1)] {
+            let response = state.apply_command_with_limits(
+                index,
+                &publish_command(publish(
+                    1,
+                    2,
+                    3,
+                    10,
+                    producer_id,
+                    1,
+                    0,
+                    100 + producer_id,
+                    vec![producer_id as u8],
+                )),
+                &limits,
+            );
+            expect_published(response);
+        }
+
+        // A third producer is refused while the bound is reached.
+        let response = state.apply_command_with_limits(
+            2,
+            &publish_command(publish(1, 2, 3, 10, 3, 1, 0, 999, b"third".to_vec())),
+            &limits,
+        );
+        expect_rejected(response, PublishErrorCode::ResourceExhausted);
+        assert_eq!(state.partitions[&key(1, 2, 3)].messages.len(), 2);
+        assert_eq!(state.partitions[&key(1, 2, 3)].next_logical_offset, 2);
+
+        // An existing producer still deduplicates correctly while the bound is full.
+        let replay = state.apply_command_with_limits(
+            3,
+            &publish_command(publish(1, 2, 3, 10, 1, 1, 0, 101, vec![1u8])),
+            &limits,
+        );
+        let (index, logical_offset, duplicate) = expect_published(replay);
+        assert_eq!((index, logical_offset, duplicate), (3, 0, true));
+
+        // The outcome bound refuses a new sequence but never evicts a retained one.
+        let mut state = ShardState::new(identity());
+        for sequence in 0..2u64 {
+            let response = state.apply_command_with_limits(
+                sequence,
+                &publish_command(publish(
+                    1,
+                    2,
+                    3,
+                    10,
+                    1,
+                    1,
+                    sequence,
+                    1000 + sequence as u128,
+                    vec![sequence as u8],
+                )),
+                &limits,
+            );
+            expect_published(response);
+        }
+        let response = state.apply_command_with_limits(
+            2,
+            &publish_command(publish(1, 2, 3, 10, 1, 1, 2, 1002, vec![2u8])),
+            &limits,
+        );
+        expect_rejected(response, PublishErrorCode::ResourceExhausted);
+        let replay = state.apply_command_with_limits(
+            3,
+            &publish_command(publish(1, 2, 3, 10, 1, 1, 0, 1000, vec![0u8])),
+            &limits,
+        );
+        let (_, logical_offset, duplicate) = expect_published(replay);
+        assert_eq!(
+            (logical_offset, duplicate),
+            (0, true),
+            "retention never evicts"
+        );
+
+        // The retained-message bound refuses admission when the window is full.
+        let message_limits = ShardLimits {
+            max_retained_messages_per_partition: 1,
+            ..limits
+        };
+        let mut state = ShardState::new(identity());
+        expect_published(state.apply_command_with_limits(
+            0,
+            &publish_command(publish(1, 2, 3, 10, 1, 1, 0, 1000, vec![0u8])),
+            &message_limits,
+        ));
+        let response = state.apply_command_with_limits(
+            1,
+            &publish_command(publish(1, 2, 3, 10, 1, 1, 1, 1001, vec![1u8])),
+            &message_limits,
+        );
+        expect_rejected(response, PublishErrorCode::ResourceExhausted);
+        assert_eq!(state.partitions[&key(1, 2, 3)].next_logical_offset, 1);
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_round_trip_restores_the_whole_publication_state() {
+        let source_directory = tempfile::tempdir().expect("temp dir");
+        let mut source =
+            ShardStateMachine::open(source_directory.path(), identity()).expect("open");
+        // Two publications in epoch 1; the snapshot must carry their full
+        // deduplication state.
+        source
+            .apply(vec![
+                command_entry(
+                    0,
+                    publish_command(publish(1, 2, 3, 10, 20, 1, 0, 1000, b"first".to_vec())),
+                ),
+                command_entry(
+                    1,
+                    publish_command(publish(1, 2, 3, 10, 20, 1, 1, 1001, b"second".to_vec())),
+                ),
+                command_entry(2, command(42, 4, 5, 6, b"adapter", 5)),
+            ])
+            .await
+            .expect("apply");
+        {
+            let partition = source.state().partition(&key(1, 2, 3)).expect("applied");
+            assert_eq!(partition.next_logical_offset, 2);
+            assert_eq!(partition.messages.len(), 2);
+            assert_eq!(partition.incarnation, 1);
+            assert_eq!(partition.producers.len(), 1);
+        }
+
+        let snapshot = source
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .expect("build snapshot");
+        let bytes = snapshot_bytes(&snapshot);
+
+        let target_directory = tempfile::tempdir().expect("temp dir");
+        let mut target =
+            ShardStateMachine::open(target_directory.path(), identity()).expect("open target");
+        install_bytes(&mut target, &snapshot.meta, &bytes)
+            .await
+            .expect("install");
+        assert_eq!(
+            target.state(),
+            source.state(),
+            "the installed state must be identical"
+        );
+        {
+            let partition = target.state().partition(&key(1, 2, 3)).expect("applied");
+            assert_eq!(partition.next_logical_offset, 2, "offsets restored");
+            assert_eq!(partition.messages.len(), 2, "messages restored");
+            assert_eq!(partition.incarnation, 1, "incarnation restored");
+            assert_eq!(partition.producers.len(), 1, "producers restored");
+            let producer = partition
+                .producers
+                .get(&ProducerKey {
+                    principal: 10,
+                    producer_id: 20,
+                })
+                .expect("producer restored");
+            assert_eq!(producer.epoch, 1, "the epoch survived");
+            assert_eq!(producer.next_sequence, 2);
+            assert_eq!(producer.outcomes.len(), 2, "the outcomes survived");
+        }
+
+        // (a) An identical retry of an older committed token returns the original offset.
+        let responses = target
+            .apply(vec![command_entry(
+                4,
+                publish_command(publish(1, 2, 3, 10, 20, 1, 1, 1001, b"second".to_vec())),
+            )])
+            .await
+            .expect("retry");
+        let (_, logical_offset, duplicate) = expect_published(responses[0].clone());
+        assert_eq!(
+            (logical_offset, duplicate),
+            (1, true),
+            "the original offset"
+        );
+
+        // (b) A conflicting retry is rejected.
+        let responses = target
+            .apply(vec![command_entry(
+                5,
+                publish_command(publish(1, 2, 3, 10, 20, 1, 1, 9999, b"second".to_vec())),
+            )])
+            .await
+            .expect("conflict");
+        expect_rejected(responses[0].clone(), PublishErrorCode::SequenceConflict);
+
+        // (c) A newer epoch is accepted.
+        let responses = target
+            .apply(vec![command_entry(
+                6,
+                publish_command(publish(
+                    1,
+                    2,
+                    3,
+                    10,
+                    20,
+                    3,
+                    0,
+                    3000,
+                    b"epoch three".to_vec(),
+                )),
+            )])
+            .await
+            .expect("epoch three");
+        let (_, logical_offset, _) = expect_published(responses[0].clone());
+        assert_eq!(logical_offset, 2, "the renewal continues the sequence");
+
+        // (d) A new valid publication gets the next offset.
+        let responses = target
+            .apply(vec![command_entry(
+                7,
+                publish_command(publish(
+                    1,
+                    2,
+                    3,
+                    10,
+                    20,
+                    3,
+                    1,
+                    3001,
+                    b"epoch three 1".to_vec(),
+                )),
+            )])
+            .await
+            .expect("continuation");
+        let (_, logical_offset, _) = expect_published(responses[0].clone());
+        assert_eq!(
+            logical_offset, 3,
+            "the next accepted publication takes the next number"
+        );
+
+        // (e) A stale metadata epoch is rejected.
+        let mut stale = publish(1, 2, 3, 10, 20, 3, 2, 3002, b"stale".to_vec());
+        stale.metadata_epoch = 4;
+        let responses = target
+            .apply(vec![command_entry(8, publish_command(stale))])
+            .await
+            .expect("stale");
+        expect_rejected(responses[0].clone(), PublishErrorCode::StaleEpoch);
+        assert_eq!(
+            target
+                .state()
+                .partition(&key(1, 2, 3))
+                .unwrap()
+                .next_logical_offset,
+            4,
+            "the refusal consumed no offset"
+        );
+    }
+
+    #[test]
+    fn a_producer_key_round_trips_as_a_json_string_and_refuses_malformed_forms() {
+        let producer = ProducerKey {
+            principal: u128::MAX,
+            producer_id: 42,
+        };
+        assert_eq!(
+            serde_json::to_string(&producer).expect("encode key"),
+            format!("\"{}:42\"", u128::MAX),
+            "a producer key is a ':'-joined string"
+        );
+        assert_eq!(
+            serde_json::from_str::<ProducerKey>(&format!("\"{}:42\"", u128::MAX))
+                .expect("decode key"),
+            producer
+        );
+
+        // The key works as a JSON map key, exactly like the partition key.
+        let map: BTreeMap<ProducerKey, ProducerState> = BTreeMap::from([(
+            producer,
+            ProducerState {
+                epoch: 1,
+                next_sequence: 0,
+                outcomes: BTreeMap::new(),
+            },
+        )]);
+        let encoded = serde_json::to_string(&map).expect("encode map");
+        let decoded: BTreeMap<ProducerKey, ProducerState> =
+            serde_json::from_str(&encoded).expect("decode map");
+        assert_eq!(decoded, map, "the producer map round trips");
+
+        for malformed in ["\"1\"", "\"1:2:3\"", "\"a:2\"", "\"1:\"", "\":2\"", "\"\""] {
+            assert!(
+                serde_json::from_str::<ProducerKey>(malformed).is_err(),
+                "{malformed} must be refused"
+            );
+        }
     }
 }

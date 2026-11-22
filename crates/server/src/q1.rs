@@ -1429,6 +1429,8 @@ pub struct Dispatch {
     pub route: RouteSlot,
     /// Cluster mode is opt-in and never changes single-node behaviour.
     pub cluster: Option<Arc<crate::cluster::Cluster>>,
+    /// The opt-in Q2 publish route. Q0 and Q1 routing is unchanged without it.
+    q2: Option<Arc<crate::q2::Route>>,
     draining: AtomicBool,
 }
 impl Dispatch {
@@ -1437,6 +1439,7 @@ impl Dispatch {
             broker,
             route,
             cluster: None,
+            q2: None,
             draining: AtomicBool::new(false),
         }
     }
@@ -1450,8 +1453,15 @@ impl Dispatch {
             broker,
             route,
             cluster: Some(cluster),
+            q2: None,
             draining: AtomicBool::new(false),
         }
+    }
+    /// Attaches the opt-in Q2 route. Only a QoS-2 publication of the Q2 topic reaches
+    /// it; every other frame keeps its Q0/Q1 behaviour.
+    pub fn with_q2(mut self, q2: Option<Arc<crate::q2::Route>>) -> Self {
+        self.q2 = q2;
+        self
     }
     /// Forwards one client publication to the configured owner, at most one hop.
     fn forward_publish(
@@ -1580,6 +1590,25 @@ impl SessionHandler for Dispatch {
             let topic = frame
                 .field(f::TOPIC_NAME)
                 .and_then(|b| std::str::from_utf8(b).ok());
+            // Q2 first, and only for its own topic: a QoS-2 publication of any other
+            // topic keeps the Q1/Q0 behaviour below, which refuses it as unsupported.
+            if frame.field(f::QOS) == Some(&[2][..]) {
+                if let Some(route) = self
+                    .q2
+                    .as_ref()
+                    .filter(|route| topic == Some(route.topic()))
+                {
+                    let route = route.clone();
+                    return SessionReply::Deferred(Box::pin(async move {
+                        match route.publish(principal, frame).await {
+                            Ok(SessionReply::Immediate(result)) => result,
+                            Ok(SessionReply::Deferred(pending))
+                            | Ok(SessionReply::ReadOnly(pending)) => pending.await,
+                            Err(error) => Err(error),
+                        }
+                    }));
+                }
+            }
             if let Some(route) = self.route.current() {
                 if topic == Some(&route.options.topic) {
                     if let Some(cluster) = &self.cluster {

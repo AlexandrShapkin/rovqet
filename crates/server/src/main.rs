@@ -9,6 +9,7 @@ mod cluster;
 mod migration;
 mod promotion;
 mod q1;
+mod q2;
 mod transfer;
 use std::{
     collections::{HashMap, HashSet},
@@ -32,6 +33,7 @@ struct Options {
     connection_budget_bytes: usize,
     metrics_interval: Option<Duration>,
     q1: Option<q1::Options>,
+    q2: Option<q2::Options>,
     cluster: Option<cluster::ClusterOptions>,
     /// The node this broker hands its partition over to.
     migrate_to: Option<u64>,
@@ -47,10 +49,12 @@ impl Options {
             connection_budget_bytes: DEFAULT_CONNECTIONS * CONNECTION_ENVELOPE_BYTES,
             metrics_interval: None,
             q1: None,
+            q2: None,
             cluster: None,
             migrate_to: None,
         };
         let mut q1_values = HashMap::new();
+        let mut q2_values = HashMap::new();
         let mut seen = HashSet::new();
         let mut explicit_budget = false;
         let mut cluster_id: Option<u128> = None;
@@ -70,7 +74,10 @@ impl Options {
                 return Err(invalid("expected unique --option value pairs; see --help"));
             }
             // A peer list may be given more than once; every other option is unique.
-            let repeatable = matches!(pair[0].as_str(), "--cluster-peer" | "--metadata-raft-peer");
+            let repeatable = matches!(
+                pair[0].as_str(),
+                "--cluster-peer" | "--metadata-raft-peer" | "--q2-peer"
+            );
             if !repeatable && !seen.insert(pair[0].as_str()) {
                 return Err(invalid("expected unique --option value pairs; see --help"));
             }
@@ -193,6 +200,22 @@ impl Options {
                 | "--q1-dlq-owner-epoch" => {
                     q1_values.insert(pair[0].clone(), pair[1].clone());
                 }
+                "--q2-data-dir" | "--q2-topic" | "--q2-tenant-id" | "--q2-topic-id"
+                | "--q2-partition-id" | "--q2-shard-id" | "--q2-incarnation"
+                | "--q2-raft-listen" | "--q2-bootstrap" => {
+                    q2_values.insert(pair[0].clone(), pair[1].clone());
+                }
+                "--q2-peer" => {
+                    // Repeatable like --cluster-peer: the map-based sub-parser sees the
+                    // repeated values as one space-separated list.
+                    q2_values
+                        .entry("--q2-peer".to_string())
+                        .and_modify(|list| {
+                            list.push(' ');
+                            list.push_str(&pair[1]);
+                        })
+                        .or_insert_with(|| pair[1].clone());
+                }
                 _ => return Err(invalid("unknown option; see --help")),
             }
         }
@@ -220,6 +243,14 @@ impl Options {
             )));
         }
         result.q1 = q1::Options::parse(&q1_values)?;
+        result.q2 = q2::Options::parse(&q2_values)?;
+        if let (Some(q1), Some(q2)) = (&result.q1, &result.q2) {
+            // Both routes own durable history under their topic name; sharing one name
+            // would make a publication ambiguous between the two durability domains.
+            if q1.topic == q2.topic {
+                return Err(invalid("Q1 and Q2 routes need distinct topics"));
+            }
+        }
         let metadata_raft_requested = metadata_raft
             || metadata_raft_dir.is_some()
             || metadata_raft_listen.is_some()
@@ -293,6 +324,13 @@ impl Options {
                 ));
             }
         }
+        if result.q2.is_some() && result.cluster.is_none() {
+            // The Q2 voter identifies itself with the cluster node id and obeys the
+            // committed metadata authority; without cluster mode neither exists.
+            return Err(invalid(
+                "Q2 options require cluster mode: --cluster-id and --node-id",
+            ));
+        }
         Ok(result)
     }
 }
@@ -303,6 +341,21 @@ fn cluster_options_listen(options: &Options) -> std::net::SocketAddr {
         .as_ref()
         .map(|cluster| cluster.listen)
         .unwrap_or_else(|| "127.0.0.1:0".parse().unwrap())
+}
+
+/// The shard authority the Q2 route obeys.
+///
+/// Only a committed placement that names this node grants write authority over the
+/// group; another owner (or no placement at all) leaves the route fenced, which is the
+/// Q2 counterpart of the Q1 ownership fence.
+fn q2_authority(
+    cluster: &cluster::Cluster,
+    route: &q2::Route,
+) -> Option<rovqet_consensus::ShardAuthority> {
+    cluster
+        .authority_for(&route.partition())
+        .filter(|authority| authority.owner == cluster.node.get())
+        .map(q2::shard_authority)
 }
 
 fn development_broker(max_sessions: usize) -> Arc<Broker> {
@@ -395,6 +448,10 @@ async fn main() -> io::Result<()> {
             "    --q1-incarnation U128 --q1-owner-epoch U64\n",
             "    [--q1-initialize-new-log true] ONLY for new empty storage and a fresh incarnation\n",
             "    [--q1-dedup-window-ms 86400000 --q1-max-producers 100000 --q1-max-outcomes 100000]\n",
+            "  Q2 opt-in (all required, cluster mode only): --q2-data-dir DIR --q2-topic NAME\n",
+            "    --q2-tenant-id 1 --q2-topic-id ID --q2-partition-id ID --q2-shard-id ID\n",
+            "    --q2-incarnation U128 --q2-raft-listen 127.0.0.1:PORT --q2-bootstrap true|false\n",
+            "    --q2-peer N=127.0.0.1:PORT (repeatable, exactly three, includes this node)\n",
             "Development only: plaintext, static dev identity, loopback required.\n",
             "Q0 topics: demo, telemetry. Default connection limit: 1024.\n",
             "Higher limits (ceiling 20000) require an explicit user-space envelope budget\n",
@@ -446,6 +503,32 @@ async fn main() -> io::Result<()> {
     // The slot owns the only reference: the shutdown releases it and waits for the last
     // holder, so a retained route is reported instead of being dropped silently.
     let route_slot = Arc::new(q1::RouteSlot::new(route.take()));
+    // The Q2 route embeds a shard voter: it identifies itself with the cluster node id
+    // and obeys the committed metadata authority, so it only exists in cluster mode
+    // (refused at parse time otherwise).
+    let mut q2_route = match (&cluster, &options.q2) {
+        (Some(cluster), Some(q2)) => {
+            let route = tokio::task::spawn(q2::Route::open(
+                q2.clone(),
+                cluster.node.get(),
+                cluster.trust.cluster.get(),
+            ))
+            .await
+            .map_err(io::Error::other)??;
+            eprintln!(
+                "Q2 route: topic={} partition={:?} incarnation={} shard_id={} peers={} bootstrap={} applied_revision={}",
+                route.topic(),
+                route.partition(),
+                route.incarnation(),
+                q2.shard_id,
+                q2.peers.len(),
+                q2.bootstrap,
+                route.applied_state().revision
+            );
+            Some(Arc::new(route))
+        }
+        _ => None,
+    };
     let mut cluster_stop = None;
     if let Some(cluster) = &cluster {
         if let Some(q1) = &options.q1 {
@@ -460,40 +543,6 @@ async fn main() -> io::Result<()> {
                         .and_then(|dlq| cluster.authority_for(&dlq.partition)),
                 );
             }
-            // In Raft mode the authority follows the committed metadata: it is installed
-            // again whenever the committed revision changes. Nothing mints an epoch, extends
-            // a lease or activates a replacement owner.
-            if let Some(node) = cluster.raft_node() {
-                let cluster = cluster.clone();
-                let route_slot = route_slot.clone();
-                let partition = q1.partition;
-                let dlq_partition = q1.dlq.as_ref().map(|dlq| dlq.partition);
-                let mut updates = node.committed_updates();
-                tokio::spawn(async move {
-                    loop {
-                        if updates.changed().await.is_err() {
-                            return;
-                        }
-                        if let Some(route) = route_slot.current() {
-                            route.install_authority(cluster.authority_for(&partition));
-                            if let Some(dlq_partition) = dlq_partition {
-                                let dlq_authority = cluster.authority_for(&dlq_partition);
-                                route.install_dlq_authority(dlq_authority);
-                                // The dependent authority must be observable: the test
-                                // harness proves that the expired placement is in place.
-                                eprintln!(
-                                    "Q1 DLQ authority: epoch={} owner={} lease_ms={}",
-                                    dlq_authority.map(|value| value.epoch).unwrap_or(0),
-                                    dlq_authority.map(|value| value.owner).unwrap_or(0),
-                                    dlq_authority
-                                        .map(|value| value.lease.as_millis())
-                                        .unwrap_or(0)
-                                );
-                            }
-                        }
-                    }
-                });
-            }
             if authority.is_some() {
                 eprintln!(
                     "Q1 authority: epoch={} owner={} lease_ms={}",
@@ -501,6 +550,61 @@ async fn main() -> io::Result<()> {
                     authority.map(|value| value.owner).unwrap_or(0),
                     authority.map(|value| value.lease.as_millis()).unwrap_or(0)
                 );
+            }
+        }
+        if let Some(q2) = &q2_route {
+            // Fencing: the route only obeys a committed placement that names this node.
+            let authority = q2_authority(cluster, q2);
+            q2.install_authority(authority);
+            if let Some(authority) = authority {
+                eprintln!(
+                    "Q2 authority: epoch={} owner={}",
+                    authority.epoch, authority.owner
+                );
+            }
+        }
+        // In Raft mode the authority follows the committed metadata: it is installed
+        // again whenever the committed revision changes. Nothing mints an epoch, extends
+        // a lease or activates a replacement owner.
+        if let Some(node) = cluster.raft_node() {
+            let q1_watch = options
+                .q1
+                .as_ref()
+                .map(|q1| (q1.partition, q1.dlq.as_ref().map(|dlq| dlq.partition)));
+            if q1_watch.is_some() || q2_route.is_some() {
+                let cluster = cluster.clone();
+                let route_slot = route_slot.clone();
+                let q2_route = q2_route.clone();
+                let mut updates = node.committed_updates();
+                tokio::spawn(async move {
+                    loop {
+                        if updates.changed().await.is_err() {
+                            return;
+                        }
+                        if let Some((partition, dlq_partition)) = q1_watch {
+                            if let Some(route) = route_slot.current() {
+                                route.install_authority(cluster.authority_for(&partition));
+                                if let Some(dlq_partition) = dlq_partition {
+                                    let dlq_authority = cluster.authority_for(&dlq_partition);
+                                    route.install_dlq_authority(dlq_authority);
+                                    // The dependent authority must be observable: the test
+                                    // harness proves that the expired placement is in place.
+                                    eprintln!(
+                                        "Q1 DLQ authority: epoch={} owner={} lease_ms={}",
+                                        dlq_authority.map(|value| value.epoch).unwrap_or(0),
+                                        dlq_authority.map(|value| value.owner).unwrap_or(0),
+                                        dlq_authority
+                                            .map(|value| value.lease.as_millis())
+                                            .unwrap_or(0)
+                                    );
+                                }
+                            }
+                        }
+                        if let Some(q2) = &q2_route {
+                            q2.install_authority(q2_authority(&cluster, q2));
+                        }
+                    }
+                });
             }
         }
         // The migration coordinator drives a committed handover of this partition. It only
@@ -610,10 +714,15 @@ async fn main() -> io::Result<()> {
             }}
         })
     });
-    let handler = Arc::new(match cluster.clone() {
-        Some(cluster) => q1::Dispatch::with_cluster(broker.clone(), (*route_slot).clone(), cluster),
-        None => q1::Dispatch::new(broker.clone(), (*route_slot).clone()),
-    });
+    let handler = Arc::new(
+        match cluster.clone() {
+            Some(cluster) => {
+                q1::Dispatch::with_cluster(broker.clone(), (*route_slot).clone(), cluster)
+            }
+            None => q1::Dispatch::new(broker.clone(), (*route_slot).clone()),
+        }
+        .with_q2(q2_route.clone()),
+    );
     let drain = handler.clone();
     let result = serve(listener, config, handler.clone(), async move {
         let _ = tokio::signal::ctrl_c().await;
@@ -637,6 +746,19 @@ async fn main() -> io::Result<()> {
             Err(_) => {
                 eprintln!(
                     "Q1 shutdown deadline exceeded; pending outcomes unknown; restart recovery required"
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+    if let Some(q2) = q2_route.take() {
+        let owned = Arc::try_unwrap(q2)
+            .map_err(|_| io::Error::other("Q2 route retained after session shutdown"))?;
+        match tokio::time::timeout(Duration::from_secs(5), owned.shutdown()).await {
+            Ok(done) => done?,
+            Err(_) => {
+                eprintln!(
+                    "Q2 shutdown deadline exceeded; pending outcomes unknown; restart recovery required"
                 );
                 std::process::exit(1);
             }
@@ -705,6 +827,64 @@ mod tests {
         ] {
             assert!(Options::parse(&args(bad)).is_err(), "{bad:?}");
         }
+    }
+    #[test]
+    fn q2_needs_cluster_mode_and_a_topic_distinct_from_q1() {
+        let q2 = [
+            "--q2-data-dir",
+            "/tmp/q2",
+            "--q2-topic",
+            "durable-q2",
+            "--q2-tenant-id",
+            "1",
+            "--q2-topic-id",
+            "3",
+            "--q2-partition-id",
+            "0",
+            "--q2-shard-id",
+            "9",
+            "--q2-incarnation",
+            "42",
+            "--q2-raft-listen",
+            "127.0.0.1:7500",
+            "--q2-peer",
+            "1=127.0.0.1:7501",
+            "--q2-peer",
+            "2=127.0.0.1:7502",
+            "--q2-peer",
+            "3=127.0.0.1:7503",
+            "--q2-bootstrap",
+            "true",
+        ];
+        // The Q2 voter needs the cluster node identity and the committed authority.
+        assert!(Options::parse(&args(&q2)).is_err());
+        let mut clustered = vec!["--cluster-id", "1", "--node-id", "1"];
+        clustered.extend_from_slice(&q2);
+        let parsed = Options::parse(&args(&clustered)).unwrap();
+        assert!(parsed.q2.is_some());
+        assert!(parsed.cluster.is_some());
+        // Both routes own durable history: one topic name must not serve both.
+        let mut with_q1 = vec![
+            "--q1-data-dir",
+            "/tmp/q1",
+            "--q1-topic",
+            "durable-q2",
+            "--q1-tenant-id",
+            "1",
+            "--q1-topic-id",
+            "4",
+            "--q1-partition-id",
+            "0",
+            "--q1-incarnation",
+            "42",
+            "--q1-owner-epoch",
+            "7",
+        ];
+        with_q1.extend_from_slice(&clustered);
+        assert!(Options::parse(&args(&with_q1)).is_err());
+        // A QoS-2 publish without a configured route stays refused, not routed.
+        let parsed = Options::parse(&[]).unwrap();
+        assert!(parsed.q2.is_none());
     }
     #[test]
     fn metric_snapshot_exposes_zero_bounded_queues() {

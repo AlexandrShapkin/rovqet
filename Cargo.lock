@@ -1329,6 +1329,7 @@ name = "rovqet-server"
 version = "0.1.0"
 dependencies = [
  "fs2",
+ "rovqet-consensus",
  "rovqet-control",
  "rovqet-core",
  "rovqet-durable",

@@ -4,7 +4,9 @@
 //! separate data directories, TCP transport, a leader change, a restart and a log
 //! compaction that forces a snapshot transfer. Every wait is bounded.
 use rovqet_consensus::sm::ShardState;
-use rovqet_consensus::types::{ShardCommand, ShardCommandResponse, ShardNodeId, ShardPayload};
+use rovqet_consensus::types::{
+    ShardCommand, ShardCommandResponse, ShardNodeId, ShardPayload, ShardPublish, ShardRequest,
+};
 use rovqet_consensus::{ShardAuthority, ShardError, ShardNode, ShardNodeConfig};
 use rovqet_core::PartitionRef;
 use std::collections::BTreeMap;
@@ -23,8 +25,8 @@ fn free_address() -> SocketAddr {
     listener.local_addr().expect("a bound address")
 }
 
-fn command(request_id: u128, partition_id: u32) -> ShardCommand {
-    ShardCommand {
+fn request(request_id: u128, partition_id: u32) -> ShardRequest {
+    ShardRequest {
         request_id,
         partition: PartitionRef {
             tenant_id: 1,
@@ -34,6 +36,39 @@ fn command(request_id: u128, partition_id: u32) -> ShardCommand {
         payload: ShardPayload::Inline(vec![request_id as u8; 4]),
         metadata_epoch: EPOCH,
     }
+}
+
+fn command(request_id: u128, partition_id: u32) -> ShardCommand {
+    ShardCommand::Request(request(request_id, partition_id))
+}
+
+/// `sha256("abc")`, the published FIPS 180-4 test vector, so the integration test
+/// carries a well-formed publish digest without pulling in a hash dependency.
+const ABC_DIGEST: [u8; 32] = [
+    0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
+    0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad,
+];
+
+/// A Q2 publication of `("abc", message_id)` for one partition, sequence 0 of a fresh
+/// producer.
+fn publish(partition_id: u32, message_id: u128) -> ShardCommand {
+    ShardCommand::Publish(ShardPublish {
+        partition: PartitionRef {
+            tenant_id: 1,
+            topic_id: 9,
+            partition_id,
+        },
+        durable_class: 2,
+        incarnation: 1,
+        metadata_epoch: EPOCH,
+        principal: 1,
+        producer_id: 7,
+        producer_epoch: 1,
+        sequence: 0,
+        message_id,
+        payload: b"abc".to_vec(),
+        payload_digest: ABC_DIGEST,
+    })
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -250,10 +285,10 @@ async fn a_three_voter_shard_group_replicates_and_recovers() {
     let applied_before = cluster.node(leader_id).last_applied_index().await;
     let refusal = cluster
         .node(leader_id)
-        .propose(ShardCommand {
+        .propose(ShardCommand::Request(ShardRequest {
             metadata_epoch: EPOCH + 1,
-            ..command(0, 0)
-        })
+            ..request(0, 0)
+        }))
         .await
         .expect_err("a foreign metadata epoch must be refused");
     assert!(
@@ -459,6 +494,62 @@ async fn a_three_voter_shard_group_replicates_and_recovers() {
             >= last_index,
         "the recovered voter must reach the last committed index"
     );
+
+    // 5. A Q2 PUBLISH commits a logical offset that is not the Raft index and
+    // converges on every live voter — through the leader change and the compaction
+    // that happened above.
+    let (publish_leader, _) = cluster.wait_for_leader(None).await;
+    let before_publish = cluster
+        .node(publish_leader as usize)
+        .applied_state()
+        .revision;
+    let published = propose(cluster.node(publish_leader as usize), publish(3, 77)).await;
+    match &published {
+        ShardCommandResponse::Published {
+            index,
+            partition,
+            logical_offset,
+            message_id,
+            duplicate,
+        } => {
+            assert!(
+                *index > last_index,
+                "the publication commits after the compacted prefix, observed index {index}"
+            );
+            assert_eq!(partition.partition_id, 3, "the publication partition");
+            assert_eq!(
+                *logical_offset, 0,
+                "the first publication of a partition is logical offset 0, not the raft index {index}"
+            );
+            assert_eq!(*message_id, 77);
+            assert!(!*duplicate, "the first publication is not a duplicate");
+        }
+        other => panic!("expected a published response, got {other:?}"),
+    }
+
+    for id in cluster.live() {
+        cluster.wait_for_revision(id, before_publish + 1).await;
+        let state = cluster.node(id).applied_state();
+        let partition = state
+            .partitions
+            .get(&rovqet_consensus::sm::PartitionKey {
+                tenant_id: 1,
+                topic_id: 9,
+                partition_id: 3,
+            })
+            .unwrap_or_else(|| panic!("voter {id} did not apply the publication"));
+        assert_eq!(
+            partition.next_logical_offset, 1,
+            "voter {id} recorded exactly one offset"
+        );
+        assert_eq!(partition.messages.len(), 1, "voter {id} has one message");
+        assert_eq!(partition.messages[0].logical_offset, 0);
+        assert_eq!(
+            partition.incarnation, 1,
+            "voter {id} locked the incarnation"
+        );
+        assert_eq!(partition.applied_count, 1);
+    }
 
     for id in cluster.live() {
         cluster.shutdown(id).await;

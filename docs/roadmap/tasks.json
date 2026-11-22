@@ -1070,14 +1070,24 @@
         "C-03",
         "B-03"
       ],
-      "status": "TODO",
+      "status": "IN_PROGRESS",
       "architecture": "07",
       "proof": "Leader crash before/after majority, consistent retry",
       "paths": [
         "crates/durable/",
         "crates/consensus/"
       ],
-      "evidence": null
+      "evidence": {
+        "verification": "IN_PROGRESS: Q2 implementation and unit tests exist and pass. Real SDK-to-broker campaign executed with 23 fixtures PASS. Live oracle NOT_RUN because the required pre-majority leader-crash scenario is not yet implemented/executed.",
+        "implementation": "Q2 implementation and unit tests exist and pass.",
+        "campaign": "Real SDK-to-broker campaign executed with 23 fixtures PASS.",
+        "live_oracle": "NOT_RUN: required pre-majority leader-crash scenario not yet implemented/executed.",
+        "remaining_gates": [
+          "Implement the pre-majority leader-crash scenario required by the live oracle.",
+          "Execute the live oracle campaign including that scenario (currently NOT_RUN).",
+          "Re-verify C-04 end-to-end before any DONE transition."
+        ]
+      }
     },
     {
       "id": "C-05",

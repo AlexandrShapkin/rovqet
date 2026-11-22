@@ -3,7 +3,7 @@
 //! The process prints one JSON event per line and accepts commands on stdin, so a
 //! multi-process harness can observe leadership, applied revisions, snapshots and the
 //! installed ownership authority without reaching into the library's internals.
-use rovqet_consensus::types::{ShardCommand, ShardNodeId};
+use rovqet_consensus::types::{ShardCommand, ShardNodeId, ShardPublish, ShardRequest};
 use rovqet_consensus::{ShardAuthority, ShardNode, ShardNodeConfig};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -129,6 +129,31 @@ fn hex(bytes: &[u8]) -> String {
     rendered
 }
 
+/// Decodes one command payload from stdin.
+///
+/// Three shapes are accepted: the externally-tagged command itself
+/// (`{"Request": …}` / `{"Publish": …}`), a wrapper (`{"request": …}` /
+/// `{"publish": …}`) and the legacy bare request (`{"request_id": …, …}`), so every
+/// harness input that worked before the Q2 publish command existed keeps working.
+fn parse_shard_command(value: &serde_json::Value) -> Result<ShardCommand, String> {
+    if let Some(request) = value.get("request") {
+        let request: ShardRequest = serde_json::from_value(request.clone())
+            .map_err(|error| format!("invalid shard request: {error}"))?;
+        return Ok(ShardCommand::Request(request));
+    }
+    if let Some(publish) = value.get("publish") {
+        let publish: ShardPublish = serde_json::from_value(publish.clone())
+            .map_err(|error| format!("invalid shard publish: {error}"))?;
+        return Ok(ShardCommand::Publish(publish));
+    }
+    if let Ok(command) = serde_json::from_value::<ShardCommand>(value.clone()) {
+        return Ok(command);
+    }
+    let request: ShardRequest = serde_json::from_value(value.clone())
+        .map_err(|error| format!("invalid shard command: {error}"))?;
+    Ok(ShardCommand::Request(request))
+}
+
 /// The applied-state projection printed by the `applied` event.
 fn applied_event(id: ShardNodeId, state: &rovqet_consensus::sm::ShardState) -> serde_json::Value {
     let partitions: Vec<serde_json::Value> = state
@@ -227,15 +252,19 @@ async fn run(arguments: Arguments) -> Result<(), String> {
                         continue;
                     }
                 };
-                if let Some(command) = value.get("propose") {
-                    let command: ShardCommand = match serde_json::from_value(command.clone()) {
+                let proposed = value
+                    .get("propose")
+                    .or_else(|| value.get("request"))
+                    .or_else(|| value.get("publish"));
+                if let Some(command) = proposed {
+                    let command: ShardCommand = match parse_shard_command(command) {
                         Ok(command) => command,
                         Err(error) => {
                             emit(serde_json::json!({
                                 "event": "proposed",
                                 "node": id,
                                 "ok": false,
-                                "error": format!("invalid shard command: {error}"),
+                                "error": error,
                             }));
                             continue;
                         }

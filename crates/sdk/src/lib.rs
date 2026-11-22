@@ -10,6 +10,173 @@ pub use group::{
 };
 mod replay;
 pub use replay::{ReadBatch, ReadError, ReadOptions, ReadRecord, ReadStatus};
+/// SHA-256 (FIPS 180-4) of `payload`.
+///
+/// The Q2 publish path stamps `PAYLOAD_DIGEST_SHA256` with the exact bytes the broker
+/// recomputes (`crates/server/src/q2.rs`), but this crate does not depend on `sha2` and
+/// the Q1 path sends no digest at all. The primitive therefore stays in-crate instead of
+/// widening the SDK's dependency set.
+fn sha256(payload: &[u8]) -> [u8; 32] {
+    const K: [u32; 64] = [
+        0x428a_2f98,
+        0x7137_4491,
+        0xb5c0_fbcf,
+        0xe9b5_dba5,
+        0x3956_c25b,
+        0x59f1_11f1,
+        0x923f_82a4,
+        0xab1c_5ed5,
+        0xd807_aa98,
+        0x1283_5b01,
+        0x2431_85be,
+        0x550c_7dc3,
+        0x72be_5d74,
+        0x80de_b1fe,
+        0x9bdc_06a7,
+        0xc19b_f174,
+        0xe49b_69c1,
+        0xefbe_4786,
+        0x0fc1_9dc6,
+        0x240c_a1cc,
+        0x2de9_2c6f,
+        0x4a74_84aa,
+        0x5cb0_a9dc,
+        0x76f9_88da,
+        0x983e_5152,
+        0xa831_c66d,
+        0xb003_27c8,
+        0xbf59_7fc7,
+        0xc6e0_0bf3,
+        0xd5a7_9147,
+        0x06ca_6351,
+        0x1429_2967,
+        0x27b7_0a85,
+        0x2e1b_2138,
+        0x4d2c_6dfc,
+        0x5338_0d13,
+        0x650a_7354,
+        0x766a_0abb,
+        0x81c2_c92e,
+        0x9272_2c85,
+        0xa2bf_e8a1,
+        0xa81a_664b,
+        0xc24b_8b70,
+        0xc76c_51a3,
+        0xd192_e819,
+        0xd699_0624,
+        0xf40e_3585,
+        0x106a_a070,
+        0x19a4_c116,
+        0x1e37_6c08,
+        0x2748_774c,
+        0x34b0_bcb5,
+        0x391c_0cb3,
+        0x4ed8_aa4a,
+        0x5b9c_ca4f,
+        0x682e_6ff3,
+        0x748f_82ee,
+        0x78a5_636f,
+        0x84c8_7814,
+        0x8cc7_0208,
+        0x90be_fffa,
+        0xa450_6ceb,
+        0xbef9_a3f7,
+        0xc671_78f2,
+    ];
+    let mut state: [u32; 8] = [
+        0x6a09_e667,
+        0xbb67_ae85,
+        0x3c6e_f372,
+        0xa54f_f53a,
+        0x510e_527f,
+        0x9b05_688c,
+        0x1f83_d9ab,
+        0x5be0_cd19,
+    ];
+    let bit_len = (payload.len() as u64).wrapping_mul(8);
+    let mut message = payload.to_vec();
+    message.push(0x80);
+    while message.len() % 64 != 56 {
+        message.push(0);
+    }
+    message.extend_from_slice(&bit_len.to_be_bytes());
+    for block in message.chunks_exact(64) {
+        let mut w = [0u32; 64];
+        for (slot, word) in w.iter_mut().take(16).enumerate() {
+            *word = u32::from_be_bytes([
+                block[slot * 4],
+                block[slot * 4 + 1],
+                block[slot * 4 + 2],
+                block[slot * 4 + 3],
+            ]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let mut v = state;
+        for i in 0..64 {
+            let s1 = v[4].rotate_right(6) ^ v[4].rotate_right(11) ^ v[4].rotate_right(25);
+            let ch = (v[4] & v[5]) ^ (!v[4] & v[6]);
+            let t1 = v[7]
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = v[0].rotate_right(2) ^ v[0].rotate_right(13) ^ v[0].rotate_right(22);
+            let maj = (v[0] & v[1]) ^ (v[0] & v[2]) ^ (v[1] & v[2]);
+            let t2 = s0.wrapping_add(maj);
+            v[7] = v[6];
+            v[6] = v[5];
+            v[5] = v[4];
+            v[4] = v[3].wrapping_add(t1);
+            v[3] = v[2];
+            v[2] = v[1];
+            v[1] = v[0];
+            v[0] = t1.wrapping_add(t2);
+        }
+        for (slot, word) in state.iter_mut().zip(v.iter()) {
+            *slot = slot.wrapping_add(*word);
+        }
+    }
+    let mut digest = [0u8; 32];
+    for (chunk, word) in digest.chunks_exact_mut(4).zip(state.iter()) {
+        chunk.copy_from_slice(&word.to_be_bytes());
+    }
+    digest
+}
+
+#[cfg(test)]
+mod sha256_vectors {
+    use super::sha256;
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    #[test]
+    fn matches_fips_180_4_vectors() {
+        assert_eq!(
+            hex(&sha256(b"")),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            hex(&sha256(b"abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            hex(&sha256(
+                b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+            )),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+    }
+}
+
 use rovqet_protocol::{ErrorCode, Field, Frame, FrameType, Limits, registry::field as f};
 use rovqet_transport::{read_frame, write_frame};
 use std::{
@@ -110,6 +277,42 @@ pub struct Q1PublishOptions {
     pub log_incarnation: u128,
     pub ownership_epoch: u64,
     pub ttl: Duration,
+}
+
+/// Explicit Q2 identity addressed by partition. Keep these values and the original
+/// payload for an unresolved retry. Reconnecting never changes this caller-owned
+/// producer token and never retries automatically. Only a validated COMMITTED_QUORUM
+/// acknowledgment is success; the default TTL is an admission deadline of 30 seconds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Q2PublishOptions {
+    pub partition: PartitionRef,
+    pub incarnation: u128,
+    pub ownership_epoch: u64,
+    pub producer_id: u128,
+    pub producer_epoch: u64,
+    pub sequence: u64,
+    pub message_id: u128,
+    pub payload: Vec<u8>,
+    pub ttl_ms: u32,
+}
+impl Default for Q2PublishOptions {
+    fn default() -> Self {
+        Self {
+            partition: PartitionRef {
+                tenant_id: 0,
+                topic_id: 0,
+                partition_id: 0,
+            },
+            incarnation: 0,
+            ownership_epoch: 0,
+            producer_id: 0,
+            producer_epoch: 0,
+            sequence: 0,
+            message_id: 0,
+            payload: Vec::new(),
+            ttl_ms: 30_000,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -448,6 +651,101 @@ impl Client {
             Err(_) => {
                 self.stream = None;
                 Err(ClientError::OutcomeUnknown)
+            }
+        }
+    }
+    /// Publish to an explicitly configured Q2 partition and wait for the quorum commit.
+    /// Only a validated COMMITTED_QUORUM response yields success: QoS, outcome,
+    /// partition identity and log incarnation must all match the request. A transport
+    /// error or timeout after the write is unresolved (OUTCOME_UNKNOWN) and closes this
+    /// connection; a malformed or contradictory acknowledgment is a protocol error, never
+    /// a commit. Reconnect and retry with the identical producer token and payload to
+    /// settle that outcome; the token is never regenerated here.
+    pub async fn publish_q2(
+        &mut self,
+        topic: &str,
+        options: Q2PublishOptions,
+    ) -> Result<PublishOutcome, ClientError> {
+        if self.stream.is_none() {
+            return Err(ClientError::Closed);
+        }
+        if options.payload.len() > self.limits.max_payload_bytes
+            || topic.is_empty()
+            || topic.len() > 255
+        {
+            return Err(ClientError::Protocol("publish exceeds wire bounds"));
+        }
+        if options.ttl_ms == 0 || options.producer_id == 0 || options.incarnation == 0 {
+            return Err(ClientError::Protocol("Q2 identity and TTL must be nonzero"));
+        }
+        let mut frame = self.request(FrameType::Publish)?;
+        frame.fields = vec![
+            Field::required(f::TOPIC_NAME, topic.as_bytes().to_vec()),
+            // The frame codec requires the partition key on every Publish. A Q2
+            // publication addresses its partition explicitly, so the key is empty.
+            Field::required(f::PARTITION_KEY, Vec::new()),
+            Field::required(f::QOS, [2]),
+            Field::required(f::TENANT_ID, options.partition.tenant_id.to_be_bytes()),
+            Field::required(f::TOPIC_ID, options.partition.topic_id.to_be_bytes()),
+            Field::required(
+                f::PARTITION_ID,
+                options.partition.partition_id.to_be_bytes(),
+            ),
+            Field::required(f::LOG_INCAR, options.incarnation.to_be_bytes()),
+            Field::required(f::OWNERSHIP_EPOCH, options.ownership_epoch.to_be_bytes()),
+            Field::required(f::PRODUCER_ID, options.producer_id.to_be_bytes()),
+            Field::required(f::PRODUCER_EPOCH, options.producer_epoch.to_be_bytes()),
+            Field::required(f::PRODUCER_SEQUENCE, options.sequence.to_be_bytes()),
+            Field::required(f::MESSAGE_ID, options.message_id.to_be_bytes()),
+            Field::required(f::TTL_MS, options.ttl_ms.to_be_bytes()),
+            Field::required(f::PAYLOAD_DIGEST_SHA256, sha256(&options.payload).to_vec()),
+        ];
+        frame.payload = options.payload;
+        rovqet_protocol::encode(&frame, self.limits)
+            .map_err(|_| ClientError::Protocol("invalid Q2 publish"))?;
+        // Uncertain transport after the write reuses the Q1 mechanism exactly.
+        let result = match self.exchange(frame, FrameType::PubAck).await {
+            Ok(result) => result,
+            Err(ClientError::Remote {
+                code: Some(ErrorCode::OutcomeUnknown),
+                ..
+            }) => {
+                self.stream = None;
+                return Err(ClientError::OutcomeUnknown);
+            }
+            Err(remote @ ClientError::Remote { .. }) => return Err(remote),
+            Err(_) => {
+                self.stream = None;
+                return Err(ClientError::OutcomeUnknown);
+            }
+        };
+        let decoded = (|| {
+            if result.field(f::QOS) != Some(&[2][..])
+                || result.field(f::PUB_OUTCOME) != Some(&[3][..])
+                || u64_field(&result, f::TENANT_ID)? != options.partition.tenant_id
+                || u64_field(&result, f::TOPIC_ID)? != options.partition.topic_id
+                || u32_field(&result, f::PARTITION_ID)? != options.partition.partition_id
+            {
+                return Err(ClientError::Protocol("invalid Q2 puback identity"));
+            }
+            let incarnation = u128::from_be_bytes(
+                required(&result, f::LOG_INCAR)?
+                    .try_into()
+                    .map_err(|_| ClientError::Protocol("invalid Q2 log incarnation"))?,
+            );
+            if incarnation != options.incarnation {
+                return Err(ClientError::Protocol("Q2 puback incarnation mismatch"));
+            }
+            Ok(DurableOffset {
+                log_incarnation: incarnation,
+                sequence: u64_field(&result, f::OFFSET)?,
+            })
+        })();
+        match decoded {
+            Ok(offset) => Ok(PublishOutcome::CommittedQuorum(offset)),
+            Err(error) => {
+                self.stream = None;
+                Err(error)
             }
         }
     }

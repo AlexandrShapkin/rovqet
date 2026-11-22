@@ -1013,7 +1013,7 @@ mod tests {
     #[tokio::test]
     async fn a_command_entry_survives_a_durable_append_and_reopen() {
         let directory = tempfile::tempdir().expect("temp dir");
-        let command = crate::types::ShardCommand {
+        let command = crate::types::ShardCommand::Request(crate::types::ShardRequest {
             request_id: 17,
             partition: rovqet_core::PartitionRef {
                 tenant_id: 1,
@@ -1022,7 +1022,7 @@ mod tests {
             },
             payload: crate::types::ShardPayload::Inline(vec![1, 2, 3]),
             metadata_epoch: 4,
-        };
+        });
         let command_entry = Entry {
             log_id: log_id(1),
             payload: EntryPayload::Normal(command.clone()),
