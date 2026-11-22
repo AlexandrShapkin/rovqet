@@ -91,6 +91,13 @@ pub const MAX_OUTCOMES_PER_PRODUCER: usize = 4096;
 /// Largest number of retained committed messages one partition may hold. Prototype
 /// value.
 pub const MAX_RETAINED_MESSAGES_PER_PARTITION: usize = 65_536;
+/// Largest total committed payload bytes one partition may retain. Together with
+/// [`MAX_INLINE_PAYLOAD_BYTES`] per message and
+/// [`MAX_RETAINED_MESSAGES_PER_PARTITION`] this keeps the retained payload — and the
+/// snapshot image that has to carry it — a bounded object. Sized so one saturated
+/// partition still fits the [`MAX_SNAPSHOT_BYTES`] envelope with room for the JSON
+/// encoding of its retained bytes.
+pub const MAX_RETAINED_PAYLOAD_BYTES_PER_PARTITION: usize = 8 * 1024 * 1024;
 
 /// The publication bounds of one state machine.
 ///
@@ -107,6 +114,8 @@ pub struct ShardLimits {
     pub max_outcomes_per_producer: usize,
     /// Largest number of retained committed messages per partition.
     pub max_retained_messages_per_partition: usize,
+    /// Largest total retained committed payload bytes per partition.
+    pub max_retained_payload_bytes_per_partition: usize,
 }
 
 impl Default for ShardLimits {
@@ -115,6 +124,7 @@ impl Default for ShardLimits {
             max_producers_per_partition: MAX_PRODUCERS_PER_PARTITION,
             max_outcomes_per_producer: MAX_OUTCOMES_PER_PRODUCER,
             max_retained_messages_per_partition: MAX_RETAINED_MESSAGES_PER_PARTITION,
+            max_retained_payload_bytes_per_partition: MAX_RETAINED_PAYLOAD_BYTES_PER_PARTITION,
         }
     }
 }
@@ -323,6 +333,15 @@ pub struct CommittedMessage {
     pub message_id: u128,
     /// `sha256(payload)` as validated at apply.
     pub payload_digest: [u8; 32],
+    /// The committed payload bytes exactly as validated at apply: their `sha256`
+    /// equals `payload_digest` and they stay within [`MAX_INLINE_PAYLOAD_BYTES`].
+    /// The bytes are retained in the state — and therefore in every snapshot and in
+    /// `state.json` — so a committed record survives Raft log compaction and snapshot
+    /// recovery instead of only its digest. Defaults for a document written before
+    /// payload retention existed; such a document that carries messages fails
+    /// validation rather than silently losing its records.
+    #[serde(default)]
+    pub payload: Vec<u8>,
     /// Principal the message was published for.
     pub principal: u128,
     /// Producer that published the message.
@@ -392,6 +411,11 @@ pub struct PartitionState {
     /// [`MAX_PRODUCERS_PER_PARTITION`].
     #[serde(default)]
     pub producers: BTreeMap<ProducerKey, ProducerState>,
+    /// Total bytes of the retained `payload` fields of `messages`. Maintained at
+    /// apply so the payload admission bound is checked in constant time. Defaults
+    /// for a state written before payload retention existed.
+    #[serde(default)]
+    pub retained_payload_bytes: u64,
 }
 
 /// Committed, deterministic state of one Q2 shard group.
@@ -758,6 +782,26 @@ impl ShardState {
                 ),
             );
         }
+        // The committed bytes are retained in the state, so their total is bounded
+        // exactly like the message count. The counter is kept on the partition, so
+        // the admission check stays constant time.
+        let payload_bytes = command.payload.len() as u64;
+        let retained_payload_bytes = self
+            .partitions
+            .get(&key)
+            .map(|partition| partition.retained_payload_bytes)
+            .unwrap_or(0);
+        if retained_payload_bytes.saturating_add(payload_bytes)
+            > limits.max_retained_payload_bytes_per_partition as u64
+        {
+            return rejected(
+                PublishErrorCode::ResourceExhausted,
+                format!(
+                    "the partition already retains {retained_payload_bytes} payload bytes, bound {}",
+                    limits.max_retained_payload_bytes_per_partition
+                ),
+            );
+        }
 
         // Allocation: the logical offset comes from the partition's own counter, never
         // from the Raft index.
@@ -774,11 +818,15 @@ impl ShardState {
             logical_offset,
             message_id: command.message_id,
             payload_digest: command.payload_digest,
+            payload: command.payload.clone(),
             principal: command.principal,
             producer_id: command.producer_id,
             producer_epoch: command.producer_epoch,
             sequence: command.sequence,
         });
+        partition.retained_payload_bytes = partition
+            .retained_payload_bytes
+            .saturating_add(payload_bytes);
         let producer = partition
             .producers
             .entry(producer_key)
@@ -842,6 +890,7 @@ impl PartitionState {
             next_logical_offset: 0,
             messages: Vec::new(),
             producers: BTreeMap::new(),
+            retained_payload_bytes: 0,
         }
     }
 }
@@ -851,6 +900,46 @@ fn rejected(reason: &str) -> ShardCommandResponse {
     ShardCommandResponse::Rejected {
         reason: reason.to_string(),
     }
+}
+
+/// Internal consistency of the retained publication state of one partition: every
+/// committed message carries the payload bytes whose `sha256` equals its recorded
+/// digest inside the inline bound, the logical offsets increase strictly, and the
+/// retained byte counter agrees with the payloads. A document that lost or mutated
+/// its payload bytes — for example an image written before payload retention
+/// existed — fails closed instead of recovering a record without its content.
+fn validate_committed_messages(partition: &PartitionState) -> Result<(), String> {
+    let mut total: u64 = 0;
+    let mut previous: Option<u64> = None;
+    for message in &partition.messages {
+        if message.payload.len() > MAX_INLINE_PAYLOAD_BYTES {
+            return Err(format!(
+                "committed message at logical offset {} exceeds the inline payload bound",
+                message.logical_offset
+            ));
+        }
+        if sha256(&message.payload) != message.payload_digest {
+            return Err(format!(
+                "committed message at logical offset {} does not match its payload digest",
+                message.logical_offset
+            ));
+        }
+        if previous.is_some_and(|offset| message.logical_offset <= offset) {
+            return Err(format!(
+                "committed messages are not ordered by logical offset at {}",
+                message.logical_offset
+            ));
+        }
+        previous = Some(message.logical_offset);
+        total = total.saturating_add(message.payload.len() as u64);
+    }
+    if total != partition.retained_payload_bytes {
+        return Err(format!(
+            "partition retains {total} payload bytes but its counter says {}",
+            partition.retained_payload_bytes
+        ));
+    }
+    Ok(())
 }
 
 /// Digest of what a command carries: the inline bytes themselves, or the durable
@@ -1292,6 +1381,10 @@ impl ShardSnapshot {
                     );
                 }
             }
+            // The committed payload bytes are part of the recovered state, so an image
+            // that lost or mutated them is refused before it can be activated.
+            validate_committed_messages(partition)
+                .map_err(|error| format!("shard snapshot partition {key}: {error}"))?;
             previous = Some(*key);
         }
         if let Some(membership) = self.membership.as_ref() {
@@ -1363,6 +1456,17 @@ impl ShardStateMachine {
                         ErrorVerb::Read,
                         invalid("shard state identity mismatch"),
                     ));
+                }
+                // Recovery must not silently resume with committed records whose
+                // payload bytes are missing or no longer match their digest.
+                for (key, partition) in &state.partitions {
+                    validate_committed_messages(partition).map_err(|error| {
+                        storage_error(
+                            Target::State.subject(),
+                            ErrorVerb::Read,
+                            invalid(format!("shard state partition {key}: {error}")),
+                        )
+                    })?;
                 }
                 state
             }
@@ -2896,6 +3000,7 @@ mod tests {
             max_producers_per_partition: 2,
             max_outcomes_per_producer: 2,
             max_retained_messages_per_partition: 64,
+            max_retained_payload_bytes_per_partition: 4,
         };
         let mut state = ShardState::new(identity());
 
@@ -2994,6 +3099,48 @@ mod tests {
         );
         expect_rejected(response, PublishErrorCode::ResourceExhausted);
         assert_eq!(state.partitions[&key(1, 2, 3)].next_logical_offset, 1);
+
+        // The retained-payload-byte bound refuses admission once the partition would
+        // hold more committed bytes than configured; it never evicts what it holds
+        // and a deduplicating replay consumes no new bytes.
+        let payload_limits = ShardLimits {
+            max_retained_payload_bytes_per_partition: 4,
+            ..limits
+        };
+        let mut state = ShardState::new(identity());
+        expect_published(state.apply_command_with_limits(
+            0,
+            &publish_command(publish(1, 2, 3, 10, 1, 1, 0, 1000, b"abcd".to_vec())),
+            &payload_limits,
+        ));
+        let response = state.apply_command_with_limits(
+            1,
+            &publish_command(publish(1, 2, 3, 10, 1, 1, 1, 1001, b"e".to_vec())),
+            &payload_limits,
+        );
+        expect_rejected(response, PublishErrorCode::ResourceExhausted);
+        {
+            let partition = &state.partitions[&key(1, 2, 3)];
+            assert_eq!(
+                partition.messages.len(),
+                1,
+                "the refusal consumed no message"
+            );
+            assert_eq!(
+                partition.next_logical_offset, 1,
+                "the refusal consumed no offset"
+            );
+            assert_eq!(partition.retained_payload_bytes, 4);
+            assert_eq!(partition.messages[0].payload, b"abcd");
+        }
+        let replay = state.apply_command_with_limits(
+            2,
+            &publish_command(publish(1, 2, 3, 10, 1, 1, 0, 1000, b"abcd".to_vec())),
+            &payload_limits,
+        );
+        let (_, logical_offset, duplicate) = expect_published(replay);
+        assert_eq!((logical_offset, duplicate), (0, true));
+        assert_eq!(state.partitions[&key(1, 2, 3)].retained_payload_bytes, 4);
     }
 
     #[tokio::test]
@@ -3023,6 +3170,10 @@ mod tests {
             assert_eq!(partition.messages.len(), 2);
             assert_eq!(partition.incarnation, 1);
             assert_eq!(partition.producers.len(), 1);
+            // The committed payload bytes are retained next to their digest.
+            assert_eq!(partition.messages[0].payload, b"first");
+            assert_eq!(partition.messages[1].payload, b"second");
+            assert_eq!(partition.retained_payload_bytes, 11);
         }
 
         let snapshot = source
@@ -3050,6 +3201,15 @@ mod tests {
             assert_eq!(partition.messages.len(), 2, "messages restored");
             assert_eq!(partition.incarnation, 1, "incarnation restored");
             assert_eq!(partition.producers.len(), 1, "producers restored");
+            // The committed payload bytes survive the snapshot round trip, not only
+            // their digests, so a committed record is still readable after the Raft
+            // log that carried it has been compacted away.
+            assert_eq!(partition.messages[0].payload, b"first", "payload restored");
+            assert_eq!(partition.messages[1].payload, b"second", "payload restored");
+            assert_eq!(
+                partition.retained_payload_bytes, 11,
+                "the retained byte counter restored"
+            );
             let producer = partition
                 .producers
                 .get(&ProducerKey {
@@ -3149,6 +3309,84 @@ mod tests {
             4,
             "the refusal consumed no offset"
         );
+    }
+
+    /// A snapshot that carries committed messages without their payload bytes — the
+    /// digest-only shape this fix replaced — is refused before it can touch the live
+    /// state. Recovery never hands back a record whose content is gone.
+    #[tokio::test]
+    async fn a_snapshot_that_lost_its_committed_payload_bytes_is_refused() {
+        let source_directory = tempfile::tempdir().expect("temp dir");
+        let mut source =
+            ShardStateMachine::open(source_directory.path(), identity()).expect("open");
+        source
+            .apply(vec![command_entry(
+                0,
+                publish_command(publish(1, 2, 3, 10, 20, 1, 0, 1000, b"keep me".to_vec())),
+            )])
+            .await
+            .expect("apply");
+        let snapshot = source
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .expect("build snapshot");
+        let good_bytes = snapshot_bytes(&snapshot);
+        let mut document: ShardSnapshot =
+            serde_json::from_slice(&good_bytes).expect("decode our own snapshot");
+        assert_eq!(document.partitions[0].1.messages[0].payload, b"keep me");
+        // Strip the payload while the digest still claims it, then reseal so only
+        // the payload validation can refuse the image.
+        document.partitions[0].1.messages[0].payload.clear();
+        let stripped = reseal(document);
+
+        let target_directory = tempfile::tempdir().expect("temp dir");
+        let mut target =
+            ShardStateMachine::open(target_directory.path(), identity()).expect("open target");
+        target
+            .apply(vec![command_entry(0, command(99, 9, 9, 9, b"own", 1))])
+            .await
+            .expect("apply");
+        let before = target.state().clone();
+
+        let error = install_bytes(&mut target, &snapshot.meta, &stripped)
+            .await
+            .expect_err("a payload-less image must be refused");
+        assert!(
+            format!("{error:?}").contains("payload digest"),
+            "unexpected refusal: {error:?}"
+        );
+        assert_eq!(target.state(), &before, "the live state must stay intact");
+    }
+
+    /// A restart must not silently resume from a `state.json` whose committed
+    /// payload bytes are missing: recovery fails closed instead.
+    #[tokio::test]
+    async fn recovery_refuses_a_state_whose_committed_payload_bytes_are_gone() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let mut machine = ShardStateMachine::open(directory.path(), identity()).expect("open");
+        machine
+            .apply(vec![command_entry(
+                0,
+                publish_command(publish(1, 2, 3, 10, 20, 1, 0, 1000, b"keep me".to_vec())),
+            )])
+            .await
+            .expect("apply");
+        let mut state = machine.state().clone();
+        state.partitions.get_mut(&key(1, 2, 3)).unwrap().messages[0]
+            .payload
+            .clear();
+        let bytes = encode_state(&state).expect("encode the mutated state");
+        drop(machine);
+        std::fs::write(directory.path().join(STATE_FILE), bytes).expect("write state");
+        match ShardStateMachine::open(directory.path(), identity()) {
+            Ok(_) => panic!("a state without its committed payloads must not load"),
+            Err(error) => assert!(
+                format!("{error:?}").contains("payload digest"),
+                "unexpected refusal: {error:?}"
+            ),
+        }
     }
 
     #[test]

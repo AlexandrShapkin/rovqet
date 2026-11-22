@@ -8,7 +8,7 @@ Metadata consensus and each Q2 data shard are separate Raft groups, though they 
 
 ## Durable-shard state
 
-One Raft group \`shard_id\` hosts multiple Q2 logical partitions. Committed entries contain \`shard_id, raft_term, raft_index, partition_ref, logical_offset, producer_identity/epoch/sequence, payload_digest, record, metadata_mutation\`. The Raft state machine maintains per-partition \`next_logical_offset, committed_index, producer_outcomes, group_cursors\` and retention metadata. A physical Raft index never becomes the public logical offset.
+One Raft group \`shard_id\` hosts multiple Q2 logical partitions. Committed entries contain \`shard_id, raft_term, raft_index, partition_ref, logical_offset, producer_identity/epoch/sequence, payload_digest, record, metadata_mutation\`. The Raft state machine maintains per-partition \`next_logical_offset, committed_index, producer_outcomes, group_cursors\` and retention metadata. Each retained committed message carries its payload bytes beside its \`payload_digest\`, under a per-partition retained-byte bound, so a committed record survives Raft log compaction and snapshot recovery instead of only its digest. A physical Raft index never becomes the public logical offset.
 
 Reference single shard append sequence: leader validates auth/class/epoch and producer sequence; submits a deterministic \`PublishCommand\` to Raft; log storage persists; replication reaches a durable majority; the leader applies committed entries in index order; the state machine returns the assigned logical offset and durable PUB_ACK outcome. Use the chosen library's exact commit/apply contract, not an assumed completion callback. Ensure storage adapter flushes required entries before reporting durable.
 
@@ -126,7 +126,10 @@ and the public data-plane model of `rovqet-core` is not changed by it.
   version, checksum, group identity, the included index against the snapshot metadata,
   and internal consistency of the carried state (no partition without an applied
   command, no duplicate or unordered partition, no membership log id above the included
-  index). A foreign identity, a bad checksum or an inconsistent index is refused and the
+  index, and every retained committed message carrying payload bytes whose `sha256`
+  matches its recorded digest within the inline bound — an image that lost its payload
+  bytes is refused, never activated). A foreign identity, a bad checksum or an
+  inconsistent index is refused and the
   live state stays untouched. A snapshot is published image-first under a temporary name
   renamed over the previous image, so an interrupted publication leaves the previous
   recovery point intact.

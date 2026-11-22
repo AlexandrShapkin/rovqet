@@ -614,6 +614,19 @@ mod tests {
             ack.field(f::MESSAGE_ID),
             Some(100u128.to_be_bytes().as_slice())
         );
+        // The committed payload bytes are retained next to their digest in the
+        // applied state, so the record survives Raft log compaction and snapshot
+        // recovery instead of only its digest.
+        {
+            let applied = route.applied_state();
+            let partition = applied
+                .partitions
+                .values()
+                .next()
+                .expect("the committed partition");
+            assert_eq!(partition.messages[0].payload, b"event");
+            assert_eq!(partition.retained_payload_bytes, 5);
+        }
         // An identical retry is the idempotent replay of the same token: the same
         // committed offset is reported and no second message is created.
         let retry = publish_until_certain(&route, frame).await;

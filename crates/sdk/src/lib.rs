@@ -656,7 +656,8 @@ impl Client {
     }
     /// Publish to an explicitly configured Q2 partition and wait for the quorum commit.
     /// Only a validated COMMITTED_QUORUM response yields success: QoS, outcome,
-    /// partition identity and log incarnation must all match the request. A transport
+    /// partition identity, log incarnation and the echoed message id must all match
+    /// the request. A transport
     /// error or timeout after the write is unresolved (OUTCOME_UNKNOWN) and closes this
     /// connection; a malformed or contradictory acknowledgment is a protocol error, never
     /// a commit. Reconnect and retry with the identical producer token and payload to
@@ -735,6 +736,16 @@ impl Client {
             );
             if incarnation != options.incarnation {
                 return Err(ClientError::Protocol("Q2 puback incarnation mismatch"));
+            }
+            // The acknowledgment must echo the message id of THIS request: a PubAck
+            // for another token is never a commit of ours.
+            let ack_message_id = u128::from_be_bytes(
+                required(&result, f::MESSAGE_ID)?
+                    .try_into()
+                    .map_err(|_| ClientError::Protocol("invalid Q2 message id"))?,
+            );
+            if ack_message_id != options.message_id {
+                return Err(ClientError::Protocol("Q2 puback message id mismatch"));
             }
             Ok(DurableOffset {
                 log_incarnation: incarnation,
@@ -1716,6 +1727,105 @@ mod tests {
         }
         client.close().await.unwrap();
         server.await.unwrap();
+    }
+    fn q2_options() -> Q2PublishOptions {
+        Q2PublishOptions {
+            partition: PartitionRef {
+                tenant_id: 1,
+                topic_id: 3,
+                partition_id: 0,
+            },
+            incarnation: 42,
+            ownership_epoch: 7,
+            producer_id: 77,
+            producer_epoch: 3,
+            sequence: 4,
+            message_id: 88,
+            payload: b"q2-body".to_vec(),
+            ttl_ms: 30_000,
+        }
+    }
+    /// A COMMITTED_QUORUM acknowledgment is a commit only when it echoes the message
+    /// id of the request it answers. A missing or foreign message id is a protocol
+    /// error that closes the session — never `CommittedQuorum`.
+    #[tokio::test]
+    async fn q2_commit_requires_the_ack_to_echo_the_requested_message_id() {
+        for fault in 0..3 {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let config = ClientConfig {
+                endpoint: listener.local_addr().unwrap(),
+                ..Default::default()
+            };
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                handshake(&mut stream).await;
+                let request = read_frame(&mut stream, Limits::default())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(request.frame_type, FrameType::Publish);
+                let options = q2_options();
+                let mut ack = Frame::new(FrameType::PubAck, request.request_id);
+                ack.fields = vec![
+                    Field::required(f::QOS, [2]),
+                    Field::required(f::PUB_OUTCOME, [3]),
+                    Field::required(f::TENANT_ID, 1u64.to_be_bytes()),
+                    Field::required(f::TOPIC_ID, 3u64.to_be_bytes()),
+                    Field::required(f::PARTITION_ID, 0u32.to_be_bytes()),
+                    Field::required(f::LOG_INCAR, 42u128.to_be_bytes()),
+                    Field::required(f::OFFSET, 7u64.to_be_bytes()),
+                ];
+                match fault {
+                    // Control: every field correct, message id echoed.
+                    0 => ack.fields.push(Field::required(
+                        f::MESSAGE_ID,
+                        options.message_id.to_be_bytes(),
+                    )),
+                    // The required message id is absent.
+                    1 => {}
+                    // The acknowledgment answers another token.
+                    2 => ack
+                        .fields
+                        .push(Field::required(f::MESSAGE_ID, 89u128.to_be_bytes())),
+                    _ => unreachable!(),
+                }
+                write_frame(&mut stream, &ack, Limits::default())
+                    .await
+                    .unwrap();
+                if fault == 0 {
+                    return;
+                }
+                // A rejected acknowledgment closes the session without another frame.
+                match read_frame(&mut stream, Limits::default()).await {
+                    Ok(None) => {}
+                    Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {}
+                    other => panic!("a rejected q2 ack must close the session: {other:?}"),
+                }
+            });
+            let mut client = Client::connect(config).await.unwrap();
+            let result = client.publish_q2("durable", q2_options()).await;
+            match fault {
+                0 => assert_eq!(
+                    result.unwrap(),
+                    PublishOutcome::CommittedQuorum(DurableOffset {
+                        log_incarnation: 42,
+                        sequence: 7
+                    }),
+                    "fault {fault}"
+                ),
+                _ => {
+                    assert!(
+                        matches!(result, Err(ClientError::Protocol(_))),
+                        "fault {fault} must never report a commit: {result:?}"
+                    );
+                    assert!(
+                        client.stream.is_none(),
+                        "fault {fault} must close the session"
+                    );
+                }
+            }
+            server.await.unwrap();
+        }
     }
     fn read_options() -> ReadOptions {
         ReadOptions {
