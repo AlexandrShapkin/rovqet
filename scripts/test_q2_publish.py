@@ -19,11 +19,17 @@ identity) is INVALID evidence and never counts toward the majority. A digest wit
 the payload bytes cannot prove what a voter recovered, and a payload whose bytes
 contradict their digest is a failure.
 
-The required proof "leader crash strictly before a durable majority" is NOT_RUN here:
-the prototype broker exposes no deterministic pause before the quorum boundary, so a
-crash at that exact point cannot be provoked without fabricating evidence. That
-scenario is journaled as NOT_RUN with `required: true`, and the oracle therefore never
-reports the campaign as a complete PASS. The pre-majority case remains open for C-04.
+The required proof "leader crash strictly before a durable majority" is exercised by a
+deterministic, explicitly-armed broker seam. A broker started with
+`ROVQET_Q2_PREMAJORITY_BARRIER=<dir>` holds replication of exactly the `arm.json`
+producer token before any follower socket is opened, and only after its own
+`FileLogStorage` completed `sync_all` for that entry. It then writes `barrier.json`
+(node, log index, durable index, token), so the parent can SIGKILL the named leader
+before the entry reaches a quorum. Without that environment variable the same
+production binary is inert, and the seam writes nothing. The scenario journals the
+barrier, kills the leader, verifies no voter committed the entry, disarms the seam,
+restarts the node and retries the same producer token: the retry must settle at the
+next logical offset exactly once on every voter.
 
 Default invocation runs the negative fixtures and then the campaign. `--fixtures-only`
 runs only the oracle fixture suite. Missing binaries are a real NOT_RUN observation,
@@ -712,6 +718,7 @@ class Node:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
+            env=dict(os.environ, **self.harness.env),
         )
         threading.Thread(target=self._read, daemon=True).start()
         self.harness.journal.append(
@@ -854,6 +861,10 @@ class Campaign:
     def __init__(self, journal: oracle.Journal, directory: Path):
         self.journal = journal
         self.directory = directory
+        # Extra environment for every broker this campaign starts. Empty by default:
+        # a production broker is started without it, so the pre-majority seam stays
+        # disabled until a scenario explicitly enables it.
+        self.env: dict[str, str] = {}
         self._ports: set[int] = set()
         self.ports: dict[int, dict] = {}
         for number in (1, 2, 3):
@@ -887,7 +898,33 @@ class Campaign:
             self.nodes[number].wait_ready()
         self.nodes[1].wait_authority()
 
-    def publish(
+    def _arguments(
+        self,
+        producer: int,
+        epoch: int,
+        sequence: int,
+        message_id: int,
+        payload: str,
+        incarnation: int,
+        owner_epoch: int,
+    ) -> list[str]:
+        return [
+            str(EXAMPLE),
+            TOPIC,
+            str(TENANT),
+            str(TOPIC_ID),
+            str(PARTITION),
+            str(incarnation),
+            str(owner_epoch),
+            str(producer),
+            str(epoch),
+            str(sequence),
+            str(message_id),
+            payload,
+            "1",
+        ]
+
+    def publish_start(
         self,
         producer: int,
         epoch: int,
@@ -897,9 +934,13 @@ class Campaign:
         *,
         incarnation: int = INCARNATION,
         owner_epoch: int = OWNER_EPOCH,
-        timeout: float = T_PUBLISH,
-        rejection_event: str = "publication_rejected",
-    ) -> dict:
+    ) -> subprocess.Popen:
+        """Journal one publication attempt and start the real SDK example.
+
+        The process is returned still running: a caller that must observe an external
+        barrier before the publication can settle (scenario 12) collects it with
+        :meth:`publish_finish`. Every other caller uses :meth:`publish`.
+        """
         self.journal.append(
             "publication_attempt",
             producer=producer,
@@ -916,38 +957,149 @@ class Campaign:
                 "partition_id": PARTITION,
             },
         )
-        result = subprocess.run(
-            [
-                str(EXAMPLE),
-                TOPIC,
-                str(TENANT),
-                str(TOPIC_ID),
-                str(PARTITION),
-                str(incarnation),
-                str(owner_epoch),
-                str(producer),
-                str(epoch),
-                str(sequence),
-                str(message_id),
-                payload,
-                "1",
-            ],
+        return subprocess.Popen(
+            self._arguments(
+                producer, epoch, sequence, message_id, payload, incarnation, owner_epoch
+            ),
             env=dict(os.environ, ROVQET_ADDR=f"127.0.0.1:{self.nodes[1].client_port}"),
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout,
         )
-        if result.returncode != 0:
+
+    def publish_finish(
+        self,
+        process: subprocess.Popen,
+        producer: int,
+        epoch: int,
+        sequence: int,
+        message_id: int,
+        payload: str,
+        *,
+        incarnation: int = INCARNATION,
+        owner_epoch: int = OWNER_EPOCH,
+        timeout: float = T_PUBLISH,
+        rejection_event: str = "publication_rejected",
+    ) -> dict:
+        """Collect a started publication and journal the outcome it really observed."""
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
             raise CheckFailure(
-                f"the SDK example exited {result.returncode}: {result.stderr.strip()}"
+                f"the SDK example for {producer}:{epoch}:{sequence} never finished "
+                f"within {timeout}s"
+            ) from None
+        if process.returncode != 0:
+            raise CheckFailure(
+                f"the SDK example exited {process.returncode}: {stderr.strip()}"
             )
-        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        observed = self._observed(stdout)
+        self._journal_outcome(
+            observed,
+            producer,
+            epoch,
+            sequence,
+            message_id,
+            payload,
+            incarnation=incarnation,
+            rejection_event=rejection_event,
+        )
+        return observed
+
+    def collect_attempt(
+        self,
+        process: subprocess.Popen,
+        producer: int,
+        epoch: int,
+        sequence: int,
+        message_id: int,
+        payload: str,
+        *,
+        incarnation: int = INCARNATION,
+        timeout: float = T_PUBLISH,
+    ) -> dict | None:
+        """Collect an attempt whose broker may be killed while it is in flight.
+
+        Unlike :meth:`publish_finish`, a non-zero exit is not itself a failure here:
+        the SDK loses its socket when the harness kills the leader. The externally
+        observed outcome is journaled only when the SDK actually printed one;
+        otherwise the exit is recorded as its own evidence and no outcome is invented.
+        """
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, stderr = process.communicate()
+        lines = [line for line in stdout.splitlines() if line.strip()]
+        if not lines:
+            self.journal.append(
+                "premajority_attempt_exit",
+                producer=producer,
+                producer_epoch=epoch,
+                sequence=sequence,
+                message_id=message_id,
+                exit_code=process.returncode,
+                stderr=stderr.strip()[-800:],
+            )
+            return None
+        observed = self._observed(stdout)
+        self._journal_outcome(
+            observed,
+            producer,
+            epoch,
+            sequence,
+            message_id,
+            payload,
+            incarnation=incarnation,
+        )
+        return observed
+
+    def await_premajority_barrier(
+        self, path: Path, process: subprocess.Popen, *, timeout: float = T_APPLIED
+    ) -> dict:
+        """Wait until the armed broker wrote its pre-majority barrier document."""
+        deadline = time.monotonic() + timeout
+        last_error = "the barrier document never appeared"
+        while time.monotonic() < deadline:
+            if path.exists():
+                try:
+                    return json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as error:
+                    last_error = f"unreadable barrier: {error}"
+            if process.poll() is not None:
+                raise CheckFailure(
+                    "the SDK attempt finished before the armed broker emitted the "
+                    f"pre-majority barrier (exit {process.returncode})"
+                )
+            time.sleep(T_POLL)
+        raise CheckFailure(
+            f"the armed broker did not emit the pre-majority barrier: {last_error}"
+        )
+
+    @staticmethod
+    def _observed(stdout: str) -> dict:
+        lines = [line for line in stdout.splitlines() if line.strip()]
         if not lines:
             raise CheckFailure("the SDK example printed no outcome")
         try:
-            observed = json.loads(lines[-1])
+            return json.loads(lines[-1])
         except json.JSONDecodeError as error:
             raise CheckFailure(f"unparseable SDK output {lines[-1]!r}: {error}") from error
+
+    def _journal_outcome(
+        self,
+        observed: dict,
+        producer: int,
+        epoch: int,
+        sequence: int,
+        message_id: int,
+        payload: str,
+        *,
+        incarnation: int = INCARNATION,
+        rejection_event: str = "publication_rejected",
+    ) -> None:
         outcome = observed.get("outcome")
         if outcome == "committed_quorum":
             self.journal.append(
@@ -1001,7 +1153,41 @@ class Campaign:
                 detail=observed,
             )
             raise CheckFailure(f"unexpected SDK outcome {observed!r}")
-        return observed
+
+    def publish(
+        self,
+        producer: int,
+        epoch: int,
+        sequence: int,
+        message_id: int,
+        payload: str,
+        *,
+        incarnation: int = INCARNATION,
+        owner_epoch: int = OWNER_EPOCH,
+        timeout: float = T_PUBLISH,
+        rejection_event: str = "publication_rejected",
+    ) -> dict:
+        process = self.publish_start(
+            producer,
+            epoch,
+            sequence,
+            message_id,
+            payload,
+            incarnation=incarnation,
+            owner_epoch=owner_epoch,
+        )
+        return self.publish_finish(
+            process,
+            producer,
+            epoch,
+            sequence,
+            message_id,
+            payload,
+            incarnation=incarnation,
+            owner_epoch=owner_epoch,
+            timeout=timeout,
+            rejection_event=rejection_event,
+        )
 
     def publish_until_certain(
         self,
@@ -1365,18 +1551,114 @@ def run_campaign(campaign: Campaign) -> None:
     campaign.journal.append(
         "scenario_started", scenario=12, name="leader-crash-before-majority"
     )
-    campaign.journal.append(
-        "scenario_not_run",
-        scenario=12,
-        name="leader-crash-before-majority",
-        required=True,
-        reason=(
-            "the prototype broker exposes no deterministic pause between the leader's "
-            "local append and the durable majority; provoking that exact crash would "
-            "require an unimplemented fault hook, so no evidence is claimed"
+    # A fresh producer token that no earlier scenario attempted: the seam may only
+    # hold this exact identity.
+    producer, sequence, message_id, payload = 21, 0, 300, "premajority"
+    barrier_directory = campaign.directory / "premajority"
+    barrier_directory.mkdir(parents=True, exist_ok=True)
+    arm_path = barrier_directory / "arm.json"
+    barrier_path = barrier_directory / "barrier.json"
+    barrier_path.unlink(missing_ok=True)
+    arm_path.write_text(
+        json.dumps(
+            {
+                "producer_id": producer,
+                "producer_epoch": 0,
+                "sequence": sequence,
+                "message_id": message_id,
+            }
         ),
+        encoding="utf-8",
     )
-    campaign.journal.append("scenario_conclusion", scenario=12, verdict=NOT_RUN)
+    # Only brokers started from here on inherit the seam directory. Brokers started
+    # earlier in this campaign ran without it, exactly like production.
+    campaign.env["ROVQET_Q2_PREMAJORITY_BARRIER"] = str(barrier_directory)
+    campaign.start([1, 2, 3])
+    time.sleep(1.5)
+
+    attempt = campaign.publish_start(producer, 0, sequence, message_id, payload)
+    barrier = campaign.await_premajority_barrier(barrier_path, attempt)
+    campaign.journal.append(
+        "premajority_barrier",
+        **{key: value for key, value in barrier.items() if key != "event"},
+    )
+    campaign.check(
+        barrier.get("event") == "premajority_barrier"
+        and barrier.get("producer_id") == producer
+        and barrier.get("producer_epoch") == 0
+        and barrier.get("sequence") == sequence
+        and barrier.get("message_id") == message_id,
+        "the armed broker held this exact publication at the pre-majority barrier",
+        barrier=barrier,
+    )
+    campaign.check(
+        isinstance(barrier.get("log_index"), int)
+        and isinstance(barrier.get("durable_index"), int)
+        and barrier["durable_index"] >= barrier["log_index"],
+        "the barrier followed a completed local durable append of that entry",
+        barrier=barrier,
+    )
+    leader = barrier.get("node")
+    campaign.check(
+        leader in campaign.live(),
+        "the barrier names a live voter that was replicating the entry",
+        barrier=barrier,
+    )
+    staged = campaign.record_states()
+    campaign.check(
+        all(
+            state is None
+            or (
+                state["next_logical_offset"] == 5
+                and campaign.message(state, 5) is None
+            )
+            for state in staged.values()
+        ),
+        "no voter had committed the held entry before the leader was killed",
+        states={str(k): v for k, v in staged.items()},
+    )
+    campaign.nodes[leader].kill()
+    campaign.check(
+        leader not in campaign.live(),
+        f"the leader named by the barrier (node {leader}) was SIGKILLed before quorum",
+        node=leader,
+    )
+    interrupted = campaign.collect_attempt(
+        attempt, producer, 0, sequence, message_id, payload
+    )
+    campaign.check(
+        interrupted is None or interrupted.get("outcome") != "committed_quorum",
+        "the interrupted attempt never observed COMMITTED_QUORUM",
+        observed=interrupted,
+    )
+    # The crash point has been witnessed. Disarm before recovery so the restarted
+    # voter behaves exactly like a production broker and the retry can settle.
+    arm_path.unlink(missing_ok=True)
+    campaign.env.pop("ROVQET_Q2_PREMAJORITY_BARRIER", None)
+    campaign.start([leader])
+    time.sleep(1.5)
+    observed = campaign.publish_until_certain(
+        producer, 0, sequence, message_id, payload, timeout=75
+    )
+    campaign.expect_committed(observed, 5)
+    states = campaign.await_message(5, message_id, timeout=60)
+    campaign.check(
+        all(
+            state["next_logical_offset"] == 6
+            and len(
+                [
+                    message
+                    for message in state["messages"]
+                    if message.get("message_id") == message_id
+                ]
+            )
+            == 1
+            for state in states.values()
+        ),
+        "the recovered retry is committed exactly once at offset 5 on every voter",
+        states={str(k): v for k, v in states.items()},
+    )
+    campaign.journal.append("scenario_conclusion", scenario=12, verdict=PASS)
 
 
 def preflight_problem() -> str | None:
@@ -1448,12 +1730,6 @@ def main() -> int:
                 pass
         records = oracle.load(JOURNAL_PATH, require_conclusion=False)
         verdict = oracle.reconcile_q2_publish(records, require_conclusion=False)
-        journal.append(
-            "oracle_verdict",
-            verdict=verdict["verdict"],
-            reasons=verdict["reasons"],
-            counts=verdict["counts"],
-        )
         if failure is not None:
             journal.conclusion(FAIL, failure)
         elif verdict["verdict"] == PASS:
@@ -1464,6 +1740,17 @@ def main() -> int:
             journal.conclusion(NOT_RUN, "; ".join(verdict["reasons"]))
         else:
             journal.conclusion(FAIL, "; ".join(verdict["reasons"]))
+        # The verdict journaled as evidence must reflect the conclusion just written:
+        # otherwise a crashed campaign could leave a PASS oracle record beside a FAIL
+        # conclusion, which is exactly the misleading path this harness must not emit.
+        final_records = oracle.load(JOURNAL_PATH, require_conclusion=False)
+        verdict = oracle.reconcile_q2_publish(final_records, require_conclusion=False)
+        journal.append(
+            "oracle_verdict",
+            verdict=verdict["verdict"],
+            reasons=verdict["reasons"],
+            counts=verdict["counts"],
+        )
         journal.close()
         shutil.rmtree(directory, ignore_errors=True)
 

@@ -729,6 +729,12 @@ impl RaftLogStorage<ShardRaftTypeConfig> for FileLogStorage {
         let entries: Vec<Entry<ShardRaftTypeConfig>> = entries.into_iter().collect();
         match self.append_sync(&entries) {
             Ok(()) => {
+                // The append is durable now (`sync_all` returned above), so the
+                // pre-majority seam may witness this exact index: it must never claim
+                // a durable append that has not completed.
+                if let Some(last) = entries.last() {
+                    crate::premajority::observe_durable(last.log_id.index);
+                }
                 callback.log_io_completed(Ok(()));
                 Ok(())
             }

@@ -27,6 +27,7 @@
 
 pub mod log;
 pub mod network;
+pub mod premajority;
 pub mod sm;
 pub mod types;
 
@@ -162,7 +163,7 @@ impl ShardNode {
 
         let peers = config.peers.clone();
         let timeout = Duration::from_millis(config.election_timeout_ms.max(500));
-        let network = ShardNetworkFactory::new(peers.clone(), timeout);
+        let network = ShardNetworkFactory::new(peers.clone(), timeout, config.id);
         let raft_config = Config {
             cluster_name: format!("rovqet-shard-{}-{}", identity.cluster_id, identity.shard_id),
             election_timeout_min: config.election_timeout_ms.max(150),

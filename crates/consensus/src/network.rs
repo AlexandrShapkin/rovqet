@@ -71,11 +71,21 @@ pub enum ShardRpcResponse {
 pub struct ShardNetworkFactory {
     peers: Vec<(ShardNodeId, SocketAddr)>,
     timeout: Duration,
+    /// The node this factory belongs to, echoed by the pre-majority barrier.
+    local: ShardNodeId,
 }
 
 impl ShardNetworkFactory {
-    pub fn new(peers: Vec<(ShardNodeId, SocketAddr)>, timeout: Duration) -> Self {
-        Self { peers, timeout }
+    pub fn new(
+        peers: Vec<(ShardNodeId, SocketAddr)>,
+        timeout: Duration,
+        local: ShardNodeId,
+    ) -> Self {
+        Self {
+            peers,
+            timeout,
+            local,
+        }
     }
 }
 
@@ -94,6 +104,7 @@ impl RaftNetworkFactory<ShardRaftTypeConfig> for ShardNetworkFactory {
             target,
             address,
             timeout: self.timeout,
+            local: self.local,
         }
     }
 }
@@ -103,6 +114,8 @@ pub struct TcpShardNetwork {
     target: ShardNodeId,
     address: SocketAddr,
     timeout: Duration,
+    /// The local node, used by the test-controlled pre-majority barrier.
+    local: ShardNodeId,
 }
 
 impl TcpShardNetwork {
@@ -131,6 +144,11 @@ impl RaftNetwork<ShardRaftTypeConfig> for TcpShardNetwork {
         AppendEntriesResponse<ShardNodeId>,
         RPCError<ShardNodeId, ShardNode, RaftError<ShardNodeId>>,
     > {
+        // Test-controlled pre-majority seam: a no-op unless the environment armed it
+        // for this exact publication. It runs before any socket is opened and holds
+        // only this replication task, so the leader's local durable append has already
+        // completed while no follower can reach a majority for the entry.
+        crate::premajority::hold_publish_replication(self.local, &rpc.entries).await;
         match self.call(ShardRpc::AppendEntries(rpc)).await? {
             ShardRpcResponse::AppendEntries(response) => Ok(response),
             ShardRpcResponse::Error(error) => Err(RPCError::Unreachable(Unreachable::new(

@@ -11,14 +11,16 @@
 //!
 //! Environment:
 //!   ROVQET_ADDR  broker endpoint (default from ClientConfig)
-use rovqet_sdk::{Client, ClientConfig, ClientError, PartitionRef, PublishOutcome, Q2PublishOptions};
+use rovqet_sdk::{
+    Client, ClientConfig, ClientError, PartitionRef, PublishOutcome, Q2PublishOptions,
+};
 use std::time::Duration;
 
 fn main_value(error: &ClientError) -> (String, String) {
     match error {
-        ClientError::Remote { code: Some(code), .. } => {
-            ("rejected".to_string(), format!("{code:?}"))
-        }
+        ClientError::Remote {
+            code: Some(code), ..
+        } => ("rejected".to_string(), format!("{code:?}")),
         ClientError::Remote { code: None, .. } => {
             ("unknown".to_string(), "remote-error".to_string())
         }
@@ -31,9 +33,12 @@ fn main_value(error: &ClientError) -> (String, String) {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.len() < 11 {
-        return Err("usage: q2_publish topic tenant topic_id partition incarnation \
+        return Err(
+            "usage: q2_publish topic tenant topic_id partition incarnation \
                     owner_epoch producer_id producer_epoch start_sequence message_id \
-                    payload count".into());
+                    payload count"
+                .into(),
+        );
     }
     let mut config = ClientConfig {
         request_timeout: Duration::from_secs(20),
