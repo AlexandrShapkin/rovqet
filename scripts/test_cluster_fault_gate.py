@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
-"""C-07 fault gate scenarios F1 and F3b: a healthy Q0/Q1/Q2 baseline and a
-consumer ACK refused without the Q2 majority.
+"""C-07 fault gate: Q0/Q1/Q2 baseline, ACK quorum loss, and live metadata authority.
+
+F7a observes a three-voter metadata-Raft leader replacement with unchanged
+committed placement and continued Q1 commits under a 60-second lease. F7b
+commits a 200-ms placement but reports INVALID if the non-DLQ route cannot
+expose installation/expiry; elapsed time alone never establishes expiry.
 
 F1 (healthy-q0-q1-q2-baseline): one campaign starts three real Q2 voters plus
 a single broker that hosts the Q1 route, the Q2 route and the Q0 admission
@@ -45,6 +49,7 @@ from pathlib import Path
 import q1_oracle as oracle
 from q0_smoke import line_within
 from q1_smoke import Q0, Q1, SERVER, Broker, q1_command
+from test_metadata_raft import Node as MetadataVoter, NODE as METADATA_NODE, free_port
 from test_q2_publish import (
     Campaign,
     EXAMPLE,
@@ -65,6 +70,8 @@ Q2_CONSUMER = (Path(__file__).resolve().parents[1] / "target" / "debug"
 
 F1 = "healthy-q0-q1-q2-baseline"
 F3B = "consumer-ack-refused-without-q2-majority"
+F7A = "metadata-election-preserves-ownership-epoch"
+F7B = "expired-authority-fails-closed"
 
 Q1_TOPIC = "durable"
 Q1_TENANT, Q1_TOPIC_ID, Q1_PARTITION = 1, 3, 0
@@ -927,7 +934,211 @@ def scenario_f3b(journal) -> str:
             f"{len(next(iter(records_after.values())))} record per voter")
 
 
-SCENARIOS = ((F1, scenario_f1), (F3B, scenario_f3b))
+class MetadataJournal:
+    """Scope every reused observation to metadata, never the Q2 data quorum."""
+
+    def __init__(self, journal):
+        self.journal = journal
+
+    def append(self, event, **fields):
+        return self.journal.append(
+            event, metadata_quorum={
+                "domain": "metadata-Raft", "configured_voters": [1, 2, 3],
+                "required_majority": 2, "q2_data_quorum": "not exercised"},
+            **fields)
+
+
+class LiveMetadata:
+    """Two command-capable voters plus the broker as the third metadata voter."""
+
+    def __init__(self, directory, journal):
+        self.directory = directory
+        self.journal = MetadataJournal(journal)
+        self.ports = {number: free_port() for number in (1, 2, 3)}
+        self.nodes = [
+            MetadataVoter(number, self.ports[number], self.ports,
+                          directory / f"metadata-{number}")
+            for number in (1, 2)]
+        self.broker = None
+        self.captured = {1: 0, 2: 0}
+
+    def observations(self):
+        events = []
+        for node in self.nodes:
+            history = list(node.history)
+            for event in history[self.captured[node.node_id]:]:
+                self.journal.append("metadata_revision" if
+                                    event.get("event") == "applied" else
+                                    "metadata_observation", evidence=event)
+            self.captured[node.node_id] = len(history)
+            if node.process is not None:
+                events.extend(history)
+        return events
+
+    def wait(self, predicate, description, timeout=30):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            result = predicate(self.observations())
+            if result:
+                return result
+            time.sleep(0.02)  # Poll observable events; elapsed time is not proof.
+        raise AssertionError(f"metadata deadline: {description}")
+
+    def leader(self, after_term=0):
+        return self.wait(
+            lambda events: next(
+                (event for event in reversed(events)
+                 if event.get("event") in ("leader", "follower")
+                 and event["term"] > after_term), None),
+            "leader transition")
+
+    def propose(self, leader_id, command):
+        node = next(node for node in self.nodes if node.node_id == leader_id)
+        response = node.propose(command, timeout=35)
+        self.journal.append("metadata_proposal", command=command,
+                            response=response, node=leader_id)
+        assert response is not None and response.get("ok"), response
+        return response["response"]["Applied"]["revision"]
+
+    def placement(self, revision):
+        return self.wait(
+            lambda events: next(
+                (event for event in reversed(events)
+                 if event.get("event") == "applied"
+                 and event["revision"] >= revision
+                 and event.get("placements")), None),
+            f"committed placement at revision {revision}")
+
+    def start(self):
+        for node in self.nodes:
+            node.start()
+        initial = self.leader()
+        leader_id = initial["leader"]
+        # Bootstrap has two live voters; start the Q1 owner only after the
+        # command-capable voters have elected a leader.
+        local = self.directory / "broker"
+        local.mkdir()
+        args = [
+            "--cluster-id", "990011", "--node-id", "3",
+            "--cluster-listen", f"127.0.0.1:{free_port()}",
+            "--metadata-raft", "true",
+            "--metadata-raft-dir", str(local / "metadata"),
+            "--metadata-raft-listen", f"127.0.0.1:{self.ports[3]}",
+            "--metadata-raft-bootstrap", "false",
+        ]
+        for number, port in self.ports.items():
+            args += ["--metadata-raft-peer", f"{number}=127.0.0.1:{port}"]
+        self.broker = Broker(local, extra=args)
+        self.broker.start()
+        self.propose(leader_id, {"SetNode": {
+            "node": 3, "address": self.broker.endpoint}})
+        self.propose(leader_id, {"SetTopicPolicy": {
+            "topic_id": 3, "durable_class": 1, "policy_revision": 1}})
+        revision = self.propose(leader_id, {"SetPlacement": {
+            **partition_identity(), "owner": 3, "ownership_epoch": 7,
+            "lease_valid_for_ms": 60000}})
+        placement = self.placement(revision)
+        with self.broker.condition:
+            ready = self.broker.condition.wait_for(
+                lambda: any("Q1 route active:" in line
+                            for line in self.broker.lines), timeout=30)
+        assert ready, self.broker.lines
+        self.journal.append(
+            "scenario_started", broker_endpoint=self.broker.endpoint,
+            placement=placement, leader=initial,
+            profile="loopback plaintext disposable research prototype",
+            prior_evidence={
+                "stale_epoch": "C-04 scenario 6",
+                "stale_generation": "C-05 fencing",
+                "handover_epoch_7_to_8": "C-02 D2 journal"})
+        self.journal.append("authority_observed",
+                            evidence=list(self.broker.lines),
+                            committed_placement=placement)
+        return initial, placement
+
+    def close(self):
+        if self.broker is not None:
+            self.broker.close()
+            self.journal.append("broker_output",
+                                stderr=list(self.broker.lines))
+        for node in self.nodes:
+            node.kill()
+        self.observations()
+
+
+def scenario_f7a(journal):
+    """A real metadata election does not mint a new ownership epoch."""
+    with tempfile.TemporaryDirectory(prefix="rovqet-c07-f7a-") as temporary:
+        live = LiveMetadata(Path(temporary), journal)
+        try:
+            initial, before = live.start()
+            first = publish_q1(live.journal, live.broker, 0)
+            old_id = initial["leader"]
+            old = next(node for node in live.nodes if node.node_id == old_id)
+            pid = old.process.pid
+            old.kill()
+            live.journal.append("broker_killed", role="metadata-voter",
+                                node=old_id, pid=pid, signal="SIGKILL",
+                                returncode=-9, storage=str(old.directory))
+            replacement = live.leader(after_term=initial["term"])
+            new_id = replacement["leader"]
+            assert new_id != old_id, replacement
+            live.journal.append("leader_observed", old_leader=old_id,
+                                new_leader=new_id, evidence=replacement)
+            # No metadata command is issued after the kill: only an election.
+            # The survivor's committed state is observed after the transition.
+            survivor = next(node for node in live.nodes
+                            if node.process is not None)
+            after = next(event for event in reversed(survivor.history)
+                         if event.get("event") == "applied"
+                         and event["revision"] >= before["revision"])
+            assert after["placements"] == before["placements"], (before, after)
+            epoch_before = before["placements"][0]["ownership_epoch"]
+            epoch_after = after["placements"][0]["ownership_epoch"]
+            assert epoch_before == epoch_after == Q1_OWNER_EPOCH, (before, after)
+            second = publish_q1(live.journal, live.broker, 1)
+            assert second["offset"] != first["offset"], (first, second)
+            live.journal.append("metadata_revision", phase="after_election",
+                                evidence=after, epoch_before=epoch_before,
+                                epoch_after=epoch_after,
+                                placement_unchanged=True,
+                                q1_before=first, q1_after=second)
+            return (f"metadata leader {old_id}->{new_id}, term "
+                    f"{initial['term']}->{replacement['term']}; committed "
+                    f"placement unchanged, epoch 7->7; {first['line']}; "
+                    f"{second['line']} within 60000 ms cached authority")
+        finally:
+            live.close()
+
+
+def scenario_f7b(journal):
+    """Never infer non-DLQ Q1 authority expiry from elapsed wall time."""
+    with tempfile.TemporaryDirectory(prefix="rovqet-c07-f7b-") as temporary:
+        live = LiveMetadata(Path(temporary), journal)
+        try:
+            initial, _ = live.start()
+            revision = live.propose(initial["leader"], {"SetPlacement": {
+                **partition_identity(), "owner": 3, "ownership_epoch": 7,
+                "lease_valid_for_ms": 200}})
+            committed = live.placement(revision)
+            live.journal.append(
+                "authority_observed", state="short_lease_committed",
+                evidence=committed, lease_ms=200,
+                expiry_observed=False, installation_observed=False)
+            raise ScenarioInvalid(
+                "200 ms placement committed in live metadata Raft, but the "
+                "non-DLQ Q1 route exposes neither an authority-install update "
+                "diagnostic nor an expired-state observation. main.rs logs "
+                "'Q1 DLQ authority' only for a configured DLQ; the ordinary "
+                "'Q1 authority' line is startup-only. No elapsed-time inference, "
+                "publication refusal, or no-record proof is claimed; unsupported "
+                "Q1 lease-expiry migration fallback not used.")
+        finally:
+            live.close()
+
+
+SCENARIOS = ((F1, scenario_f1), (F3B, scenario_f3b),
+             (F7A, scenario_f7a), (F7B, scenario_f7b))
 
 
 def main() -> int:
@@ -939,9 +1150,12 @@ def main() -> int:
     verdicts: dict[str, str] = {}
     try:
         for name, scenario in SCENARIOS:
-            if missing:
+            scenario_missing = missing + (
+                [str(METADATA_NODE)] if name in (F7A, F7B)
+                and not METADATA_NODE.is_file() else [])
+            if scenario_missing:
                 verdict, reason = oracle.NOT_RUN, (
-                    "binaries not built: " + ", ".join(missing))
+                    "binaries not built: " + ", ".join(scenario_missing))
             else:
                 scoped = ScenarioJournal(journal, name)
                 try:
@@ -958,7 +1172,15 @@ def main() -> int:
                     reason = f"{type(error).__name__}: {error}"
                     journal.append("scenario_failure", scenario=name,
                                    detail=traceback.format_exc())
-            journal.conclusion(verdict, reason, scenario=name)
+            if name in (F7A, F7B):
+                journal.conclusion(
+                    verdict, reason, scenario=name,
+                    metadata_quorum={"domain": "metadata-Raft",
+                                     "configured_voters": [1, 2, 3],
+                                     "required_majority": 2,
+                                     "q2_data_quorum": "not exercised"})
+            else:
+                journal.conclusion(verdict, reason, scenario=name)
             verdicts[name] = verdict
             print(f"{verdict} {name}: {reason}", flush=True)
     finally:
