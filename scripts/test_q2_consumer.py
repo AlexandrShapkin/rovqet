@@ -318,7 +318,8 @@ class ConsumerCampaign:
 
 def main():
     EVIDENCE.mkdir(parents=True, exist_ok=True)
-    directory = Path(tempfile.mkdtemp(prefix="c05-consumer-", dir="/tmp/opencode"))
+    scratch = "/tmp/opencode" if os.path.isdir("/tmp/opencode") else None
+    directory = Path(tempfile.mkdtemp(prefix="c05-consumer-", dir=scratch))
     journal = oracle.Journal(EVIDENCE / "consumer.jsonl", "c05-q2-consumer")
     campaign = None
     failure = None
