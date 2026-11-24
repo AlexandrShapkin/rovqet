@@ -1070,7 +1070,7 @@
         "C-03",
         "B-03"
       ],
-      "status": "IN_PROGRESS",
+      "status": "DONE",
       "architecture": "07",
       "proof": "Leader crash before/after majority, consistent retry",
       "paths": [
@@ -1078,26 +1078,36 @@
         "crates/consensus/"
       ],
       "evidence": {
-        "verification": "IN_PROGRESS: Q2 publish, offsets and dedup are implemented and covered by tests; PROOF_MATRIX.md formatting fixed. The 23-row proof matrix at benchmarks/evidence/c04-q2-publish/PROOF_MATRIX.md records 21 PASS and 2 NOT_RUN (properties 12 and 15). Live campaign scenarios 1-12 PASS with live oracle PASS. Final implementation commit 9f88929. CI still pending after the latest push; no green CI is claimed. No C-04 PASS or DONE claim.",
+        "verification": "DONE: Q2 publish, offsets and dedup are implemented, tested and proven end to end. Every command under commands was executed and its recorded result observed; the proof matrix is 23/23 PASS with no NOT_RUN rows; the live campaign and oracle are green; green CI was obtained for the final implementation tip.",
         "implementation_commits": [
           "a2e17e6",
           "723e584",
           "9238cdf",
           "2d21bfa",
-          "9f88929"
+          "9f88929",
+          "6a7bd3e",
+          "aca04ca",
+          "2efa34d"
         ],
-        "implementation": "Q2 publish, sparse offsets and producer dedup/retry implemented and covered by unit/integration tests; the oracle fixture suite is 38 fixtures at 2d21bfa; PROOF_MATRIX.md formatting fixed; final implementation commit 9f88929 (premajority leader-crash proof).",
-        "fixtures": "38 Q2 oracle fixtures PASS at 2d21bfa, replacing the previously recorded 23.",
-        "campaign": "Live SDK-to-broker campaign scenarios 1-12 PASS (real external clients over loopback TCP), including scenario 12 (leader crash before majority); journal benchmarks/evidence/c04-q2-publish/q2-publish.jsonl.",
-        "live_oracle": "PASS: all 12 campaign scenarios PASS and the recorded oracle_verdict at seq 169 is PASS (12 scenarios, 7 committed observations, 7 majority proofs, 2 rejections, 2 unknown outcomes, 34 voter states; counts re-read from the journal).",
-        "proof_matrix": "benchmarks/evidence/c04-q2-publish/PROOF_MATRIX.md: 23 rows, 21 PASS, 2 NOT_RUN - property 12 (no verified Q2 publication acknowledged while exactly one follower is unavailable) and property 15 (no verified majority-acknowledged-but-unanswered publication window).",
-        "ci_status": "CI still pending after the latest push (final implementation commit 9f88929); no green CI run is claimed and none may be inferred. Earlier runs 55-58 for these implementation commits failed and have not been re-run green.",
-        "remaining_gates": [
-          "Close proof-matrix property 12: a verified Q2 publication acknowledged while exactly one follower is unavailable (the q2-raft Inline command is not a publish).",
-          "Close proof-matrix property 15: a verified majority-acknowledged-but-unanswered publication window (leader crash after majority before response).",
-          "Obtain a green CI run after the latest push; CI is still pending.",
-          "Re-verify C-04 end to end before any DONE transition."
-        ]
+        "implementation": "Q2 publish, sparse offsets and producer dedup/retry implemented and covered by unit/integration tests; the close-out adds the fault-injection post-majority response seam (crates/consensus/src/postmajority.rs, compiled only under the fault-injection feature and inert unless armed for one publication token), campaign scenarios 13 and 14, and post-majority reconciliation in scripts/q1_oracle.py.",
+        "commands": [
+          "cargo fmt --all -- --check -> exit 0",
+          "cargo check --workspace --locked -> pass",
+          "cargo test --workspace --locked -> 399 passed, 0 failed, 0 ignored",
+          "cargo build -p rovqet-server -p rovqet-sdk --examples --bins --features fault-injection --locked -> exit 0",
+          "python3 scripts/test_q2_publish.py (fault-injection build) -> exit 0; 14/14 scenarios PASS; 47 oracle fixture tests OK; campaign: all executed checks passed; oracle: PASS []",
+          "python3 scripts/test_q2_publish.py (normal build) -> NOT_RUN recorded in benchmarks/evidence/c04-q2-publish/q2-publish-not-run.jsonl; the seam is feature-gated, so the campaign must run on the fault build",
+          "python3 scripts/test_q2_raft.py -> exit 0; 18/18 scenarios PASS",
+          "python3 scripts/test_q1_oracle.py -> exit 0; 59 tests passed",
+          "python3 scripts/check_docs.py -> pass (42 markdown files, 36 roadmap tasks)"
+        ],
+        "fixtures": "47 Q2 oracle fixture tests PASS in the final campaign run, replacing the previously recorded 38.",
+        "campaign": "Live SDK-to-broker campaign scenarios 1-14 PASS (real external clients over loopback TCP) on the fault-injection build. Scenario 12 = leader-crash-before-majority (row 14); scenario 13 = one-unavailable-follower-quorum (row 12: a Q2 publication acknowledged with exactly one follower unavailable, journal seq 165-195); scenario 14 = leader-crash-after-majority-before-response (row 15: post-majority barrier armed at seq 213 for message_id 302, every running voter carries the record before the kill, no acknowledgment reached the client before the SIGKILL at seq 222, OutcomeUnknown preserved, exactly-once recovery at offset 8, journal seq 196-256). Journal benchmarks/evidence/c04-q2-publish/q2-publish.jsonl.",
+        "live_oracle": "PASS: all 14 campaign scenarios PASS and the recorded oracle_verdict at seq 261 is PASS (14 scenarios, 11 committed observations, 11 majority proofs, 2 rejections, 3 unknown outcomes, 63 voter states; counts re-read from the journal).",
+        "proof_matrix": "benchmarks/evidence/c04-q2-publish/PROOF_MATRIX.md: 23 rows, 23 PASS, 0 NOT_RUN. Row 12 cites campaign scenario 13 (seq 165-195) and row 15 cites campaign scenario 14 (seq 196-256), both executed.",
+        "final_commit": "2efa34d7768292c3005452310a8228f6b57ca443 - final implementation and evidence tip of the green CI run; this ledger commit follows it.",
+        "ci_status": "Green CI: https://github.com/AlexandrShapkin/rovqet/actions/runs/45357718833 (conclusion success, headSha 2efa34d7768292c3005452310a8228f6b57ca443), verified with gh run list and gh run watch 45357718833 --exit-status. The ledger commit recording this entry is pushed on top; its own run is verified after push and reported in the agent handoff.",
+        "remaining_gates": []
       }
     },
     {
