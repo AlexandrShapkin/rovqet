@@ -3,8 +3,10 @@
 
 F7a observes a three-voter metadata-Raft leader replacement with unchanged
 committed placement and continued Q1 commits under a 60-second lease. F7b
-commits a 200-ms placement but reports INVALID if the non-DLQ route cannot
-expose installation/expiry; elapsed time alone never establishes expiry.
+configures a DLQ only so the committed-update watcher prints the authority
+witness, installs a 200 ms lease on the source route, waits past the observed
+install bound, and proves the owner-dependent publication is refused with the
+durable record count unchanged; elapsed time alone never establishes expiry.
 
 F1 (healthy-q0-q1-q2-baseline): one campaign starts three real Q2 voters plus
 a single broker that hosts the Q1 route, the Q2 route and the Q0 admission
@@ -48,7 +50,15 @@ from pathlib import Path
 
 import q1_oracle as oracle
 from q0_smoke import line_within
-from q1_smoke import Q0, Q1, SERVER, Broker, q1_command
+from q1_smoke import (
+    Q0,
+    Q1,
+    READ,
+    SERVER,
+    Broker,
+    manifest_record_count,
+    q1_command,
+)
 from test_metadata_raft import Node as MetadataVoter, NODE as METADATA_NODE, free_port
 from test_q2_publish import (
     Campaign,
@@ -72,6 +82,16 @@ F1 = "healthy-q0-q1-q2-baseline"
 F3B = "consumer-ack-refused-without-q2-majority"
 F7A = "metadata-election-preserves-ownership-epoch"
 F7B = "expired-authority-fails-closed"
+
+# The DLQ is configured only so that main.rs prints the committed-update authority
+# witness for a non-DLQ source route; no terminal disposition is exercised here.
+DLQ_TOPIC_NAME = "durable-dlq"
+DLQ_TOPIC_ID, DLQ_PARTITION_ID, DLQ_INCARNATION = 7, 0, 77
+F7B_LEASE_MS = 200
+# The install witness is read by polling, so the observation can lag the actual
+# install. The margin only widens the already-sound upper bound; it is never the
+# evidence that the lease lapsed -- the broker's typed refusal is.
+F7B_MARGIN_MS = 100
 
 Q1_TOPIC = "durable"
 Q1_TENANT, Q1_TOPIC_ID, Q1_PARTITION = 1, 3, 0
@@ -934,6 +954,17 @@ def scenario_f3b(journal) -> str:
             f"{len(next(iter(records_after.values())))} record per voter")
 
 
+def read_history(broker, incarnation) -> tuple[dict, list[str]]:
+    """Externally read the durable Q1 history; never trusts the broker's own count."""
+    observed = run_bounded(
+        [str(READ), Q1_TOPIC, str(Q1_TENANT), str(Q1_TOPIC_ID),
+         str(Q1_PARTITION), str(incarnation), "0", "64", "65536", "0"],
+        broker.environment(), TIMEOUT_CLIENT)
+    records = [line for line in observed["stdout"].splitlines()
+               if line.startswith("READ_RECORD")]
+    return observed, records
+
+
 class MetadataJournal:
     """Scope every reused observation to metadata, never the Q2 data quorum."""
 
@@ -951,8 +982,9 @@ class MetadataJournal:
 class LiveMetadata:
     """Two command-capable voters plus the broker as the third metadata voter."""
 
-    def __init__(self, directory, journal):
+    def __init__(self, directory, journal, dlq=False):
         self.directory = directory
+        self.dlq = dlq
         self.journal = MetadataJournal(journal)
         self.ports = {number: free_port() for number in (1, 2, 3)}
         self.nodes = [
@@ -1028,6 +1060,21 @@ class LiveMetadata:
         ]
         for number, port in self.ports.items():
             args += ["--metadata-raft-peer", f"{number}=127.0.0.1:{port}"]
+        if self.dlq:
+            # The DLQ exists only so the committed-update watcher prints the
+            # authority witness; the source route under test stays non-DLQ work.
+            args += [
+                "--q1-terminal-policy", "dlq",
+                "--q1-max-attempts", "1",
+                "--q1-retry-initial-ms", "10",
+                "--q1-retry-max-ms", "50",
+                "--q1-dlq-data-dir", str(local / "dlq"),
+                "--q1-dlq-topic", DLQ_TOPIC_NAME,
+                "--q1-dlq-topic-id", str(DLQ_TOPIC_ID),
+                "--q1-dlq-partition-id", str(DLQ_PARTITION_ID),
+                "--q1-dlq-incarnation", str(DLQ_INCARNATION),
+                "--q1-dlq-owner-epoch", str(Q1_OWNER_EPOCH),
+            ]
         self.broker = Broker(local, extra=args)
         self.broker.start()
         self.propose(leader_id, {"SetNode": {
@@ -1112,27 +1159,128 @@ def scenario_f7a(journal):
 
 
 def scenario_f7b(journal):
-    """Never infer non-DLQ Q1 authority expiry from elapsed wall time."""
+    """An actually expired owner authority refuses durable work with no record."""
     with tempfile.TemporaryDirectory(prefix="rovqet-c07-f7b-") as temporary:
-        live = LiveMetadata(Path(temporary), journal)
+        live = LiveMetadata(Path(temporary), journal, dlq=True)
         try:
             initial, _ = live.start()
-            revision = live.propose(initial["leader"], {"SetPlacement": {
-                **partition_identity(), "owner": 3, "ownership_epoch": 7,
-                "lease_valid_for_ms": 200}})
-            committed = live.placement(revision)
+            # Baseline: the route serves under the committed authority, and the
+            # durable record count the refusal must leave untouched is fixed here.
+            serving = publish_q1(live.journal, live.broker, 0)
+            baseline_count = manifest_record_count(live.broker.wal)
+            _, baseline_records = read_history(live.broker, Q1_INCARNATION)
             live.journal.append(
-                "authority_observed", state="short_lease_committed",
-                evidence=committed, lease_ms=200,
-                expiry_observed=False, installation_observed=False)
-            raise ScenarioInvalid(
-                "200 ms placement committed in live metadata Raft, but the "
-                "non-DLQ Q1 route exposes neither an authority-install update "
-                "diagnostic nor an expired-state observation. main.rs logs "
-                "'Q1 DLQ authority' only for a configured DLQ; the ordinary "
-                "'Q1 authority' line is startup-only. No elapsed-time inference, "
-                "publication refusal, or no-record proof is claimed; unsupported "
-                "Q1 lease-expiry migration fallback not used.")
+                "authority_observed", state="serving_before_short_lease",
+                q1=serving, manifest_records=baseline_count,
+                record_count=len(baseline_records))
+
+            # Install a short lease. The source placement changes the installed
+            # authority, which starts a fresh clock; the DLQ placement then makes
+            # the committed-update watcher print the witness line carrying that
+            # lease. That line can only be printed at or after the source's fresh
+            # install, so it bounds the expiry from above.
+            leader = initial["leader"]
+            source_revision = live.propose(leader, {"SetPlacement": {
+                **partition_identity(), "owner": 3,
+                "ownership_epoch": Q1_OWNER_EPOCH,
+                "lease_valid_for_ms": F7B_LEASE_MS}})
+            live.placement(source_revision)
+            dlq_revision = live.propose(leader, {"SetPlacement": {
+                "tenant_id": Q1_TENANT, "topic_id": DLQ_TOPIC_ID,
+                "partition_id": DLQ_PARTITION_ID, "owner": 3,
+                "ownership_epoch": Q1_OWNER_EPOCH,
+                "lease_valid_for_ms": F7B_LEASE_MS}})
+            live.placement(dlq_revision)
+            suffix = f"lease_ms={F7B_LEASE_MS}"
+
+            def witness():
+                return next(
+                    (line for line in live.broker.lines
+                     if "Q1 DLQ authority:" in line
+                     and line.rstrip().endswith(suffix)), None)
+
+            with live.broker.condition:
+                found = live.broker.condition.wait_for(
+                    lambda: witness() is not None, timeout=30)
+            line = witness()
+            if not found or line is None:
+                raise AssertionError(
+                    "the DLQ-configured route never printed the short-lease "
+                    f"authority witness: {live.broker.lines}")
+            installed_ns = time.monotonic_ns()
+            live.journal.append(
+                "dlq_authority_installed", line=line,
+                observed_at_ns=installed_ns, lease_ms=F7B_LEASE_MS,
+                owner=3, ownership_epoch=Q1_OWNER_EPOCH,
+                witness_source="crates/server/src/main.rs committed-update watcher",
+                ordering="printed at or after the source authority's fresh install")
+
+            # Reach the post-expiry window. Elapsed time alone proves nothing: the
+            # broker's typed refusal below is the expiry evidence, and this wait
+            # only guarantees the attempt cannot land inside the lease.
+            lease_ns = F7B_LEASE_MS * 1_000_000
+            window_end_ns = installed_ns + lease_ns + F7B_MARGIN_MS * 1_000_000
+            while time.monotonic_ns() < window_end_ns:
+                time.sleep(0.005)
+            elapsed_ns = time.monotonic_ns() - installed_ns
+            assert elapsed_ns >= lease_ns, (elapsed_ns, lease_ns)
+            live.journal.append(
+                "authority_expiry_window", lease_ms=F7B_LEASE_MS,
+                margin_ms=F7B_MARGIN_MS, observed_at_ns=installed_ns,
+                elapsed_ns=elapsed_ns, lease_ns=lease_ns,
+                upper_bound="install happened at or before the witness line, so "
+                            "expiry is at or before observed_at + lease",
+                proof="the typed refusal below, not the elapsed time")
+
+            count_before = manifest_record_count(live.broker.wal)
+            _, records_before = read_history(live.broker, Q1_INCARNATION)
+            live.journal.append(
+                "manifest_records", phase="before_expired_attempt",
+                manifest_records=count_before,
+                record_count=len(records_before))
+            # Sequence 1: a fabricated success would append a second record and
+            # move the count, so neither a false ACK nor a real commit can pass.
+            command = q1_command(1, incarnation=Q1_INCARNATION,
+                                 owner=Q1_OWNER_EPOCH)
+            live.journal.append(
+                "publication_attempt", durable_class="q1-local",
+                phase="after_expiry", topic=Q1_TOPIC, producer=Q1_PRODUCER,
+                epoch=Q1_PRODUCER_EPOCH, sequence=1, message_id=101,
+                incarnation=Q1_INCARNATION, owner_epoch=Q1_OWNER_EPOCH,
+                partition=partition_identity(), command=command,
+                lease_ms=F7B_LEASE_MS, elapsed_ns=elapsed_ns)
+            observed = run_bounded(command, live.broker.environment(),
+                                   TIMEOUT_CLIENT)
+            count_after = manifest_record_count(live.broker.wal)
+            _, records_after = read_history(live.broker, Q1_INCARNATION)
+            output = observed["stdout"] + observed["stderr"]
+            live.journal.append(
+                "publication_refused", durable_class="q1-local",
+                phase="after_expiry", sequence=1, **observed,
+                manifest_records_before=count_before,
+                manifest_records_after=count_after,
+                record_count_before=len(records_before),
+                record_count_after=len(records_after),
+                refusal_code=next((code for code in
+                                   ("StaleEpoch", "FenceExpired", "Fenced")
+                                   if code in output), None))
+            assert not observed["timed_out"], observed
+            assert observed["returncode"] != 0, observed
+            assert "COMMITTED_LOCAL" not in observed["stdout"], observed
+            assert output.strip(), observed
+            assert count_after == count_before, (count_before, count_after)
+            assert len(records_after) == len(records_before), (
+                records_before, records_after)
+            live.journal.append(
+                "authority_observed", state="expired_fail_closed",
+                manifest_records=count_after, record_count=len(records_after),
+                durable_record_created=False, fabricated_success=False)
+            return (f"{line.strip()}; lease lapsed after "
+                    f"{elapsed_ns / 1_000_000:.1f} ms (>= {F7B_LEASE_MS} ms); "
+                    f"sequence 1 refused rc={observed['returncode']} with no "
+                    f"COMMITTED_LOCAL; manifest records "
+                    f"{count_before}->{count_after} and history "
+                    f"{len(records_before)}->{len(records_after)} records")
         finally:
             live.close()
 
