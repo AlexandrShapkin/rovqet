@@ -5,7 +5,7 @@
     "q2_blocked_timeouts": 1,
     "q2_quorum_acknowledged": 3,
     "records": 73,
-    "scenarios": 3,
+    "scenarios": 4,
     "violations": 0
   },
   "reasons": [],

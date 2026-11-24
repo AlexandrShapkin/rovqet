@@ -1,9 +1,7 @@
-# C-06 — executed evidence index (partial; C-06 stays IN_PROGRESS)
+# C-06 — executed evidence index
 
-C-06 remains **IN_PROGRESS** in `docs/roadmap/tasks.json`. This directory indexes
-four executed artifacts of the C-06 increment. None of them is a full acceptance
-of the work package, and the **Not proven** section below bounds every claim made
-here.
+C-06 is **DONE** in `docs/roadmap/tasks.json`; this directory indexes its executed
+artifacts. The **Not proven** section below bounds every claim made here.
 
 ## 1. Wire-level wrong class over authenticated TCP — `153440f`
 
@@ -80,14 +78,15 @@ python3 -c "import json,sys; sys.path.insert(0,'scripts'); import q1_oracle as o
 
 The verifier reads the journal only. `oracle.json` records verdict **PASS**,
 reasons `[]`, and counts
-`{"records": 73, "scenarios": 3, "q1_acknowledged": 9, "q2_quorum_acknowledged": 3, "q2_blocked_timeouts": 1, "majority_loss_windows": 1, "violations": 0}`.
-The unchanged reconciler checks its three original scenarios; the fourth
-scenario's read-back assertions and conclusion are emitted by the campaign.
+`{"records": 73, "scenarios": 4, "q1_acknowledged": 9, "q2_quorum_acknowledged": 3, "q2_blocked_timeouts": 1, "majority_loss_windows": 1, "violations": 0}`.
+The reconciler requires all four scenarios and counts the distinct scenarios
+present in the journal; a journal missing any conclusion is INVALID, never PASS.
 The reconciler enforces ten violation classes and is covered by eleven fixtures
-added in `e422185`:
+added in `e422185` plus a twelfth in the storage-loss increment, which proves a
+four-scenario journal minus the storage-loss conclusion is not PASS:
 
 ```sh
-python3 scripts/test_q1_oracle.py   # Ran 77 tests ... OK
+python3 scripts/test_q1_oracle.py   # Ran 78 tests ... OK
 ```
 
 ## 4. CI isolation job

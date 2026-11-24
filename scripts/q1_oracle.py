@@ -2633,6 +2633,7 @@ ISOLATION_SCENARIOS = (
     "q1-restart-preserves-incarnation-and-offsets",
     "q1-unrecoverable-history-fails-closed-and-fresh-incarnation-is-distinct",
     "q2-quorum-loss-blocks-quorum-ack-while-q1-commits",
+    "q2-history-survives-isolated-q1-storage-loss",
 )
 
 ISOLATION_LOCAL_ACK = "COMMITTED_LOCAL"
@@ -3113,7 +3114,11 @@ def reconcile_q1_q2_isolation(records: list[dict], *, require_conclusion: bool =
     for record in records:
         if record.get("event") == "conclusion":
             conclusions[record.get("scenario")] = record
-    counts["scenarios"] = sum(1 for name in ISOLATION_SCENARIOS if name in conclusions)
+    counts["scenarios"] = len({
+        record.get("scenario") for record in records
+        if record.get("event") in ("scenario_started", "conclusion")
+        and isinstance(record.get("scenario"), str)
+    })
     if require_conclusion:
         for name in ISOLATION_SCENARIOS:
             record = conclusions.get(name)

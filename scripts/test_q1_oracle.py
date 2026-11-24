@@ -803,7 +803,7 @@ class Q2RaftOracle(unittest.TestCase):
 
 # --- cross-class (Q1/Q2) isolation fixtures ------------------------------------
 
-ISO_S1, ISO_S2, ISO_S3 = oracle.ISOLATION_SCENARIOS
+ISO_S1, ISO_S2, ISO_S3, ISO_S4 = oracle.ISOLATION_SCENARIOS
 
 
 def isolation_record(event, scenario, **overrides) -> dict:
@@ -926,6 +926,33 @@ def isolation_journal() -> list[dict]:
         isolation_voter_state(ISO_S3, 2, 302, 2, "ee", producer=33),
         isolation_voter_state(ISO_S3, 3, 302, 2, "ee", producer=33),
         isolation_record("conclusion", ISO_S3, verdict="PASS", reason="quorum loss blocked"),
+        # Q2 history survives isolated Q1 storage loss.
+        isolation_record("broker_started", ISO_S4, node=1, bootstrap=True,
+                         q1_topic="durable", q2_topic="durable-q2"),
+        isolation_record("broker_started", ISO_S4, node=2, bootstrap=False),
+        isolation_record("broker_started", ISO_S4, node=3, bootstrap=False),
+        isolation_record("publication_committed", ISO_S4, durable_class=2, producer=41,
+                         epoch=0, sequence=0, message_id=400, offset=0,
+                         payload_digest="dc77", outcome="committed_quorum",
+                         partition={"partition_id": 0, "tenant_id": 1, "topic_id": 4}),
+        isolation_voter_state(ISO_S4, 1, 400, 0, "dc77", producer=41),
+        isolation_voter_state(ISO_S4, 2, 400, 0, "dc77", producer=41),
+        isolation_voter_state(ISO_S4, 3, 400, 0, "dc77", producer=41),
+        isolation_record("q1_storage_corrupted", ISO_S4,
+                         path="throwaway-q1/wal/segment-00000000000000000000.wal",
+                         operation="truncate to zero bytes", bytes_before=265, bytes_after=0),
+        isolation_record("q1_storage_corrupted", ISO_S4,
+                         path="throwaway-q1/wal/MANIFEST",
+                         operation="overwrite with invalid manifest bytes",
+                         bytes_before=118, bytes_after=20),
+        isolation_record("q2_history_read_back", ISO_S4, node=1, incarnation=42, offset=0,
+                         payload_digest="dc77"),
+        isolation_record("q2_history_read_back", ISO_S4, node=2, incarnation=42, offset=0,
+                         payload_digest="dc77"),
+        isolation_record("q2_history_read_back", ISO_S4, node=3, incarnation=42, offset=0,
+                         payload_digest="dc77"),
+        isolation_record("conclusion", ISO_S4, verdict="PASS",
+                         reason="Q2 history read back from all three persisted voter states"),
     ]
     return records
 
@@ -942,6 +969,7 @@ class IsolationOracle(unittest.TestCase):
     def test_well_formed_journal_passes(self):
         result = self.reconcile()
         self.assertEqual(result["verdict"], oracle.PASS, result)
+        self.assertEqual(result["counts"]["scenarios"], 4, result)
         self.assertEqual(result["counts"]["q2_blocked_timeouts"], 1, result)
         self.assertEqual(result["counts"]["majority_loss_windows"], 1, result)
 
@@ -1033,6 +1061,17 @@ class IsolationOracle(unittest.TestCase):
         result = self.reconcile(records)
         self.assertNotEqual(result["verdict"], oracle.PASS)
         self.assertIn("incomplete scenario set", " | ".join(result["reasons"]))
+
+    def test_storage_loss_scenario_is_required_for_pass(self):
+        """Four scenarios minus the Q2-history-survives-Q1-storage-loss conclusion."""
+        records = [r for r in isolation_journal()
+                   if not (r["event"] == "conclusion" and r["scenario"] == ISO_S4)]
+        result = self.reconcile(records)
+        self.assertEqual(result["verdict"], oracle.INVALID, result)
+        self.assertEqual(result["counts"]["scenarios"], 3, result)
+        reasons = " | ".join(result["reasons"])
+        self.assertIn("incomplete scenario set", reasons)
+        self.assertIn(ISO_S4, reasons)
 
 
 if __name__ == "__main__":
