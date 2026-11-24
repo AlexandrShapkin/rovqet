@@ -64,8 +64,9 @@ Claims require an existing committed publication in that incarnation.
 The broker must validate authorization and a previously delivered, live volatile
 lease before proposing an ACK. The replicated apply path checks committed
 offset/message identity, incarnation, epoch, current generation and exact retry
-token; committed message existence is not proof of delivery. The broker route,
-SDK and three-node consumer campaign are not implemented in this increment.
+token; committed message existence is not proof of delivery. The broker route and
+SDK now implement this boundary; the three-node consumer campaign and its oracle
+remain the next increment.
 
 Cursor is encoded as the **next incomplete logical offset**, initially zero:
 ACK 2 and ACK 1 leave it at zero, then ACK 0 advances it to three. Sparse state
@@ -74,15 +75,54 @@ at that bound. Group count is capped at 1024 per partition and saved outcomes
 at 65536 per group (prototype admission limits, not production sizing).
 No outcome is evicted: admission fails without mutation on exhaustion. Identical
 current-generation retries return the original saved result, including its
-original cursor, without mutation; conflicting tokens are rejected. Stale epoch
-or generation is rejected even on retry (saved-success after fencing is optional,
-not provided by this increment).
+original cursor, without mutation; conflicting tokens are rejected. The state
+machine rejects stale epoch/generation proposals. The broker's exact saved-token
+lookup can return prior success after fencing or restart without a new proposal.
 
 Group generation, cursor, sparse set and full committed ACK identity/result live
 inside `PartitionState`, covered by the existing atomic state persistence and
 checksummed snapshot build/install paths. Recovery validates group bounds,
 fence, contiguous-prefix/sparse consistency and saved message/token identity.
-No terminal disposition, SEEK, Q1 change or client-facing Q2 ACK route is added.
+No terminal disposition, SEEK or Q1 behavior change is added.
+
+### C-05 Q2 broker route and Rust SDK increment
+
+The existing FETCH/MESSAGE/FETCH_END and CONSUMER_ACK/CONSUMER_ACK_RESULT frames
+carry QOS=2 for the configured Q2 topic; no identifier or parallel protocol is
+introduced. FETCH_END now accepts either durable class (Q1 stays unchanged).
+Only the current shard leader grants new leases, from its applied committed
+snapshot. A claim (generation absent) commits a strictly newer partition-wide
+fence before delivery; a supplied generation must match. As required by the
+replicated claim contract, the partition must already contain a committed message.
+FETCH serves immediately; WAIT_MS is an upper bound, not a guaranteed long poll.
+The returned continuation is the next incomplete logical offset; HAS_MORE remains
+true for incomplete offsets, including currently leased records.
+
+Route-local state is bounded to 4096 leases, 128 inflight per group, 128 messages
+per batch and 4 MiB payload per batch. Grants expire after 30 seconds. Each
+process startup uses an OS-random lease namespace; attempts are process-local
+delivery counters and can reset on restart. A lease becomes delivered only after
+its MESSAGE socket write completes. Incomplete/cancelled batches do not authorize
+ACKs for unsent messages. Unacknowledged grants are redeliverable after expiry or
+restart; a new claim fences all earlier partition grants.
+
+For a new ACK mutation the route validates the live delivered lease, metadata
+epoch, generation, then committed offset/message identity, before proposing
+GroupAck. ACK_COMMITTED is emitted only after the applied GroupAcked result.
+Exact saved-token retries bypass the volatile lease check and do not propose
+again, including after restart or loss of quorum. Conflicting identities,
+expired/unknown leases, stale epochs and stale generations have distinct typed
+errors. A three-second proposal deadline or any uncertain consensus failure
+returns OUTCOME_UNKNOWN, never fabricated success or definite non-commitment.
+
+Rust `Client::fetch_q2_group(topic, GroupOptions)` reuses GroupBatch and validates
+the full batch, scope, tokens and mandatory terminal FETCH_END.
+`ack_q2_group(topic, &GroupMessage)` reuses AckOutcome and sends both the existing
+delivery token and message_id; the Q1 token/API remains unchanged.
+Q2 transport loss or timeout during ACK is GroupError::OutcomeUnknown.
+Missing FETCH_END discards the partial batch and closes the framing-uncertain
+SDK stream. In-process three-voter quorum-loss tests and real TCP/SDK tests cover
+this route, but are not the independent-process consumer campaign/oracle gate.
 
 | Event | Write allowed? | Cursor effect | Client result |
 |---|---|---|---|

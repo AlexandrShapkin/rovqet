@@ -1569,6 +1569,36 @@ impl SessionHandler for Dispatch {
             if self.draining.load(Ordering::Acquire) {
                 return SessionReply::Immediate(Err(ErrorCode::ServerDraining));
             }
+            if frame.field(f::QOS) == Some(&[2][..]) {
+                let Some(route) = self
+                    .q2
+                    .as_ref()
+                    .filter(|route| frame.field(f::TOPIC_NAME) == Some(route.topic().as_bytes()))
+                    .cloned()
+                else {
+                    return SessionReply::Immediate(Err(ErrorCode::UnsupportedGuarantee));
+                };
+                return match frame.frame_type {
+                    FrameType::Fetch => SessionReply::ReadOnly(Box::pin(async move {
+                        let batch = Arc::new(route.fetch_q2_group(principal, frame).await?);
+                        for reply in batch.iter() {
+                            rovqet_protocol::encode(reply, outbound.limits())
+                                .map_err(|_| ErrorCode::ResourceExhausted)?;
+                        }
+                        for reply in batch.iter() {
+                            outbound.send_read(reply, batch.clone()).await?;
+                            if reply.frame_type == FrameType::Message {
+                                route.delivered_q2(reply).await?;
+                            }
+                        }
+                        Ok(None)
+                    })),
+                    FrameType::ConsumerAck => SessionReply::Deferred(Box::pin(async move {
+                        route.ack_q2_group(principal, frame).await.map(Some)
+                    })),
+                    _ => SessionReply::Immediate(Err(ErrorCode::UnsupportedCapability)),
+                };
+            }
             let Some(route) = self.route.current() else {
                 return SessionReply::Immediate(Err(ErrorCode::UnsupportedGuarantee));
             };

@@ -1,7 +1,7 @@
-//! The opt-in Q2 publish route of the development broker.
+//! The opt-in Q2 publish and leased consumer route of the development broker.
 //!
 //! The route embeds one shard voter of `rovqet-consensus` behind the existing Publish
-//! frame: no new client protocol, no Q2 consumer/ACK work. It is configured with the
+//! and consumer frames: no second client protocol. It is configured with the
 //! `--q2-*` flags, exists only in cluster mode (the voter needs the cluster node
 //! identity and obeys the committed metadata authority) and is reached only for a
 //! QoS-2 publication whose topic is the configured Q2 topic. Every other frame keeps
@@ -20,7 +20,34 @@ use rovqet_consensus::{
 use rovqet_core::PartitionRef;
 use rovqet_protocol::{ErrorCode, Field, Frame, FrameType, registry::field as f};
 use rovqet_transport::SessionReply;
-use std::{collections::HashMap, io, net::SocketAddr, path::PathBuf};
+use std::{
+    collections::HashMap,
+    io,
+    net::SocketAddr,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
+
+const MAX_LEASES: usize = 4096;
+const MAX_GROUP_INFLIGHT: usize = 128;
+const MAX_GROUP_BATCH: usize = 128;
+const MAX_GROUP_BYTES: usize = 4 * 1024 * 1024;
+const LEASE_DURATION: Duration = Duration::from_secs(30);
+const PROPOSAL_TIMEOUT: Duration = Duration::from_secs(3);
+
+struct Lease {
+    command: ShardCommand,
+    expires: Instant,
+    delivered: bool,
+}
+
+/// Process-local leases are not consumer progress. Only the replicated ACK closes
+/// an offset. A fresh random namespace prevents restart from reusing old grants.
+struct Leases {
+    namespace: u64,
+    sequence: u64,
+    entries: HashMap<u128, Lease>,
+}
 
 /// The Q2 route configuration, parsed from the `--q2-*` flags.
 ///
@@ -164,6 +191,8 @@ pub fn shard_authority(authority: rovqet_durable::Authority) -> ShardAuthority {
 pub struct Route {
     node: ShardNode,
     options: Options,
+    node_id: u64,
+    leases: tokio::sync::Mutex<Leases>,
 }
 
 impl Route {
@@ -179,6 +208,10 @@ impl Route {
         if !options.peers.iter().any(|(id, _)| *id == node_id) {
             return Err(invalid("the Q2 peer list must include this node"));
         }
+        let mut namespace = [0u8; 8];
+        // Development broker is a Unix/loopback profile; fail closed if the OS
+        // random source is unavailable instead of minting predictable lease IDs.
+        std::io::Read::read_exact(&mut std::fs::File::open("/dev/urandom")?, &mut namespace)?;
         let node = ShardNode::start(ShardNodeConfig {
             id: node_id,
             cluster_id,
@@ -194,7 +227,16 @@ impl Route {
         })
         .await
         .map_err(|error| io::Error::other(format!("Q2 route startup failed: {error}")))?;
-        Ok(Self { node, options })
+        Ok(Self {
+            node,
+            options,
+            node_id,
+            leases: tokio::sync::Mutex::new(Leases {
+                namespace: u64::from_be_bytes(namespace),
+                sequence: 0,
+                entries: HashMap::new(),
+            }),
+        })
     }
     /// The configured Q2 topic this route serves.
     pub fn topic(&self) -> &str {
@@ -229,6 +271,398 @@ impl Route {
             .shutdown()
             .await
             .map_err(|error| io::Error::other(format!("Q2 shutdown: {error}")))
+    }
+    fn group_scope(&self, principal: u128, frame: &Frame) -> Result<u64, ErrorCode> {
+        if principal != 1
+            || frame
+                .field(f::PRINCIPAL_ID)
+                .is_some_and(|v| v != 1u64.to_be_bytes())
+            || number::<8>(frame, f::TENANT_ID)? != self.options.partition.tenant_id as u128
+            || number::<8>(frame, f::TOPIC_ID)? != self.options.partition.topic_id as u128
+            || frame
+                .field(f::TOPIC_NAME)
+                .is_some_and(|v| v != self.options.topic.as_bytes())
+        {
+            return Err(ErrorCode::PermissionDenied);
+        }
+        if frame.field(f::QOS) != Some(&[2][..]) {
+            return Err(ErrorCode::UnsupportedGuarantee);
+        }
+        if number::<4>(frame, f::PARTITION_ID)? != self.options.partition.partition_id as u128
+            || number::<16>(frame, f::LOG_INCAR)? != self.options.incarnation
+        {
+            return Err(ErrorCode::ReplayNotAvailable);
+        }
+        let group = number::<8>(frame, f::GROUP_ID)? as u64;
+        if group == 0 {
+            return Err(ErrorCode::BadFrame);
+        }
+        Ok(group)
+    }
+
+    fn group_partition<'a>(
+        &self,
+        state: &'a ShardState,
+    ) -> Result<&'a rovqet_consensus::sm::PartitionState, ErrorCode> {
+        state
+            .partition(&(&self.options.partition).into())
+            .filter(|p| p.incarnation == self.options.incarnation && !p.messages.is_empty())
+            .ok_or(ErrorCode::ReplayNotAvailable)
+    }
+
+    /// Installs the partition-wide fence through Raft, never a local counter.
+    /// Claims have no group selector in the replicated contract; every prior
+    /// group's generation is fenced. Concurrent claims may be rejected/retried.
+    pub async fn claim_q2_group(&self, requested_generation: u64) -> Result<u64, ErrorCode> {
+        let epoch = self.node.authority().ok_or(ErrorCode::StaleEpoch)?.epoch;
+        let command = ShardCommand::GroupClaim {
+            partition: self.options.partition,
+            incarnation: self.options.incarnation,
+            metadata_epoch: epoch,
+            requested_generation,
+        };
+        match tokio::time::timeout(PROPOSAL_TIMEOUT, self.node.propose(command)).await {
+            Ok(Ok(ShardCommandResponse::GroupClaimed { generation })) => Ok(generation),
+            Ok(Ok(ShardCommandResponse::Rejected { reason })) => Err(if reason.contains("epoch") {
+                ErrorCode::StaleEpoch
+            } else if reason.contains("incarnation") || reason.contains("partition") {
+                ErrorCode::ReplayNotAvailable
+            } else {
+                ErrorCode::StaleGeneration
+            }),
+            _ => Err(ErrorCode::OutcomeUnknown),
+        }
+    }
+
+    /// Builds a bounded batch from applied committed history only. New leases
+    /// start *undelivered*: the transport calls `delivered_q2` only after each
+    /// MESSAGE's socket write completes. A cancelled batch cannot authorize ACKs
+    /// for messages that never crossed that boundary.
+    pub async fn fetch_q2_group(
+        &self,
+        principal: u128,
+        frame: Frame,
+    ) -> Result<Vec<Frame>, ErrorCode> {
+        let group_id = self.group_scope(principal, &frame)?;
+        let max_messages = number::<4>(&frame, f::MAX_MESSAGES)? as usize;
+        let max_bytes = number::<4>(&frame, f::MAX_BYTES)? as usize;
+        let wait = frame
+            .field(f::WAIT_MS)
+            .map(uint::<4>)
+            .transpose()?
+            .unwrap_or(0);
+        if max_messages == 0
+            || max_messages > MAX_GROUP_BATCH
+            || !(128..=MAX_GROUP_BYTES).contains(&max_bytes)
+            || wait > 30_000
+        {
+            return Err(ErrorCode::ResourceExhausted);
+        }
+        // Fetch serves an immediate committed snapshot (WAIT_MS is an upper
+        // bound, not a promise to wait). Only the current leader grants leases.
+        if self.node.current_leader().await != Some(self.node_id) {
+            return Err(ErrorCode::OutcomeUnknown);
+        }
+        let mut leases = self.leases.lock().await;
+        leases
+            .entries
+            .retain(|_, lease| lease.expires > Instant::now());
+        let epoch = self.node.authority().ok_or(ErrorCode::StaleEpoch)?.epoch;
+        let generation = frame
+            .field(f::GROUP_GENERATION)
+            .map(uint::<8>)
+            .transpose()?
+            .unwrap_or(0) as u64;
+        let generation = if generation == 0 {
+            let state = self.node.applied_state();
+            let next = self
+                .group_partition(&state)?
+                .group_generation
+                .checked_add(1)
+                .ok_or(ErrorCode::ResourceExhausted)?;
+            self.claim_q2_group(next).await?
+        } else {
+            generation
+        };
+        let state = self.node.applied_state();
+        let partition = self.group_partition(&state)?;
+        if generation != partition.group_generation {
+            return Err(ErrorCode::StaleGeneration);
+        }
+        if epoch < partition.last_metadata_epoch
+            || self.node.authority().map(|a| a.epoch) != Some(epoch)
+        {
+            return Err(ErrorCode::StaleEpoch);
+        }
+        // Discard fenced grants; durable ACK outcomes remain in the state machine.
+        leases.entries.retain(|_, lease| {
+            matches!(&lease.command,
+            ShardCommand::GroupAck { generation: g, metadata_epoch, .. }
+                if *g == generation && *metadata_epoch == epoch)
+        });
+        let group = partition.groups.get(&group_id);
+        let cursor = group.map_or(0, |g| g.cursor);
+        let inflight = leases
+            .entries
+            .values()
+            .filter(|l| {
+                matches!(&l.command,
+            ShardCommand::GroupAck { group_id: g, .. } if *g == group_id)
+            })
+            .count();
+        let capacity = max_messages
+            .min(MAX_GROUP_INFLIGHT.saturating_sub(inflight))
+            .min(MAX_LEASES.saturating_sub(leases.entries.len()));
+        let mut frames = Vec::new();
+        let mut bytes = 0;
+        for message in &partition.messages {
+            if message.logical_offset < cursor
+                || group.is_some_and(|g| g.outcomes.contains_key(&message.logical_offset))
+                || leases.entries.values().any(|l| {
+                    matches!(&l.command,
+                    ShardCommand::GroupAck { group_id: g, offset, .. }
+                        if *g == group_id && *offset == message.logical_offset)
+                })
+            {
+                continue;
+            }
+            if frames.len() == capacity || bytes + message.payload.len() > max_bytes {
+                break;
+            }
+            leases.sequence = leases
+                .sequence
+                .checked_add(1)
+                .ok_or(ErrorCode::ResourceExhausted)?;
+            let attempt =
+                u32::try_from(leases.sequence).map_err(|_| ErrorCode::ResourceExhausted)?;
+            let lease_id = ((leases.namespace as u128) << 64) | leases.sequence as u128;
+            let command = ShardCommand::GroupAck {
+                partition: self.options.partition,
+                incarnation: self.options.incarnation,
+                metadata_epoch: epoch,
+                generation,
+                group_id,
+                offset: message.logical_offset,
+                message_id: message.message_id,
+                principal,
+                lease_id,
+                attempt,
+            };
+            let mut delivery = self.group_frame(
+                FrameType::Message,
+                frame.request_id,
+                group_id,
+                generation,
+                message.logical_offset,
+            );
+            delivery.fields.extend([
+                Field::required(f::MESSAGE_ID, message.message_id.to_be_bytes()),
+                Field::required(f::LEASE_ID, lease_id.to_be_bytes()),
+                Field::required(f::OWNERSHIP_EPOCH, epoch.to_be_bytes()),
+                Field::required(f::DELIVERY_ATTEMPT, attempt.to_be_bytes()),
+                Field::required(
+                    f::ACK_DEADLINE_MS,
+                    (LEASE_DURATION.as_millis() as u32).to_be_bytes(),
+                ),
+            ]);
+            delivery.payload = message.payload.clone();
+            bytes += delivery.payload.len();
+            frames.push(delivery);
+            leases.entries.insert(
+                lease_id,
+                Lease {
+                    command,
+                    expires: Instant::now() + LEASE_DURATION,
+                    delivered: false,
+                },
+            );
+        }
+        if frames.is_empty()
+            && partition.messages.iter().any(|m| {
+                m.logical_offset >= cursor
+                    && !group.is_some_and(|g| g.outcomes.contains_key(&m.logical_offset))
+                    && m.payload.len() > max_bytes
+            })
+        {
+            return Err(ErrorCode::ResourceExhausted);
+        }
+        let mut end = self.group_frame(
+            FrameType::FetchEnd,
+            frame.request_id,
+            group_id,
+            generation,
+            cursor,
+        );
+        end.fields.push(Field::required(
+            f::HAS_MORE,
+            [u8::from(cursor < partition.next_logical_offset)],
+        ));
+        frames.push(end);
+        Ok(frames)
+    }
+
+    pub(crate) async fn delivered_q2(&self, frame: &Frame) -> Result<(), ErrorCode> {
+        let lease_id = number::<16>(frame, f::LEASE_ID)?;
+        let mut leases = self.leases.lock().await;
+        let lease = leases
+            .entries
+            .get_mut(&lease_id)
+            .ok_or(ErrorCode::LeaseExpired)?;
+        if lease.expires <= Instant::now() {
+            return Err(ErrorCode::LeaseExpired);
+        }
+        lease.delivered = true;
+        Ok(())
+    }
+
+    fn group_frame(
+        &self,
+        kind: FrameType,
+        request_id: u64,
+        group: u64,
+        generation: u64,
+        offset: u64,
+    ) -> Frame {
+        let mut frame = Frame::new(kind, request_id);
+        frame.fields = vec![
+            Field::required(f::TENANT_ID, self.options.partition.tenant_id.to_be_bytes()),
+            Field::required(f::TOPIC_ID, self.options.partition.topic_id.to_be_bytes()),
+            Field::required(f::QOS, [2]),
+            Field::required(
+                f::PARTITION_ID,
+                self.options.partition.partition_id.to_be_bytes(),
+            ),
+            Field::required(f::LOG_INCAR, self.options.incarnation.to_be_bytes()),
+            Field::required(f::GROUP_ID, group.to_be_bytes()),
+            Field::required(f::GROUP_GENERATION, generation.to_be_bytes()),
+            Field::required(f::OFFSET, offset.to_be_bytes()),
+        ];
+        frame
+    }
+
+    /// Exact committed retries are read-only even after restart/lease expiry.
+    /// For every NEW mutation: delivered live lease -> epoch -> generation ->
+    /// committed message identity -> bounded Raft proposal -> applied outcome.
+    pub async fn ack_q2_group(&self, principal: u128, frame: Frame) -> Result<Frame, ErrorCode> {
+        let group_id = self.group_scope(principal, &frame)?;
+        let generation = number::<8>(&frame, f::GROUP_GENERATION)? as u64;
+        let lease_id = number::<16>(&frame, f::LEASE_ID)?;
+        let offset = number::<8>(&frame, f::OFFSET)? as u64;
+        let epoch = number::<8>(&frame, f::OWNERSHIP_EPOCH)? as u64;
+        let message_id = number::<16>(&frame, f::MESSAGE_ID)?;
+        let command = ShardCommand::GroupAck {
+            partition: self.options.partition,
+            incarnation: self.options.incarnation,
+            metadata_epoch: epoch,
+            generation,
+            group_id,
+            offset,
+            message_id,
+            principal,
+            lease_id,
+            attempt: number::<4>(&frame, f::DELIVERY_ATTEMPT)? as u32,
+        };
+        let mut leases = self.leases.lock().await;
+        let state = self.node.applied_state();
+        let partition = self.group_partition(&state)?;
+        let outcome = if let Some(saved) = partition
+            .groups
+            .get(&group_id)
+            .and_then(|g| g.outcomes.get(&offset))
+        {
+            if saved.command != command {
+                return Err(ErrorCode::SequenceConflict);
+            }
+            saved.outcome.clone()
+        } else {
+            let lease = leases
+                .entries
+                .get(&lease_id)
+                .filter(|l| l.delivered && l.expires > Instant::now())
+                .ok_or(ErrorCode::LeaseExpired)?;
+            // Check the live delivery's scope first. Epoch/generation and record
+            // identity then receive their distinct typed validation below.
+            match (&lease.command, &command) {
+                (
+                    ShardCommand::GroupAck {
+                        partition: p,
+                        incarnation: i,
+                        group_id: g,
+                        principal: who,
+                        lease_id: l,
+                        attempt: a,
+                        ..
+                    },
+                    ShardCommand::GroupAck {
+                        partition: p2,
+                        incarnation: i2,
+                        group_id: g2,
+                        principal: who2,
+                        lease_id: l2,
+                        attempt: a2,
+                        ..
+                    },
+                ) if p == p2 && i == i2 && g == g2 && who == who2 && l == l2 && a == a2 => {}
+                _ => return Err(ErrorCode::LeaseExpired),
+            }
+            if self.node.authority().map(|a| a.epoch) != Some(epoch)
+                || epoch < partition.last_metadata_epoch
+                || !matches!(&lease.command, ShardCommand::GroupAck { metadata_epoch, .. } if *metadata_epoch == epoch)
+            {
+                return Err(ErrorCode::StaleEpoch);
+            }
+            if generation == 0
+                || generation != partition.group_generation
+                || !matches!(&lease.command, ShardCommand::GroupAck { generation: leased_generation, .. } if *leased_generation == generation)
+            {
+                return Err(ErrorCode::StaleGeneration);
+            }
+            if lease.command != command
+                || !partition
+                    .messages
+                    .iter()
+                    .any(|m| m.logical_offset == offset && m.message_id == message_id)
+            {
+                return Err(ErrorCode::SequenceConflict);
+            }
+            match tokio::time::timeout(PROPOSAL_TIMEOUT, self.node.propose(command)).await {
+                Ok(Ok(result @ ShardCommandResponse::GroupAcked { .. })) => result,
+                // A concurrent external claim/epoch may reject after validation.
+                // Never infer success from proposal submission or a timeout.
+                Ok(Ok(ShardCommandResponse::Rejected { reason })) => {
+                    return Err(if reason.contains("generation") {
+                        ErrorCode::StaleGeneration
+                    } else if reason.contains("epoch") {
+                        ErrorCode::StaleEpoch
+                    } else if reason.contains("resource") {
+                        ErrorCode::ResourceExhausted
+                    } else {
+                        ErrorCode::SequenceConflict
+                    });
+                }
+                _ => return Err(ErrorCode::OutcomeUnknown),
+            }
+        };
+        leases.entries.remove(&lease_id);
+        match outcome {
+            ShardCommandResponse::GroupAcked {
+                generation, offset, ..
+            } => {
+                let mut reply = self.group_frame(
+                    FrameType::ConsumerAckResult,
+                    frame.request_id,
+                    group_id,
+                    generation,
+                    offset,
+                );
+                reply.fields.extend([
+                    Field::required(f::ACK_OUTCOME, [1]),
+                    Field::required(f::MESSAGE_ID, message_id.to_be_bytes()),
+                ]);
+                Ok(reply)
+            }
+            _ => Err(ErrorCode::OutcomeUnknown),
+        }
     }
     /// Admits one QoS-2 publication and proposes it to the shard group.
     ///
@@ -515,6 +949,418 @@ mod tests {
     fn replace(frame: &mut Frame, id: u64, value: impl Into<Vec<u8>>) {
         frame.fields.retain(|field| field.id != id);
         frame.fields.push(Field::required(id, value));
+    }
+
+    fn fetch_frame(generation: Option<u64>) -> Frame {
+        let mut frame = Frame::new(FrameType::Fetch, 2);
+        frame.fields = vec![
+            Field::required(f::TOPIC_NAME, b"durable-q2"),
+            Field::required(f::TENANT_ID, 1u64.to_be_bytes()),
+            Field::required(f::TOPIC_ID, 3u64.to_be_bytes()),
+            Field::required(f::QOS, [2]),
+            Field::required(f::PARTITION_ID, 0u32.to_be_bytes()),
+            Field::required(f::LOG_INCAR, 42u128.to_be_bytes()),
+            Field::required(f::GROUP_ID, 7u64.to_be_bytes()),
+            Field::required(f::OFFSET, 0u64.to_be_bytes()),
+            Field::required(f::MAX_MESSAGES, 8u32.to_be_bytes()),
+            Field::required(f::MAX_BYTES, 65536u32.to_be_bytes()),
+            Field::required(f::WAIT_MS, 0u32.to_be_bytes()),
+        ];
+        if let Some(generation) = generation {
+            replace(&mut frame, f::GROUP_GENERATION, generation.to_be_bytes());
+        }
+        frame
+    }
+
+    fn ack_frame(delivery: &Frame) -> Frame {
+        let mut frame = delivery.clone();
+        frame.frame_type = FrameType::ConsumerAck;
+        frame.request_id = 3;
+        frame.payload.clear();
+        replace(&mut frame, f::TOPIC_NAME, b"durable-q2");
+        frame
+    }
+
+    async fn seed_group(route: &Route) {
+        wait_for_leader(route).await;
+        for sequence in 0..2u64 {
+            let mut frame = publish_frame(format!("event-{sequence}").into_bytes());
+            replace(&mut frame, f::PRODUCER_SEQUENCE, sequence.to_be_bytes());
+            replace(
+                &mut frame,
+                f::MESSAGE_ID,
+                (100 + sequence as u128).to_be_bytes(),
+            );
+            publish_until_certain(route, frame).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn q2_groups_require_delivery_validate_tokens_and_resolve_applied_acks() {
+        let (route, directory) = open_route().await;
+        seed_group(&route).await;
+        let batch = route.fetch_q2_group(1, fetch_frame(None)).await.unwrap();
+        assert_eq!(batch.len(), 3);
+        assert_eq!(batch[0].payload, b"event-0");
+        assert_eq!(batch[1].payload, b"event-1");
+        assert_eq!(batch[2].frame_type, FrameType::FetchEnd);
+        assert_eq!(number::<8>(&batch[2], f::OFFSET).unwrap(), 0);
+        for message in &batch[..2] {
+            let state = route.applied_state();
+            let partition = route.group_partition(&state).unwrap();
+            assert!(partition.messages.iter().any(|m| m.logical_offset as u128
+                == number::<8>(message, f::OFFSET).unwrap()
+                && m.message_id == number::<16>(message, f::MESSAGE_ID).unwrap()));
+        }
+        let ack = ack_frame(&batch[0]);
+        // Constructing a batch is not evidence of socket delivery.
+        assert_eq!(
+            route.ack_q2_group(1, ack.clone()).await.unwrap_err(),
+            ErrorCode::LeaseExpired
+        );
+        route.delivered_q2(&batch[0]).await.unwrap();
+        route.delivered_q2(&batch[1]).await.unwrap();
+        for (field, value, expected) in [
+            (
+                f::LEASE_ID,
+                999u128.to_be_bytes().to_vec(),
+                ErrorCode::LeaseExpired,
+            ),
+            (
+                f::OWNERSHIP_EPOCH,
+                4u64.to_be_bytes().to_vec(),
+                ErrorCode::StaleEpoch,
+            ),
+            (
+                f::GROUP_GENERATION,
+                0u64.to_be_bytes().to_vec(),
+                ErrorCode::StaleGeneration,
+            ),
+            (
+                f::OFFSET,
+                999u64.to_be_bytes().to_vec(),
+                ErrorCode::SequenceConflict,
+            ),
+            (
+                f::MESSAGE_ID,
+                999u128.to_be_bytes().to_vec(),
+                ErrorCode::SequenceConflict,
+            ),
+            (
+                f::TOPIC_ID,
+                99u64.to_be_bytes().to_vec(),
+                ErrorCode::PermissionDenied,
+            ),
+        ] {
+            let mut invalid = ack.clone();
+            replace(&mut invalid, field, value);
+            let before = route.applied_state();
+            assert_eq!(route.ack_q2_group(1, invalid).await.unwrap_err(), expected);
+            assert_eq!(route.applied_state().revision, before.revision);
+            assert_eq!(route.applied_state().last_applied, before.last_applied);
+        }
+        let reply = route.ack_q2_group(1, ack.clone()).await.unwrap();
+        assert_eq!(reply.field(f::ACK_OUTCOME), Some(&[1][..]));
+        let before = route.applied_state();
+        let group = &route.group_partition(&before).unwrap().groups[&7];
+        assert_eq!(group.cursor, 1, "ACK_COMMITTED follows actual application");
+        assert_eq!(group.outcomes.len(), 1);
+        let retry = route.ack_q2_group(1, ack.clone()).await.unwrap();
+        assert_eq!(retry, reply);
+        assert_eq!(
+            route.applied_state().last_applied,
+            before.last_applied,
+            "no second proposal"
+        );
+        assert_eq!(route.applied_state().revision, before.revision);
+        let mut conflict = ack;
+        replace(&mut conflict, f::MESSAGE_ID, 999u128.to_be_bytes());
+        assert_eq!(
+            route.ack_q2_group(1, conflict).await.unwrap_err(),
+            ErrorCode::SequenceConflict
+        );
+        assert_eq!(route.claim_q2_group(2).await.unwrap(), 2);
+        assert_eq!(
+            route
+                .ack_q2_group(1, ack_frame(&batch[1]))
+                .await
+                .unwrap_err(),
+            ErrorCode::StaleGeneration
+        );
+        assert_eq!(
+            route.claim_q2_group(2).await.unwrap_err(),
+            ErrorCode::StaleGeneration
+        );
+        route.shutdown().await.unwrap();
+        drop(directory);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn q2_route_restart_redelivers_unacknowledged_records_but_preserves_saved_success() {
+        let (route, directory) = open_route().await;
+        seed_group(&route).await;
+        let batch = route.fetch_q2_group(1, fetch_frame(None)).await.unwrap();
+        for message in &batch[..2] {
+            route.delivered_q2(message).await.unwrap();
+        }
+        let ack = ack_frame(&batch[0]);
+        let saved = route.ack_q2_group(1, ack.clone()).await.unwrap();
+        let options = route.options.clone();
+        route.shutdown().await.unwrap();
+        let restarted = Route::open(options, 1, 7).await.unwrap();
+        restarted.install_authority(Some(ShardAuthority { owner: 1, epoch: 5 }));
+        wait_for_leader(&restarted).await;
+        let before = restarted.applied_state();
+        assert_eq!(restarted.ack_q2_group(1, ack).await.unwrap(), saved);
+        assert_eq!(restarted.applied_state().revision, before.revision);
+        assert_eq!(restarted.applied_state().last_applied, before.last_applied);
+        assert_eq!(
+            restarted
+                .ack_q2_group(1, ack_frame(&batch[1]))
+                .await
+                .unwrap_err(),
+            ErrorCode::LeaseExpired
+        );
+        let redelivery = restarted
+            .fetch_q2_group(1, fetch_frame(Some(1)))
+            .await
+            .unwrap();
+        assert_eq!(redelivery.len(), 2);
+        assert_eq!(redelivery[0].payload, b"event-1");
+        assert_ne!(
+            redelivery[0].field(f::LEASE_ID),
+            batch[1].field(f::LEASE_ID)
+        );
+        assert_eq!(redelivery[1].frame_type, FrameType::FetchEnd);
+        assert_eq!(number::<8>(&redelivery[1], f::OFFSET).unwrap(), 1);
+        restarted.shutdown().await.unwrap();
+        drop(directory);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn q2_leases_are_bounded_expire_and_do_not_complete_offsets() {
+        let (route, directory) = open_route().await;
+        seed_group(&route).await;
+        let mut excessive = fetch_frame(None);
+        replace(
+            &mut excessive,
+            f::MAX_MESSAGES,
+            (MAX_GROUP_BATCH as u32 + 1).to_be_bytes(),
+        );
+        let before = route.applied_state();
+        assert_eq!(
+            route.fetch_q2_group(1, excessive).await.unwrap_err(),
+            ErrorCode::ResourceExhausted
+        );
+        assert_eq!(route.applied_state().revision, before.revision);
+        assert!(route.leases.lock().await.entries.is_empty());
+        let mut single = fetch_frame(None);
+        replace(&mut single, f::MAX_MESSAGES, 1u32.to_be_bytes());
+        let batch = route.fetch_q2_group(1, single).await.unwrap();
+        assert_eq!(batch.len(), 2);
+        route.delivered_q2(&batch[0]).await.unwrap();
+        let lease_id = number::<16>(&batch[0], f::LEASE_ID).unwrap();
+        route
+            .leases
+            .lock()
+            .await
+            .entries
+            .get_mut(&lease_id)
+            .unwrap()
+            .expires = Instant::now() - Duration::from_secs(1);
+        assert_eq!(
+            route
+                .ack_q2_group(1, ack_frame(&batch[0]))
+                .await
+                .unwrap_err(),
+            ErrorCode::LeaseExpired
+        );
+        let redelivery = route.fetch_q2_group(1, fetch_frame(Some(1))).await.unwrap();
+        assert_eq!(
+            redelivery[0].field(f::OFFSET),
+            Some(0u64.to_be_bytes().as_slice())
+        );
+        assert_ne!(
+            redelivery[0].field(f::LEASE_ID),
+            batch[0].field(f::LEASE_ID)
+        );
+        assert_eq!(
+            number::<8>(redelivery.last().unwrap(), f::OFFSET).unwrap(),
+            0
+        );
+        route.install_authority(Some(ShardAuthority { owner: 1, epoch: 6 }));
+        route.delivered_q2(&redelivery[0]).await.unwrap();
+        assert_eq!(
+            route
+                .ack_q2_group(1, ack_frame(&redelivery[0]))
+                .await
+                .unwrap_err(),
+            ErrorCode::StaleEpoch
+        );
+        route.shutdown().await.unwrap();
+        drop(directory);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn q2_ack_without_a_majority_is_uncertain_not_committed() {
+        let directories: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        let peers: Vec<(u64, SocketAddr)> = (1..=3)
+            .map(|id| (id, format!("127.0.0.1:{}", free_port()).parse().unwrap()))
+            .collect();
+        let mut routes = Vec::new();
+        for index in 0..3 {
+            let options = Options {
+                data_directory: directories[index].path().to_path_buf(),
+                topic: "durable-q2".into(),
+                partition: PartitionRef {
+                    tenant_id: 1,
+                    topic_id: 3,
+                    partition_id: 0,
+                },
+                incarnation: 42,
+                shard_id: 9,
+                listen: peers[index].1,
+                peers: peers.clone(),
+                bootstrap: index == 0,
+            };
+            let route = Route::open(options, index as u64 + 1, 7).await.unwrap();
+            route.install_authority(Some(ShardAuthority { owner: 1, epoch: 5 }));
+            routes.push(Some(route));
+        }
+        wait_for_leader(routes[0].as_ref().unwrap()).await;
+        let leader_id = routes[0].as_ref().unwrap().leader().await.unwrap();
+        let leader = leader_id as usize - 1;
+        let route = routes[leader].as_ref().unwrap();
+        seed_group(route).await;
+        let batch = route.fetch_q2_group(1, fetch_frame(None)).await.unwrap();
+        route.delivered_q2(&batch[0]).await.unwrap();
+        route.delivered_q2(&batch[1]).await.unwrap();
+        route.ack_q2_group(1, ack_frame(&batch[0])).await.unwrap();
+        for (index, slot) in routes.iter_mut().enumerate() {
+            if index != leader {
+                slot.take().unwrap().shutdown().await.unwrap();
+            }
+        }
+        let route = routes[leader].as_ref().unwrap();
+        let before = route.applied_state();
+        let result = route.ack_q2_group(1, ack_frame(&batch[1])).await;
+        assert_eq!(result.unwrap_err(), ErrorCode::OutcomeUnknown);
+        let after = route.applied_state();
+        assert_eq!(after.revision, before.revision);
+        assert!(
+            !route.group_partition(&after).unwrap().groups[&7]
+                .outcomes
+                .contains_key(&1)
+        );
+        // The earlier committed ACK remains a read-only lookup without quorum.
+        assert_eq!(
+            route
+                .ack_q2_group(1, ack_frame(&batch[0]))
+                .await
+                .unwrap()
+                .field(f::ACK_OUTCOME),
+            Some(&[1][..])
+        );
+        routes[leader].take().unwrap().shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn q2_group_frames_dispatch_over_tcp_through_the_public_sdk() {
+        use rovqet_sdk::{AckOutcome, Client, ClientConfig, GroupError, GroupOptions};
+        use std::sync::Arc;
+        let (route, directory) = open_route().await;
+        seed_group(&route).await;
+        let route = Arc::new(route);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let handler = crate::q1::Dispatch::new(
+            crate::development_broker(1024),
+            crate::q1::RouteSlot::new(None),
+        )
+        .with_q2(Some(route.clone()));
+        let (stop, closed) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(rovqet_transport::serve(
+            listener,
+            Default::default(),
+            Arc::new(handler),
+            async {
+                let _ = closed.await;
+            },
+        ));
+        let mut client = Client::connect(ClientConfig {
+            endpoint,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let options = |generation| GroupOptions {
+            partition: route.partition(),
+            incarnation: route.incarnation(),
+            group_id: 7,
+            generation,
+            max_messages: 8,
+            max_bytes: 65536,
+            wait: Duration::ZERO,
+        };
+        let batch = client
+            .fetch_q2_group(route.topic(), options(None))
+            .await
+            .unwrap();
+        assert_eq!(batch.messages.len(), 2);
+        assert_eq!(batch.messages[0].message_id, 100);
+        assert_eq!(batch.messages[1].payload, b"event-1");
+        assert_eq!(batch.next.sequence, 0);
+        assert!(batch.has_more);
+        let committed = client
+            .ack_q2_group(route.topic(), &batch.messages[1])
+            .await
+            .unwrap();
+        assert!(matches!(committed, AckOutcome::Committed { .. }));
+        let before = route.applied_state();
+        assert_eq!(route.group_partition(&before).unwrap().groups[&7].cursor, 0);
+        assert_eq!(
+            client
+                .ack_q2_group(route.topic(), &batch.messages[1])
+                .await
+                .unwrap(),
+            committed
+        );
+        assert_eq!(route.applied_state().last_applied, before.last_applied);
+        client
+            .ack_q2_group(route.topic(), &batch.messages[0])
+            .await
+            .unwrap();
+        let end = client
+            .fetch_q2_group(route.topic(), options(Some(batch.generation)))
+            .await
+            .unwrap();
+        assert!(end.messages.is_empty());
+        assert_eq!(end.next.sequence, 2);
+        assert!(end.end_of_current_history);
+        // An explicit new claim fences all earlier new mutations.
+        let next = client
+            .fetch_q2_group(route.topic(), options(None))
+            .await
+            .unwrap();
+        assert_eq!(next.generation, 2);
+        assert!(matches!(
+            client.fetch_q2_group(route.topic(), options(Some(1))).await,
+            Err(GroupError::StaleGeneration)
+        ));
+        // A rejected fetch closes the SDK's framing-uncertain batch stream.
+        assert!(matches!(
+            client.close().await,
+            Err(rovqet_sdk::ClientError::Closed)
+        ));
+        let _ = stop.send(());
+        task.await.unwrap().unwrap();
+        Arc::try_unwrap(route)
+            .ok()
+            .expect("sessions released route")
+            .shutdown()
+            .await
+            .unwrap();
+        drop(directory);
     }
 
     /// Publishes with a bounded retry: an uncertain proposal is never a definite

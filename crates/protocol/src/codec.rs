@@ -352,7 +352,7 @@ fn validate_fields(frame: &Frame) -> Result<(), CodecError> {
         FrameType::FetchEnd => {
             topic()?;
             require(f::QOS)?;
-            if frame.field(f::QOS) != Some(&[1][..]) {
+            if !matches!(frame.field(f::QOS), Some([1] | [2])) {
                 return Err(CodecError::InvalidFieldValue(f::QOS));
             }
             require(f::PARTITION_ID)?;

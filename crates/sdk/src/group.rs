@@ -79,6 +79,10 @@ pub enum GroupError {
     ResourceExhausted,
     ReplayNotAvailable,
     StorageUnavailable,
+    /// The Q2 proposal may have committed; retry the exact original delivery.
+    OutcomeUnknown,
+    StaleEpoch,
+    SequenceConflict,
     Unsupported,
     Remote(ClientError),
 }
@@ -119,6 +123,26 @@ fn map_client(error: ClientError) -> GroupError {
         _ => GroupError::Remote(error),
     }
 }
+fn map_q2_client(error: ClientError) -> GroupError {
+    match &error {
+        ClientError::Remote {
+            code: Some(ErrorCode::OutcomeUnknown | ErrorCode::NoQuorum),
+            ..
+        }
+        | ClientError::Timeout
+        | ClientError::Closed
+        | ClientError::Io(_) => GroupError::OutcomeUnknown,
+        ClientError::Remote {
+            code: Some(ErrorCode::StaleEpoch),
+            ..
+        } => GroupError::StaleEpoch,
+        ClientError::Remote {
+            code: Some(ErrorCode::SequenceConflict),
+            ..
+        } => GroupError::SequenceConflict,
+        _ => map_client(error),
+    }
+}
 fn scope_matches(partition: &PartitionRef, incarnation: u128, frame: &Frame) -> bool {
     int_u32(frame, f::PARTITION_ID).ok() == Some(partition.partition_id)
         && int_u128(frame, f::LOG_INCAR).ok() == Some(incarnation)
@@ -157,6 +181,28 @@ impl Client {
         topic: &str,
         options: GroupOptions,
     ) -> Result<GroupBatch, GroupError> {
+        self.fetch_group(topic, options, 1).await
+    }
+
+    /// Q2 uses the same leased-delivery protocol and terminal FETCH_END contract.
+    /// Claiming fences all groups on this Q2 partition (not just this group ID).
+    pub async fn fetch_q2_group(
+        &mut self,
+        topic: &str,
+        options: GroupOptions,
+    ) -> Result<GroupBatch, GroupError> {
+        if options.max_messages > 128 || options.generation == Some(0) {
+            return Err(GroupError::InvalidRequest);
+        }
+        self.fetch_group(topic, options, 2).await
+    }
+
+    async fn fetch_group(
+        &mut self,
+        topic: &str,
+        options: GroupOptions,
+        qos: u8,
+    ) -> Result<GroupBatch, GroupError> {
         if self.stream.is_none() {
             return Err(GroupError::Closed);
         }
@@ -182,7 +228,7 @@ impl Client {
             Field::required(f::TOPIC_NAME, topic.as_bytes()),
             Field::required(f::TENANT_ID, options.partition.tenant_id.to_be_bytes()),
             Field::required(f::TOPIC_ID, options.partition.topic_id.to_be_bytes()),
-            Field::required(f::QOS, [1]),
+            Field::required(f::QOS, [qos]),
             Field::required(
                 f::PARTITION_ID,
                 options.partition.partition_id.to_be_bytes(),
@@ -249,22 +295,37 @@ impl Client {
                     return Err(GroupError::InvalidResponse("request correlation"));
                 }
                 if frame.frame_type == FrameType::Error {
-                    return Err(map_client(
-                        remote(&frame).unwrap_or(ClientError::Protocol("invalid error frame")),
-                    ));
+                    let error =
+                        remote(&frame).unwrap_or(ClientError::Protocol("invalid error frame"));
+                    return Err(if qos == 2 {
+                        map_q2_client(error)
+                    } else {
+                        map_client(error)
+                    });
                 }
                 match frame.frame_type {
                     FrameType::Message => {
                         if !scope_matches(&options.partition, incarnation, &frame) {
                             return Err(GroupError::InvalidResponse("scope mismatch"));
                         }
-                        if frame.field(f::QOS) != Some(&[1][..]) {
+                        if qos == 2
+                            && (frame.field(f::TENANT_ID)
+                                != Some(options.partition.tenant_id.to_be_bytes().as_slice())
+                                || frame.field(f::TOPIC_ID)
+                                    != Some(options.partition.topic_id.to_be_bytes().as_slice()))
+                        {
+                            return Err(GroupError::InvalidResponse("missing Q2 scope"));
+                        }
+                        if frame.field(f::QOS) != Some(&[qos][..]) {
                             return Err(GroupError::InvalidResponse("not a durable delivery"));
                         }
                         if int_u64(&frame, f::GROUP_ID)? != options.group_id {
                             return Err(GroupError::InvalidResponse("group mismatch"));
                         }
                         let message_generation = int_u64(&frame, f::GROUP_GENERATION)? as u64;
+                        if qos == 2 && message_generation == 0 {
+                            return Err(GroupError::InvalidResponse("zero generation"));
+                        }
                         if *generation.get_or_insert(message_generation) != message_generation {
                             return Err(GroupError::InvalidResponse(
                                 "generation changed mid-batch",
@@ -299,6 +360,18 @@ impl Client {
                         let message_id = int_u128(&frame, f::MESSAGE_ID)?;
                         let ownership_epoch = int_u64(&frame, f::OWNERSHIP_EPOCH)?;
                         let ack_deadline_ms = int_u32(&frame, f::ACK_DEADLINE_MS)?;
+                        if qos == 2
+                            && (ownership_epoch == 0
+                                || ack_deadline_ms == 0
+                                || messages.iter().any(|m| {
+                                    m.token.lease_id == lease_id
+                                        || m.token.ownership_epoch != ownership_epoch
+                                }))
+                        {
+                            return Err(GroupError::InvalidResponse(
+                                "invalid or repeated delivery token",
+                            ));
+                        }
                         messages.push(GroupMessage {
                             token: DeliveryToken {
                                 partition: PartitionRef {
@@ -322,6 +395,15 @@ impl Client {
                         });
                     }
                     FrameType::FetchEnd => {
+                        if qos == 2
+                            && (frame.field(f::QOS) != Some(&[2][..])
+                                || frame.field(f::TENANT_ID)
+                                    != Some(options.partition.tenant_id.to_be_bytes().as_slice())
+                                || frame.field(f::TOPIC_ID)
+                                    != Some(options.partition.topic_id.to_be_bytes().as_slice()))
+                        {
+                            return Err(GroupError::InvalidResponse("invalid Q2 end scope"));
+                        }
                         if !scope_matches(&options.partition, incarnation, &frame) {
                             return Err(GroupError::InvalidResponse("end scope mismatch"));
                         }
@@ -329,6 +411,9 @@ impl Client {
                             return Err(GroupError::InvalidResponse("end group mismatch"));
                         }
                         let end_generation = int_u64(&frame, f::GROUP_GENERATION)? as u64;
+                        if qos == 2 && end_generation == 0 {
+                            return Err(GroupError::InvalidResponse("zero end generation"));
+                        }
                         if generation.is_some_and(|value| value != end_generation) {
                             return Err(GroupError::InvalidResponse("end generation mismatch"));
                         }
@@ -385,6 +470,30 @@ impl Client {
         topic: &str,
         token: &DeliveryToken,
     ) -> Result<AckOutcome, GroupError> {
+        self.ack_group(topic, token, None).await
+    }
+
+    /// Acknowledge the exact Q2 delivery, including its message identity. A
+    /// timeout/connection loss is OutcomeUnknown, never definite non-commitment.
+    /// Keep this message unchanged for saved-outcome lookup after reconnect.
+    pub async fn ack_q2_group(
+        &mut self,
+        topic: &str,
+        message: &GroupMessage,
+    ) -> Result<AckOutcome, GroupError> {
+        if message.token.generation == 0 || topic.is_empty() || topic.len() > 255 {
+            return Err(GroupError::InvalidRequest);
+        }
+        self.ack_group(topic, &message.token, Some(message.message_id))
+            .await
+    }
+
+    async fn ack_group(
+        &mut self,
+        topic: &str,
+        token: &DeliveryToken,
+        message_id: Option<u128>,
+    ) -> Result<AckOutcome, GroupError> {
         if token.group_id == 0
             || token.lease_id == 0
             || token.attempt == 0
@@ -410,17 +519,43 @@ impl Client {
             Field::required(f::OFFSET, token.offset.sequence.to_be_bytes()),
             Field::required(f::DELIVERY_ATTEMPT, token.attempt.to_be_bytes()),
         ];
+        if let Some(message_id) = message_id {
+            frame.fields.extend([
+                Field::required(f::QOS, [2]),
+                Field::required(f::MESSAGE_ID, message_id.to_be_bytes()),
+            ]);
+        }
         rovqet_protocol::encode(&frame, self.limits).map_err(|_| GroupError::InvalidRequest)?;
         let request_id = frame.request_id;
         let response = self
             .exchange(frame, FrameType::ConsumerAckResult)
             .await
-            .map_err(|error| match error {
-                ClientError::Timeout | ClientError::Closed | ClientError::Io(_) => {
-                    GroupError::Incomplete
+            .map_err(|error| {
+                if message_id.is_some() {
+                    map_q2_client(error)
+                } else {
+                    match error {
+                        ClientError::Timeout | ClientError::Closed | ClientError::Io(_) => {
+                            GroupError::Incomplete
+                        }
+                        other => map_client(other),
+                    }
                 }
-                other => map_client(other),
             })?;
+        if let Some(message_id) = message_id {
+            if !scope_matches(&token.partition, incarnation, &response)
+                || response.field(f::TENANT_ID)
+                    != Some(token.partition.tenant_id.to_be_bytes().as_slice())
+                || response.field(f::TOPIC_ID)
+                    != Some(token.partition.topic_id.to_be_bytes().as_slice())
+                || response.field(f::QOS) != Some(&[2][..])
+                || int_u128(&response, f::MESSAGE_ID)? != message_id
+            {
+                return Err(GroupError::InvalidResponse(
+                    "Q2 ACK scope or message identity",
+                ));
+            }
+        }
         if response.request_id != request_id {
             return Err(GroupError::InvalidResponse("ack correlation"));
         }
@@ -527,5 +662,178 @@ impl Client {
             },
             _ => return Err(GroupError::InvalidResponse("invalid nack outcome")),
         })
+    }
+}
+
+#[cfg(test)]
+mod q2_tests {
+    use super::*;
+
+    async fn pair() -> (Client, TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let stream = TcpStream::connect(endpoint).await.unwrap();
+        let (peer, _) = listener.accept().await.unwrap();
+        let client = Client {
+            config: ClientConfig {
+                endpoint,
+                ..Default::default()
+            },
+            stream: Some(stream),
+            limits: Limits::default(),
+            request_id: 0,
+            message_id: 0,
+            heartbeat: Duration::from_secs(15),
+            pending: VecDeque::new(),
+            pending_bytes: 0,
+            subscriptions: BTreeMap::new(),
+            owed_credit: BTreeMap::new(),
+        };
+        (client, peer)
+    }
+
+    fn options() -> GroupOptions {
+        GroupOptions {
+            partition: PartitionRef {
+                tenant_id: 1,
+                topic_id: 3,
+                partition_id: 0,
+            },
+            incarnation: 42,
+            group_id: 7,
+            generation: Some(1),
+            max_messages: 8,
+            max_bytes: 65536,
+            wait: Duration::ZERO,
+        }
+    }
+
+    fn delivery(kind: FrameType, id: u64) -> Frame {
+        let mut frame = Frame::new(kind, id);
+        frame.fields = vec![
+            Field::required(f::TENANT_ID, 1u64.to_be_bytes()),
+            Field::required(f::TOPIC_ID, 3u64.to_be_bytes()),
+            Field::required(f::QOS, [2]),
+            Field::required(f::PARTITION_ID, 0u32.to_be_bytes()),
+            Field::required(f::LOG_INCAR, 42u128.to_be_bytes()),
+            Field::required(f::GROUP_ID, 7u64.to_be_bytes()),
+            Field::required(f::GROUP_GENERATION, 1u64.to_be_bytes()),
+            Field::required(f::OFFSET, 0u64.to_be_bytes()),
+        ];
+        if kind == FrameType::Message {
+            frame.fields.extend([
+                Field::required(f::MESSAGE_ID, 100u128.to_be_bytes()),
+                Field::required(f::LEASE_ID, 123u128.to_be_bytes()),
+                Field::required(f::OWNERSHIP_EPOCH, 5u64.to_be_bytes()),
+                Field::required(f::DELIVERY_ATTEMPT, 1u32.to_be_bytes()),
+                Field::required(f::ACK_DEADLINE_MS, 30000u32.to_be_bytes()),
+            ]);
+            frame.payload = b"committed".to_vec();
+        } else {
+            frame.fields.push(Field::required(f::HAS_MORE, [1]));
+        }
+        frame
+    }
+
+    #[tokio::test]
+    async fn q2_batch_without_fetch_end_is_incomplete_not_partial_success() {
+        let (mut client, mut peer) = pair().await;
+        let task = tokio::spawn(async move {
+            let request = read_frame(&mut peer, Limits::default())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(request.field(f::QOS), Some(&[2][..]));
+            write_frame(
+                &mut peer,
+                &delivery(FrameType::Message, request.request_id),
+                Limits::default(),
+            )
+            .await
+            .unwrap();
+            // EOF deliberately precedes FETCH_END.
+        });
+        assert!(matches!(
+            client.fetch_q2_group("durable-q2", options()).await,
+            Err(GroupError::Incomplete)
+        ));
+        assert!(client.stream.is_none());
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn q2_batch_validates_terminal_scope_and_accepts_complete_delivery() {
+        for valid in [false, true] {
+            let (mut client, mut peer) = pair().await;
+            let task = tokio::spawn(async move {
+                let request = read_frame(&mut peer, Limits::default())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                write_frame(
+                    &mut peer,
+                    &delivery(FrameType::Message, request.request_id),
+                    Limits::default(),
+                )
+                .await
+                .unwrap();
+                let mut end = delivery(FrameType::FetchEnd, request.request_id);
+                if !valid {
+                    end.fields.retain(|field| field.id != f::TOPIC_ID);
+                    end.fields
+                        .push(Field::required(f::TOPIC_ID, 99u64.to_be_bytes()));
+                }
+                write_frame(&mut peer, &end, Limits::default())
+                    .await
+                    .unwrap();
+            });
+            let batch = client.fetch_q2_group("durable-q2", options()).await;
+            if valid {
+                let batch = batch.unwrap();
+                assert_eq!(batch.messages.len(), 1);
+                assert_eq!(batch.messages[0].message_id, 100);
+            } else {
+                assert!(matches!(batch, Err(GroupError::InvalidResponse(_))));
+                assert!(client.stream.is_none());
+            }
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn q2_ack_sends_message_identity_and_maps_loss_to_uncertainty() {
+        let (mut client, mut peer) = pair().await;
+        let task = tokio::spawn(async move {
+            let request = read_frame(&mut peer, Limits::default())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(request.frame_type, FrameType::ConsumerAck);
+            assert_eq!(request.field(f::QOS), Some(&[2][..]));
+            assert_eq!(int_u128(&request, f::MESSAGE_ID).unwrap(), 100);
+            // Socket loss after receiving a proposal is not proof of rejection.
+        });
+        let message = GroupMessage {
+            token: DeliveryToken {
+                partition: options().partition,
+                group_id: 7,
+                generation: 1,
+                lease_id: 123,
+                ownership_epoch: 5,
+                offset: DurableOffset {
+                    log_incarnation: 42,
+                    sequence: 0,
+                },
+                attempt: 1,
+            },
+            message_id: 100,
+            payload: vec![],
+            ack_deadline_ms: 30000,
+        };
+        assert!(matches!(
+            client.ack_q2_group("durable-q2", &message).await,
+            Err(GroupError::OutcomeUnknown)
+        ));
+        task.await.unwrap();
     }
 }
