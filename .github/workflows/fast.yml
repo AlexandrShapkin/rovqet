@@ -45,6 +45,8 @@ jobs:
         run: cargo test -p rovqet-durable --features fault-injection --locked
       - name: Build isolated Q1 fault-test broker
         run: cargo build -p rovqet-server --features fault-injection --locked
+      - name: Q2 consumer group campaign and crash windows
+        run: python3 scripts/test_q2_consumer.py
       - name: Durable consumer TCP delivery, ACK and crash windows
         run: python3 scripts/test_q1_consumer.py
       - name: Q1 oracle self-corruption fixtures
