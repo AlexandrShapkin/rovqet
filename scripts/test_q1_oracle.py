@@ -801,6 +801,240 @@ class Q2RaftOracle(unittest.TestCase):
         self.assertEqual(result["verdict"], oracle.NOT_RUN, result)
 
 
+# --- cross-class (Q1/Q2) isolation fixtures ------------------------------------
+
+ISO_S1, ISO_S2, ISO_S3 = oracle.ISOLATION_SCENARIOS
+
+
+def isolation_record(event, scenario, **overrides) -> dict:
+    record = {"event": event, "scenario": scenario, "schema": oracle.SCHEMA}
+    record.update(overrides)
+    return record
+
+
+def isolation_voter_state(scenario, node, message_id, offset, digest, sequence=0, producer=0):
+    applied = {
+        "message_id": message_id, "offset": offset, "digest": digest,
+        "producer": producer, "producer_epoch": 0, "sequence": sequence,
+    }
+    return isolation_record(
+        "voter_state", scenario, node=node, applied_index=offset + 1,
+        next_logical_offset=offset + 1, chain="c0ffee", count=1,
+        messages=[applied], outcomes=[dict(applied)],
+        partition={"partition_id": 0, "tenant_id": 1, "topic_id": 4},
+    )
+
+
+def isolation_journal() -> list[dict]:
+    """A minimal well-formed journal: preserved restart, fail-closed loss, quorum loss."""
+    partition = {"partition_id": 0, "tenant_id": 1, "topic_id": 3}
+    records = [
+        # Q1 restart preserves incarnation and offsets.
+        isolation_record("broker_started", ISO_S1, durable_class=1, incarnation=42,
+                         initialize_new_log=True, owner_epoch=7, partition=partition),
+        isolation_record("publish_ack", ISO_S1, durable_class=1, incarnation=42, producer=11,
+                         epoch=0, sequence=0, message_id=100, offset=0,
+                         payload_digest="aa", partition=partition,
+                         client_stdout="COMMITTED_LOCAL 42 0"),
+        isolation_record("publish_ack", ISO_S1, durable_class=1, incarnation=42, producer=11,
+                         epoch=0, sequence=1, message_id=101, offset=2,
+                         payload_digest="bb", partition=partition,
+                         client_stdout="COMMITTED_LOCAL 42 2"),
+        isolation_record("offsets_journaled", ISO_S1, incarnation=42, offsets=[0, 2],
+                         manifest_records=4),
+        isolation_record("broker_killed", ISO_S1, incarnation=42, signal="SIGKILL",
+                         offsets=[0, 2], manifest_records=4),
+        isolation_record("broker_restarted", ISO_S1, incarnation=42,
+                         initialize_new_log=False, same_data_dir=True, owner_epoch=7),
+        isolation_record("history_recovered", ISO_S1, incarnations=[42], offsets=[0, 2],
+                         record_count=2,
+                         client_stdout=["READ_RECORD 42 0 100 aa", "READ_RECORD 42 2 101 bb"]),
+        isolation_record("dedup_retry", ISO_S1, incarnation=42, producer=11, sequence=0,
+                         offset=0, client_stdout="COMMITTED_LOCAL 42 0"),
+        isolation_record("conclusion", ISO_S1, verdict="PASS", reason="restart preserved"),
+        # Q1 unrecoverable history fails closed and the fresh incarnation is distinct.
+        isolation_record("broker_started", ISO_S2, durable_class=1, incarnation=42,
+                         initialize_new_log=True, owner_epoch=7, partition=partition),
+        isolation_record("publish_ack", ISO_S2, durable_class=1, incarnation=42, producer=11,
+                         epoch=0, sequence=0, message_id=100, offset=0,
+                         payload_digest="aa", partition=partition,
+                         client_stdout="COMMITTED_LOCAL 42 0"),
+        isolation_record("broker_stopped", ISO_S2, incarnation=42, offsets=[0],
+                         manifest_records=2, signal="SIGINT"),
+        isolation_record("history_destroyed", ISO_S2, incarnation=42, offsets=[0],
+                         manifest_records=2, removed_paths=["wal/MANIFEST"]),
+        isolation_record("recovery_refused", ISO_S2, incarnation=42, exit_code=1,
+                         manifest_recreated=False, offsets=[0],
+                         error_text="REPLAY_NOT_AVAILABLE: existing Q1 history missing"),
+        isolation_record("broker_started", ISO_S2, durable_class=1, incarnation=43,
+                         supersedes_incarnation=42, initialize_new_log=True, owner_epoch=7,
+                         partition=partition),
+        isolation_record("old_offsets_not_replayable", ISO_S2, incarnation=42, offsets=[0],
+                         manifest_records=0, old_cursor_returncode=1),
+        isolation_record("fresh_incarnation_publish", ISO_S2, new_incarnation=43,
+                         old_incarnation=42, old_offsets=[0], fresh_offset=0, producer=11,
+                         sequence=0, message_id=100, client_stdout="COMMITTED_LOCAL 43 0"),
+        isolation_record("conclusion", ISO_S2, verdict="PASS", reason="fail closed"),
+        # Q2 quorum loss blocks the quorum ACK while Q1 still commits.
+        isolation_record("broker_started", ISO_S3, node=2, bootstrap=False),
+        isolation_record("broker_started", ISO_S3, node=3, bootstrap=False),
+        isolation_record("shared_broker_started", ISO_S3, node=1, pid=1,
+                         q1_topic="durable", q2_topic="durable-q2"),
+        isolation_record("q2_publish_attempt", ISO_S3, producer=31, epoch=0, sequence=0,
+                         message_id=300, payload_digest="cc"),
+        isolation_record("q2_client_result", ISO_S3, producer=31, message_id=300,
+                         returncode=0, timed_out=False,
+                         client_stdout='{"outcome":"committed_quorum","sequence":0,'
+                                       '"offset":0,"incarnation":42}'),
+        isolation_voter_state(ISO_S3, 1, 300, 0, "cc", producer=31),
+        isolation_voter_state(ISO_S3, 2, 300, 0, "cc", producer=31),
+        isolation_voter_state(ISO_S3, 3, 300, 0, "cc", producer=31),
+        isolation_record("healthy_baseline", ISO_S3, q1_ack="COMMITTED_LOCAL", q1_offset=0,
+                         q2_offset=0, q2_payload_digest="cc",
+                         q2_ack={"outcome": "committed_quorum", "sequence": 0, "offset": 0,
+                                 "incarnation": 42}),
+        isolation_record("broker_killed", ISO_S3, node=2, exit_code=-9),
+        isolation_record("voter_stop_observed", ISO_S3, node=2, returncode=-9,
+                         signal="SIGKILL"),
+        isolation_record("broker_killed", ISO_S3, node=3, exit_code=-9),
+        isolation_record("voter_stop_observed", ISO_S3, node=3, returncode=-9,
+                         signal="SIGKILL"),
+        isolation_record("authority_disturbed", ISO_S3, authority="Q2 data quorum",
+                         configured_voters=[1, 2, 3], live_voters=[1], stopped_voters=[2, 3],
+                         required_majority=2),
+        isolation_record("q2_publish_attempt", ISO_S3, producer=32, epoch=0, sequence=0,
+                         message_id=301, payload_digest="dd"),
+        isolation_record("q2_client_result", ISO_S3, producer=32, message_id=301,
+                         returncode=None, timed_out=True, timeout_seconds=15,
+                         client_stdout="", client_stderr=""),
+        isolation_record("quorum_loss_outcome", ISO_S3, delivery_claim="unknown",
+                         observed={"detail": "client timeout", "outcome": "unknown"}),
+        isolation_record("q1_commits_without_q2_quorum", ISO_S3, offset=2, previous_offset=0,
+                         live_q2_voters=[1], returncode=0,
+                         client_stdout="COMMITTED_LOCAL 42 2"),
+        isolation_record("broker_started", ISO_S3, node=2, bootstrap=False),
+        isolation_record("voter_restarted_on_original_storage", ISO_S3, node=2),
+        isolation_record("broker_started", ISO_S3, node=3, bootstrap=False),
+        isolation_record("voter_restarted_on_original_storage", ISO_S3, node=3),
+        isolation_record("q2_publish_attempt", ISO_S3, producer=33, epoch=0, sequence=0,
+                         message_id=302, payload_digest="ee"),
+        isolation_record("q2_client_result", ISO_S3, producer=33, message_id=302,
+                         returncode=0, timed_out=False,
+                         client_stdout='{"outcome":"committed_quorum","sequence":0,'
+                                       '"offset":2,"incarnation":42}'),
+        isolation_voter_state(ISO_S3, 1, 302, 2, "ee", producer=33),
+        isolation_voter_state(ISO_S3, 2, 302, 2, "ee", producer=33),
+        isolation_voter_state(ISO_S3, 3, 302, 2, "ee", producer=33),
+        isolation_record("conclusion", ISO_S3, verdict="PASS", reason="quorum loss blocked"),
+    ]
+    return records
+
+
+class IsolationOracle(unittest.TestCase):
+    def reconcile(self, records=None):
+        return oracle.reconcile_q1_q2_isolation(
+            isolation_journal() if records is None else records
+        )
+
+    def reasons(self, records) -> str:
+        return " | ".join(self.reconcile(records)["reasons"])
+
+    def test_well_formed_journal_passes(self):
+        result = self.reconcile()
+        self.assertEqual(result["verdict"], oracle.PASS, result)
+        self.assertEqual(result["counts"]["q2_blocked_timeouts"], 1, result)
+        self.assertEqual(result["counts"]["majority_loss_windows"], 1, result)
+
+    def test_wrong_class_acknowledgement_fails(self):
+        records = isolation_journal()
+        for record in records:
+            if record["event"] == "q2_client_result" and record.get("producer") == 31:
+                record["client_stdout"] = (
+                    '{"outcome":"committed_local","sequence":0,"offset":0,"incarnation":42}'
+                )
+        self.assertEqual(self.reconcile(records)["verdict"], oracle.FAIL)
+        self.assertIn("wrong-class acknowledgement", self.reasons(records))
+
+    def test_quorum_ack_without_majority_evidence_fails(self):
+        records = [r for r in isolation_journal() if r["event"] != "voter_state"]
+        self.assertIn("backed only by Q1 evidence", self.reasons(records))
+        self.assertEqual(self.reconcile(records)["verdict"], oracle.FAIL)
+
+    def test_reused_incarnation_after_loss_fails(self):
+        records = isolation_journal()
+        index = next(i for i, r in enumerate(records) if r["event"] == "history_destroyed")
+        records.insert(index + 2, isolation_record(
+            "broker_started", ISO_S2, durable_class=1, incarnation=42,
+            initialize_new_log=True,
+        ))
+        self.assertIn("reused Q1 incarnation", self.reasons(records))
+
+    def test_merged_identity_across_classes_fails(self):
+        records = isolation_journal()
+        records.insert(1, isolation_record(
+            "q2_client_result", ISO_S3, producer=11, epoch=0, sequence=0, incarnation=42,
+            message_id=900, returncode=0, timed_out=False,
+            client_stdout='{"outcome":"committed_quorum","sequence":0,"offset":0,'
+                          '"incarnation":42}',
+        ))
+        self.assertIn("merged under one identity", self.reasons(records))
+
+    def test_acknowledged_offset_missing_from_recovery_fails(self):
+        records = isolation_journal()
+        for record in records:
+            if record["event"] == "history_recovered":
+                record["offsets"] = [0]
+                record["client_stdout"] = ["READ_RECORD 42 0 100 aa"]
+        self.assertIn("missing from its recovery domain", self.reasons(records))
+        self.assertEqual(self.reconcile(records)["verdict"], oracle.FAIL)
+
+    def test_divergent_offsets_for_one_token_fail(self):
+        records = isolation_journal()
+        for record in records:
+            if record["event"] == "dedup_retry":
+                record["offset"] = 4
+                record["client_stdout"] = "COMMITTED_LOCAL 42 4"
+        self.assertIn("divergent logical offsets", self.reasons(records))
+
+    def test_mutation_after_kill_without_recovery_fails(self):
+        records = isolation_journal()
+        index = next(i for i, r in enumerate(records)
+                     if r["event"] == "broker_killed" and r.get("node") is None)
+        records.insert(index + 1, isolation_record(
+            "publish_ack", ISO_S1, durable_class=1, incarnation=42, producer=11,
+            epoch=0, sequence=1, message_id=101, offset=2, payload_digest="bb",
+            client_stdout="COMMITTED_LOCAL 42 2",
+        ))
+        self.assertIn("fenced/stale owner", self.reasons(records))
+
+    def test_cursor_advance_across_incomplete_record_fails(self):
+        records = isolation_journal()
+        records.append(isolation_record(
+            "group_state", ISO_S3,
+            group={"cursor": 2, "generation": 1, "group_generation": 1, "outcomes": [0]},
+        ))
+        self.assertIn("cursor advanced across an incomplete record", self.reasons(records))
+
+    def test_q2_success_during_majority_loss_fails(self):
+        records = isolation_journal()
+        index = next(i for i, r in enumerate(records) if r["event"] == "authority_disturbed")
+        records.insert(index + 1, isolation_record(
+            "q2_client_result", ISO_S3, producer=34, message_id=303, incarnation=42,
+            epoch=0, sequence=0, returncode=0, timed_out=False,
+            client_stdout='{"outcome":"committed_quorum","sequence":0,"offset":3,'
+                          '"incarnation":42}',
+        ))
+        self.assertIn("Q2 success during proven majority loss", self.reasons(records))
+        self.assertEqual(self.reconcile(records)["verdict"], oracle.FAIL)
+
+    def test_incomplete_scenario_set_is_not_pass(self):
+        records = [r for r in isolation_journal()
+                   if not (r["event"] == "conclusion" and r["scenario"] == ISO_S2)]
+        result = self.reconcile(records)
+        self.assertNotEqual(result["verdict"], oracle.PASS)
+        self.assertIn("incomplete scenario set", " | ".join(result["reasons"]))
+
+
 if __name__ == "__main__":
     from test_q2_consumer_oracle import Q2ConsumerFixtures
 

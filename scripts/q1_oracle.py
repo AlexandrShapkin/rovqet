@@ -2625,3 +2625,512 @@ def reconcile_q2_publish(
             counts,
         )
     return _result(PASS, [], counts)
+
+
+# --- cross-class (Q1/Q2) isolation oracle -------------------------------------
+
+ISOLATION_SCENARIOS = (
+    "q1-restart-preserves-incarnation-and-offsets",
+    "q1-unrecoverable-history-fails-closed-and-fresh-incarnation-is-distinct",
+    "q2-quorum-loss-blocks-quorum-ack-while-q1-commits",
+)
+
+ISOLATION_LOCAL_ACK = "COMMITTED_LOCAL"
+ISOLATION_QUORUM_ACK = "COMMITTED_QUORUM"
+ISOLATION_ACK_VOCABULARY = (ISOLATION_LOCAL_ACK, ISOLATION_QUORUM_ACK)
+ISOLATION_Q1_ACK_EVENTS = frozenset({
+    "publish_ack", "dedup_retry", "fresh_incarnation_publish",
+    "q1_commits_without_q2_quorum",
+})
+ISOLATION_Q2_ACK_EVENTS = frozenset({"q2_client_result", "q2_availability_restored"})
+ISOLATION_Q1_MUTATIONS = frozenset({"publish_ack", "fresh_incarnation_publish"})
+
+
+def _isolation_lines(record: dict) -> list[str]:
+    value = record.get("client_stdout")
+    if isinstance(value, str):
+        return [line.strip() for line in value.splitlines() if line.strip()]
+    if isinstance(value, (list, tuple)):
+        return [line.strip() for line in value if isinstance(line, str) and line.strip()]
+    return []
+
+
+def _isolation_vocabulary(line: str) -> str | None:
+    """The acknowledgement vocabulary carried by one client output line."""
+    parts = line.split()
+    if parts and parts[0] in ISOLATION_ACK_VOCABULARY:
+        return parts[0]
+    if line.startswith("{"):
+        try:
+            outcome = str(json.loads(line).get("outcome", "")).upper()
+        except json.JSONDecodeError:
+            return None
+        if outcome in ISOLATION_ACK_VOCABULARY:
+            return outcome
+    return None
+
+
+def _isolation_first_int(*values) -> int | None:
+    for value in values:
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return None
+
+
+def _isolation_offset(record: dict, line: str) -> int | None:
+    parts = line.split()
+    if len(parts) > 2 and parts[2].lstrip("-").isdigit():
+        return int(parts[2])
+    if line.startswith("{"):
+        try:
+            return _isolation_first_int(json.loads(line).get("offset"))
+        except json.JSONDecodeError:
+            return _isolation_first_int(record.get("offset"))
+    return _isolation_first_int(record.get("offset"))
+
+
+def _isolation_class(record: dict) -> int | None:
+    explicit = record.get("durable_class")
+    if explicit in (1, 2):
+        return int(explicit)
+    event = record.get("event") or ""
+    if event in ISOLATION_Q1_ACK_EVENTS or event in (
+        "offsets_journaled", "history_recovered", "history_destroyed",
+        "recovery_refused", "old_offsets_not_replayable",
+    ):
+        return 1
+    if event in ISOLATION_Q2_ACK_EVENTS or event in (
+        "voter_state", "authority_disturbed", "voter_stop_observed",
+        "voter_restarted_on_original_storage", "quorum_loss_outcome",
+    ):
+        return 2
+    return None
+
+
+def _isolation_acknowledgements(records: list[dict]) -> list[dict]:
+    """Normalize every class acknowledgement the journal actually records."""
+    acks = []
+    for record in records:
+        event = record.get("event")
+        if event in ISOLATION_Q1_ACK_EVENTS or event in ISOLATION_Q2_ACK_EVENTS:
+            cls = _isolation_class(record)
+            for line in _isolation_lines(record):
+                vocabulary = _isolation_vocabulary(line)
+                if vocabulary is None:
+                    continue
+                parsed = {}
+                if line.startswith("{"):
+                    try:
+                        parsed = json.loads(line)
+                    except json.JSONDecodeError:
+                        parsed = {}
+                acks.append({
+                    "class": cls,
+                    "vocabulary": vocabulary,
+                    "offset": _isolation_offset(record, line),
+                    "incarnation": _isolation_first_int(
+                        record.get("incarnation"), parsed.get("incarnation"),
+                        record.get("new_incarnation"),
+                    ),
+                    "producer": _isolation_first_int(record.get("producer"), parsed.get("producer")),
+                    "epoch": _isolation_first_int(record.get("epoch"), parsed.get("producer_epoch")),
+                    "sequence": _isolation_first_int(record.get("sequence"), parsed.get("sequence")),
+                    "message_id": _isolation_first_int(record.get("message_id")),
+                    "digest": record.get("payload_digest") if isinstance(record.get("payload_digest"), str) else None,
+                    "record": record,
+                })
+        elif event == "healthy_baseline":
+            q1_ack = record.get("q1_ack")
+            if isinstance(q1_ack, str):
+                vocabulary = _isolation_vocabulary(q1_ack)
+                if vocabulary:
+                    acks.append({
+                        "class": 1, "vocabulary": vocabulary,
+                        "offset": _isolation_first_int(record.get("q1_offset")),
+                        "incarnation": _isolation_first_int(record.get("incarnation")),
+                        "producer": None, "epoch": None, "sequence": None,
+                        "message_id": None,
+                        "digest": record.get("q1_payload_digest") if isinstance(record.get("q1_payload_digest"), str) else None,
+                        "record": record,
+                    })
+            q2_ack = record.get("q2_ack")
+            if isinstance(q2_ack, dict):
+                outcome = str(q2_ack.get("outcome", "")).upper()
+                if outcome in ISOLATION_ACK_VOCABULARY:
+                    acks.append({
+                        "class": 2, "vocabulary": outcome,
+                        "offset": _isolation_first_int(q2_ack.get("offset")),
+                        "incarnation": _isolation_first_int(q2_ack.get("incarnation")),
+                        "producer": None, "epoch": None, "sequence": None,
+                        "message_id": None,
+                        "digest": record.get("q2_payload_digest") if isinstance(record.get("q2_payload_digest"), str) else None,
+                        "record": record,
+                    })
+        elif event in ISOLATION_Q2_ACK_EVENTS and isinstance(record.get("observed"), dict):
+            observed = record["observed"]
+            outcome = str(observed.get("outcome", "")).upper()
+            if outcome in ISOLATION_ACK_VOCABULARY:
+                acks.append({
+                    "class": 2, "vocabulary": outcome,
+                    "offset": _isolation_first_int(observed.get("offset")),
+                    "incarnation": _isolation_first_int(observed.get("incarnation")),
+                    "producer": None, "epoch": None, "sequence": None,
+                    "message_id": _isolation_first_int(record.get("message_id")),
+                    "digest": None,
+                    "record": record,
+                })
+    return acks
+
+
+def _isolation_attempts(records: list[dict]) -> dict:
+    attempts = {}
+    for record in records:
+        if record.get("event") == "q2_publish_attempt":
+            message_id = _isolation_first_int(record.get("message_id"))
+            if message_id is not None:
+                attempts[message_id] = record
+    return attempts
+
+
+def _isolation_majority_witnesses(records: list[dict]) -> tuple[dict, dict, int]:
+    """Message/digest -> distinct voter nodes that applied it, plus the majority size."""
+    by_message, by_digest = {}, {}
+    required = 2
+    for record in records:
+        states = {}
+        if record.get("event") == "voter_state":
+            states = {record.get("node"): record}
+        elif isinstance(record.get("voter_states"), dict):
+            states = record["voter_states"]
+        for node, state in states.items():
+            if not isinstance(state, dict):
+                continue
+            node_id = int(node) if isinstance(node, str) and node.isdigit() else node
+            applied = state.get("outcomes") or state.get("messages") or []
+            for item in applied:
+                if not isinstance(item, dict):
+                    continue
+                message_id = _isolation_first_int(item.get("message_id"))
+                if message_id is not None:
+                    by_message.setdefault(message_id, set()).add(node_id)
+                digest = item.get("digest")
+                if isinstance(digest, str):
+                    by_digest.setdefault(digest, set()).add(node_id)
+        if record.get("event") == "authority_disturbed":
+            majority = _isolation_first_int(record.get("required_majority"))
+            configured = record.get("configured_voters")
+            if majority is not None and majority > 0:
+                required = majority
+            elif isinstance(configured, list) and configured:
+                required = len(configured) // 2 + 1
+    return by_message, by_digest, required
+
+
+def reconcile_q1_q2_isolation(records: list[dict], *, require_conclusion: bool = True) -> dict:
+    """Reconcile a campaign journal that mixes class-1 and class-2 observations.
+
+    The journal is the only evidence. A client timeout during proven majority loss is
+    the correct outcome: it counts as evidence that the quorum ACK was blocked and is
+    never read as a commit and never itself a failure. A missing required field or
+    scenario is INVALID, never PASS.
+    """
+    failures: list[str] = []
+    invalid: list[str] = []
+    counts = {
+        "records": len(records),
+        "scenarios": 0,
+        "q1_acknowledged": 0,
+        "q2_quorum_acknowledged": 0,
+        "q2_blocked_timeouts": 0,
+        "majority_loss_windows": 0,
+        "violations": 0,
+    }
+    if not records:
+        return {"verdict": NOT_RUN, "reasons": ["no isolation journal records"], "counts": counts}
+
+    acks = _isolation_acknowledgements(records)
+    attempts = _isolation_attempts(records)
+    counts["q1_acknowledged"] = sum(1 for ack in acks if ack["class"] == 1)
+    counts["q2_quorum_acknowledged"] = sum(
+        1 for ack in acks
+        if ack["class"] == 2 and ack["vocabulary"] == ISOLATION_QUORUM_ACK
+    )
+
+    # 1. A wrong-class publication acknowledged for the identity it names.
+    for ack in acks:
+        if ack["class"] == 2 and ack["vocabulary"] == ISOLATION_LOCAL_ACK:
+            failures.append(
+                "wrong-class acknowledgement: COMMITTED_LOCAL recorded for a class-2 identity"
+            )
+        elif ack["class"] == 1 and ack["vocabulary"] == ISOLATION_QUORUM_ACK:
+            failures.append(
+                "wrong-class acknowledgement: COMMITTED_QUORUM recorded for a class-1 identity"
+            )
+
+    # 2. A Q2 ACK backed only by Q1 evidence.
+    by_message, by_digest, required_majority = _isolation_majority_witnesses(records)
+    for ack in acks:
+        if ack["vocabulary"] != ISOLATION_QUORUM_ACK or ack["class"] != 2:
+            continue
+        if ack["record"].get("event") == "q2_availability_restored":
+            continue  # a restoration observation carries its own voter_states
+        message_id = ack["message_id"]
+        digest = ack["digest"]
+        if digest is None and message_id is not None:
+            digest = attempts.get(message_id, {}).get("payload_digest")
+        if message_id is None and digest is None:
+            states = ack["record"].get("voter_states")
+            if not isinstance(states, dict) or not states:
+                invalid.append(
+                    "Q2 quorum acknowledgement without a resolvable message identity"
+                )
+                continue
+            if len(states) < required_majority:
+                failures.append(
+                    "Q2 acknowledgment backed only by Q1 evidence: COMMITTED_QUORUM with "
+                    "%d of %d voters in its own state summary"
+                    % (len(states), required_majority)
+                )
+            continue
+        witnesses = set(by_message.get(message_id, set())) if message_id is not None else set()
+        if len(witnesses) < required_majority and isinstance(digest, str):
+            witnesses |= by_digest.get(digest, set())
+        if len(witnesses) < required_majority:
+            failures.append(
+                "Q2 acknowledgment backed only by Q1 evidence: COMMITTED_QUORUM without "
+                "majority/raft witness (message %r, %d of %d voters)"
+                % (message_id, len(witnesses), required_majority)
+            )
+
+    # 3. A reused Q1 incarnation after unrecoverable loss.
+    destroyed = {}
+    for index, record in enumerate(records):
+        if record.get("event") == "history_destroyed":
+            incarnation = _isolation_first_int(record.get("incarnation"))
+            if incarnation is not None:
+                destroyed.setdefault(incarnation, index)
+    for index, record in enumerate(records):
+        incarnation = _isolation_first_int(record.get("incarnation"))
+        supersedes = _isolation_first_int(record.get("supersedes_incarnation"))
+        new_incarnation = _isolation_first_int(record.get("new_incarnation"))
+        old_incarnation = _isolation_first_int(record.get("old_incarnation"))
+        if new_incarnation is not None and new_incarnation == old_incarnation:
+            failures.append(
+                "reused Q1 incarnation after unrecoverable loss: fresh history claims the "
+                "destroyed incarnation %d" % new_incarnation
+            )
+        if incarnation is not None and supersedes is not None and incarnation == supersedes:
+            failures.append(
+                "reused Q1 incarnation after unrecoverable loss: new log supersedes itself (%d)"
+                % incarnation
+            )
+        if incarnation is not None and incarnation in destroyed and index > destroyed[incarnation]:
+            if record.get("event") in (
+                "broker_started", "broker_restarted", "history_recovered",
+                "fresh_incarnation_publish",
+            ):
+                failures.append(
+                    "reused Q1 incarnation after unrecoverable loss: incarnation %d reused "
+                    "after its history was destroyed" % incarnation
+                )
+
+    # 4. Q1 and Q2 histories merged under one identity.
+    token_classes: dict[tuple, set] = {}
+    digest_classes: dict[str, set] = {}
+    for ack in acks:
+        token = (ack["incarnation"], ack["producer"], ack["sequence"])
+        if ack["class"] in (1, 2) and all(value is not None for value in token):
+            token_classes.setdefault(token, set()).add(ack["class"])
+        digest = ack["digest"]
+        if digest is None and ack["message_id"] is not None:
+            digest = attempts.get(ack["message_id"], {}).get("payload_digest")
+        if ack["class"] in (1, 2) and isinstance(digest, str):
+            digest_classes.setdefault(digest, set()).add(ack["class"])
+    for token, classes in token_classes.items():
+        if len(classes) > 1:
+            failures.append(
+                "Q1 and Q2 histories merged under one identity: producer token %r "
+                "acknowledged by both classes" % (token,)
+            )
+    for digest, classes in digest_classes.items():
+        if len(classes) > 1:
+            failures.append(
+                "Q1 and Q2 histories merged under one identity: payload %s... acknowledged "
+                "by both classes" % digest[:12]
+            )
+
+    # 5. A previously acknowledged record missing from its recovery domain.
+    acknowledged: dict = {}
+    for ack in acks:
+        if ack["class"] != 1 or ack["offset"] is None:
+            continue
+        scenario = ack["record"].get("scenario")
+        acknowledged.setdefault(scenario, set()).add(ack["offset"])
+    preserving = set()
+    recovered: dict = {}
+    unrecoverable = set()
+    loss_documented = set()
+    for record in records:
+        scenario = record.get("scenario")
+        event = record.get("event")
+        if event == "broker_restarted" and record.get("same_data_dir") is True:
+            preserving.add(scenario)
+        elif event == "broker_started" and record.get("node") is None:
+            if record.get("initialize_new_log") is False:
+                preserving.add(scenario)
+        elif event == "history_recovered":
+            offsets = {o for o in record.get("offsets") or [] if isinstance(o, int)}
+            for line in _isolation_lines(record):
+                parts = line.split()
+                if parts and parts[0] == "READ_RECORD" and len(parts) > 2 and parts[2].isdigit():
+                    offsets.add(int(parts[2]))
+            recovered[scenario] = offsets
+        elif event == "history_destroyed":
+            unrecoverable.add(scenario)
+        elif event in ("recovery_refused", "old_offsets_not_replayable"):
+            loss_documented.add(scenario)
+    for scenario, offsets in acknowledged.items():
+        if scenario in unrecoverable:
+            if scenario not in loss_documented:
+                invalid.append(
+                    "unrecoverable loss in %r is not documented by a fail-closed refusal"
+                    % (scenario,)
+                )
+            continue
+        if scenario not in preserving:
+            continue
+        if scenario not in recovered:
+            invalid.append("missing post-restart read for %r" % (scenario,))
+            continue
+        missing = offsets - recovered[scenario]
+        if missing:
+            failures.append(
+                "previously acknowledged record missing from its recovery domain: "
+                "offsets %s absent from the post-restart read" % sorted(missing)
+            )
+
+    # 6. Divergent logical offsets for one committed producer token.
+    token_offsets: dict[tuple, set] = {}
+    for ack in acks:
+        token = (ack["incarnation"], ack["producer"], ack["sequence"])
+        if all(value is not None for value in token) and ack["offset"] is not None:
+            token_offsets.setdefault(token, set()).add(ack["offset"])
+    for token, offsets in token_offsets.items():
+        if len(offsets) > 1:
+            failures.append(
+                "divergent logical offsets for one committed producer token: %r "
+                "acknowledged at offsets %s" % (token, sorted(offsets))
+            )
+
+    # 7. A fenced or stale owner successfully mutating.
+    closed: dict = {}
+    for record in records:
+        event = record.get("event")
+        node = record.get("node")
+        if event == "voter_stop_observed":
+            closed[("q2", node)] = True
+        elif event == "broker_killed":
+            closed[("q2", node) if node is not None else ("q1", None)] = True
+        elif event == "broker_stopped":
+            closed[("q1", None)] = True
+        elif event == "broker_started":
+            if node is None:
+                closed[("q1", None)] = False
+            elif record.get("q1_topic") or record.get("q2_topic"):
+                closed[("q1", None)] = False
+                closed[("q2", node)] = False
+            else:
+                closed[("q2", node)] = False
+        elif event == "broker_restarted":
+            closed[("q1", None)] = False
+        elif event == "voter_restarted_on_original_storage":
+            closed[("q2", node)] = False
+        elif event in ISOLATION_Q1_MUTATIONS and closed.get(("q1", None)):
+            failures.append(
+                "fenced/stale owner mutated: %s recorded after a kill with no recovery "
+                "event in between" % event
+            )
+
+    # 8. A cursor advancing across an incomplete record (only when the journal has cursors).
+    for record in records:
+        group = record.get("group") if isinstance(record.get("group"), dict) else None
+        if group is None and _isolation_first_int(record.get("cursor")) is not None \
+                and isinstance(record.get("outcomes"), list):
+            group = record
+        if not isinstance(group, dict):
+            continue
+        cursor = _isolation_first_int(group.get("cursor"))
+        if cursor is None:
+            continue
+        offsets = {o for o in group.get("outcomes") or [] if isinstance(o, int)}
+        if len([o for o in offsets if o < cursor]) != cursor:
+            failures.append(
+                "cursor advanced across an incomplete record: cursor %d over offsets %s"
+                % (cursor, sorted(offsets))
+            )
+
+    # 9. Q2 success during proven majority loss.
+    alive: set = set()
+    majority = required_majority
+    for record in records:
+        event = record.get("event")
+        node = record.get("node")
+        if event == "broker_started" and node is not None:
+            alive.add(node)
+        elif event == "voter_restarted_on_original_storage" and node is not None:
+            alive.add(node)
+        elif event in ("broker_killed", "voter_stop_observed") and node is not None:
+            alive.discard(node)
+        elif event == "authority_disturbed":
+            counts["majority_loss_windows"] += 1
+            configured = set(record.get("configured_voters") or [])
+            live = set(record.get("live_voters") or [])
+            stopped = set(record.get("stopped_voters") or [])
+            if configured:
+                alive = (alive | live | configured) - stopped
+            observed_majority = _isolation_first_int(record.get("required_majority"))
+            if observed_majority is not None and observed_majority > 0:
+                majority = observed_majority
+        if event in ISOLATION_Q2_ACK_EVENTS:
+            if record.get("timed_out") is True:
+                counts["q2_blocked_timeouts"] += 1
+            observed = record.get("observed")
+            if isinstance(observed, dict) and str(observed.get("outcome", "")).lower() == "unknown":
+                if record.get("timed_out") is not True:
+                    counts["q2_blocked_timeouts"] += 1
+            committed_here = any(
+                ack["record"] is record and ack["vocabulary"] == ISOLATION_QUORUM_ACK
+                for ack in acks
+            )
+            if committed_here and len(alive) < majority:
+                failures.append(
+                    "Q2 success during proven majority loss: COMMITTED_QUORUM with %d of "
+                    "%d required voters alive" % (len(alive), majority)
+                )
+
+    # 10. An incomplete scenario set reported PASS.
+    conclusions: dict = {}
+    for record in records:
+        if record.get("event") == "conclusion":
+            conclusions[record.get("scenario")] = record
+    counts["scenarios"] = sum(1 for name in ISOLATION_SCENARIOS if name in conclusions)
+    if require_conclusion:
+        for name in ISOLATION_SCENARIOS:
+            record = conclusions.get(name)
+            if record is None:
+                invalid.append("incomplete scenario set: missing conclusion for %s" % name)
+                continue
+            verdict = record.get("verdict")
+            if verdict == FAIL:
+                failures.append("scenario %s concluded FAIL" % name)
+            elif verdict != PASS:
+                invalid.append(
+                    "incomplete scenario set: %s concluded %s instead of PASS"
+                    % (name, verdict)
+                )
+
+    unique_failures = list(dict.fromkeys(failures))
+    unique_invalid = list(dict.fromkeys(invalid))
+    counts["violations"] = len(unique_failures)
+    verdict = FAIL if unique_failures else INVALID if unique_invalid else PASS
+    return {"verdict": verdict, "reasons": unique_failures + unique_invalid, "counts": counts}
