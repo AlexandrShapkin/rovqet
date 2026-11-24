@@ -1,0 +1,11 @@
+{
+  "verdict": "NOT_RUN",
+  "reasons": [
+    "required scenarios not executed: crash_after_majority, crash_before_majority, crash_before_proposal, idempotent"
+  ],
+  "counts": {
+    "successful_acks": 12,
+    "majority_proofs": 12,
+    "scenario_passes": 8
+  }
+}

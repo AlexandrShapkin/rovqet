@@ -802,4 +802,6 @@ class Q2RaftOracle(unittest.TestCase):
 
 
 if __name__ == "__main__":
+    from test_q2_consumer_oracle import Q2ConsumerFixtures
+
     unittest.main(verbosity=2)

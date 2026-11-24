@@ -394,12 +394,9 @@ impl Route {
         {
             return Err(ErrorCode::StaleEpoch);
         }
-        // Discard fenced grants; durable ACK outcomes remain in the state machine.
-        leases.entries.retain(|_, lease| {
-            matches!(&lease.command,
-            ShardCommand::GroupAck { generation: g, metadata_epoch, .. }
-                if *g == generation && *metadata_epoch == epoch)
-        });
+        // Keep fenced grants until their bounded expiry so a delivered old token
+        // receives STALE_GENERATION/EPOCH instead of becoming an unknown lease.
+        // Retired grants consume the global bound, not current inflight slots.
         let group = partition.groups.get(&group_id);
         let cursor = group.map_or(0, |g| g.cursor);
         let inflight = leases
@@ -407,7 +404,8 @@ impl Route {
             .values()
             .filter(|l| {
                 matches!(&l.command,
-            ShardCommand::GroupAck { group_id: g, .. } if *g == group_id)
+            ShardCommand::GroupAck { group_id: g, generation: leased, metadata_epoch, .. }
+                if *g == group_id && *leased == generation && *metadata_epoch == epoch)
             })
             .count();
         let capacity = max_messages
@@ -420,8 +418,9 @@ impl Route {
                 || group.is_some_and(|g| g.outcomes.contains_key(&message.logical_offset))
                 || leases.entries.values().any(|l| {
                     matches!(&l.command,
-                    ShardCommand::GroupAck { group_id: g, offset, .. }
-                        if *g == group_id && *offset == message.logical_offset)
+                    ShardCommand::GroupAck { group_id: g, offset, generation: leased, metadata_epoch, .. }
+                        if *g == group_id && *offset == message.logical_offset
+                            && *leased == generation && *metadata_epoch == epoch)
                 })
             {
                 continue;
@@ -1196,6 +1195,31 @@ mod tests {
                 .await
                 .unwrap_err(),
             ErrorCode::StaleEpoch
+        );
+        route.shutdown().await.unwrap();
+        drop(directory);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_replacement_fetch_preserves_the_old_tokens_typed_generation_fence() {
+        let (route, directory) = open_route().await;
+        seed_group(&route).await;
+        let old = route.fetch_q2_group(1, fetch_frame(None)).await.unwrap();
+        route.delivered_q2(&old[0]).await.unwrap();
+        let replacement = route.fetch_q2_group(1, fetch_frame(None)).await.unwrap();
+        assert_eq!(replacement[0].payload, b"event-0");
+        assert_eq!(
+            route.ack_q2_group(1, ack_frame(&old[0])).await.unwrap_err(),
+            ErrorCode::StaleGeneration
+        );
+        route.delivered_q2(&replacement[0]).await.unwrap();
+        assert_eq!(
+            route
+                .ack_q2_group(1, ack_frame(&replacement[0]))
+                .await
+                .unwrap()
+                .field(f::ACK_OUTCOME),
+            Some(&[1][..])
         );
         route.shutdown().await.unwrap();
         drop(directory);

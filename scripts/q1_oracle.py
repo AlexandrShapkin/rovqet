@@ -28,6 +28,143 @@ def digest_hex(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+Q2_CONSUMER_REQUIRED = {
+    "normal", "sparse", "fencing", "idempotent", "quorum",
+    "follower_restart", "full_restart", "crash_before_proposal",
+    "crash_before_majority", "crash_after_majority", "negative", "snapshot_install",
+}
+
+
+def _consumer_token(token: dict) -> tuple:
+    """Canonical full delivery identity, independently normalized from voter state."""
+    token = token.get("GroupAck", token)
+    partition = token.get("partition", token)
+    fields = [partition.get(k) for k in ("tenant_id", "topic_id", "partition_id")]
+    fields += [token.get(k) for k in (
+        "incarnation", "group_id", "generation", "lease_id", "metadata_epoch",
+        "offset", "attempt", "principal", "message_id",
+    )]
+    if not all(isinstance(v, int) and not isinstance(v, bool) and v >= 0 for v in fields):
+        raise ValueError("incomplete Q2 consumer identity")
+    return tuple(fields)
+
+
+def reconcile_q2_consumer(records: list[dict], *, require_conclusion: bool = True) -> dict:
+    """Reconcile external SDK observations against distinct persisted Raft voters.
+
+    No application assertion or scenario PASS is itself durability evidence.
+    Exact saved tokens in two independent applied-state files establish a majority;
+    final recovered files must retain every successful ACK. Missing coverage is
+    never accepted, even when the campaign claims PASS.
+    """
+    failures, invalid = [], []
+    conclusions = [r for r in records if r.get("event") == "conclusion"]
+    own = conclusions[-1].get("verdict") if conclusions else None
+    if require_conclusion and own is None:
+        invalid.append("missing campaign conclusion")
+    scenarios = {r.get("name"): r.get("verdict") for r in records
+                 if r.get("event") == "consumer_scenario"}
+    missing = Q2_CONSUMER_REQUIRED - scenarios.keys()
+    incomplete = missing | {n for n, v in scenarios.items() if v != PASS}
+    if own == PASS and incomplete:
+        failures.append("incomplete consumer campaign reported as PASS")
+    if any(v == FAIL for v in scenarios.values()) or own == FAIL:
+        failures.append("consumer scenario failed")
+    configurations = [r for r in records if r.get("event") == "consumer_configuration"]
+    if not configurations or any(r.get("q1_configured") is not False for r in configurations):
+        invalid.append("missing proof that Q2 consumers run without Q1")
+    attempts, delivered, successes = set(), set(), []
+    witnesses, recovered = {}, {}
+    previous = {}
+    majority_proofs = 0
+    for record in records:
+        event = record.get("event")
+        try:
+            if event in ("consumer_delivery", "consumer_attempt", "consumer_result"):
+                key = _consumer_token(record["token"])
+                if event == "consumer_delivery":
+                    delivered.add(key)
+                elif event == "consumer_attempt":
+                    attempts.add(key)
+                elif record.get("result", {}).get("outcome") == "ack_committed":
+                    result = record["result"]
+                    if key not in attempts or key not in delivered:
+                        failures.append("fabricated ACK success without an attempted delivered token")
+                    if (result.get("offset"), result.get("generation")) != (key[8], key[5]):
+                        failures.append("ACK result contradicts its delivery identity")
+                    successes.append((key, record))
+            elif event == "consumer_state":
+                node, index = record["node"], record["applied_index"]
+                if node not in (1, 2, 3) or not isinstance(index, int):
+                    raise ValueError("missing voter identity/index")
+                partition = record["partition"]
+                messages = {m["logical_offset"]: m["message_id"] for m in partition["messages"]}
+                for group_id, group in partition.get("groups", {}).items():
+                    cursor, generation = group["cursor"], group["generation"]
+                    outcomes = group["outcomes"]
+                    offsets = {int(o) for o in outcomes}
+                    if cursor < 0 or cursor > partition["next_logical_offset"] or generation != partition["group_generation"]:
+                        failures.append("invalid group fence or cursor")
+                    if len([o for o in offsets if o < cursor]) != cursor:
+                        failures.append("cursor skipped an incomplete offset")
+                    if set(group["sparse_acks"]) != {o for o in offsets if o >= cursor} or cursor in group["sparse_acks"]:
+                        failures.append("sparse ACK set contradicts contiguous cursor")
+                    scope = (node, group_id)
+                    old = previous.get(scope)
+                    if old and (index < old[0] or generation < old[1] or cursor < old[2]
+                                or not old[3].issubset(offsets)):
+                        failures.append("generation/cursor/ACK state regressed across recovery")
+                    previous[scope] = (index, generation, cursor, offsets)
+                    for offset, saved in outcomes.items():
+                        key = _consumer_token(saved["command"])
+                        outcome = saved["outcome"]["GroupAcked"]
+                        if (key[0:3] != (1, 4, 0) or key[3] != partition["incarnation"]
+                            or key[4] != int(group_id) or key[8] != int(offset)
+                            or messages.get(int(offset)) != key[11]
+                            or outcome["generation"] != key[5] or outcome["offset"] != key[8]):
+                            failures.append("saved ACK contradicts committed record/token")
+                        witnesses.setdefault(key, set()).add(node)
+                        if record.get("recovered"):
+                            recovered.setdefault(key, set()).add(node)
+            elif event == "consumer_rejection_check":
+                if record.get("before") != record.get("after"):
+                    failures.append("rejected stale/invalid ACK mutated group progress")
+            elif event == "consumer_redelivery":
+                if record.get("offset") not in record.get("delivered_offsets", []):
+                    failures.append("unacknowledged record was not redelivered")
+            elif event == "consumer_snapshot_install":
+                if not (record["leader_purged_index"] > record["before_index"]
+                        and record["after_index"] >= record["leader_purged_index"]
+                        and record["before_groups"] == record["after_groups"]):
+                    failures.append("snapshot installation erased consumer progress or lacks a log-gap proof")
+        except (KeyError, TypeError, ValueError) as error:
+            invalid.append(f"invalid {event} evidence: {error}")
+    for key, record in successes:
+        if len(witnesses.get(key, set())) < 2:
+            failures.append("ACK success has no distinct durable majority evidence")
+        else:
+            majority_proofs += 1
+        if recovered.get(key, set()) != {1, 2, 3}:
+            failures.append("ACK success is missing recovered ACK state")
+        if len(record.get("live", [])) < 2 and not any(
+            other_key == key and len(other.get("live", [])) >= 2
+            and other.get("seq", 0) < record.get("seq", 0)
+            for other_key, other in successes
+        ):
+            failures.append("new ACK success without an available majority")
+    counts = {"successful_acks": len(successes), "majority_proofs": majority_proofs,
+              "scenario_passes": sum(v == PASS for v in scenarios.values())}
+    if failures:
+        return _result(FAIL, sorted(set(failures)), counts)
+    if invalid:
+        return _result(INVALID, sorted(set(invalid)), counts)
+    if incomplete or own == NOT_RUN:
+        return _result(NOT_RUN, ["required scenarios not executed: " + ", ".join(sorted(incomplete))], counts)
+    if not successes:
+        return _result(INVALID, ["no external successful ACK observations"], counts)
+    return _result(PASS, [], counts)
+
+
 class JournalError(Exception):
     pass
 

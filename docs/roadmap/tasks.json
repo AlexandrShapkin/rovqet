@@ -1125,7 +1125,7 @@
         "crates/durable/"
       ],
       "evidence": {
-        "note": "The replicated group state machine and the broker route + SDK are implemented and tested; the three-node consumer campaign and its oracle are the remaining increment. C-05 stays IN_PROGRESS, not DONE.",
+        "note": "C-05 stays IN_PROGRESS. The real-process campaign passes normal, sparse ACK, fencing, duplicate ACK, quorum loss/restoration, follower restart, forced snapshot installation, full restart and negative-token checks. Oracle: NOT_RUN, not PASS: lost-response and the three deterministic crash windows remain. Next: extend the existing ACK fault seams and execute the missing crash scenarios.",
         "scope": "Topic-qualified GroupClaim/GroupAck, partition-wide generation fence, bounded per-group sparse cursor and saved ACK outcomes, snapshot/restart recovery; Q2 FETCH/MESSAGE/FETCH_END and CONSUMER_ACK/RESULT over TCP, bounded volatile delivery leases, applied-only ACK_COMMITTED, read-only saved-outcome lookup and explicit uncertainty under quorum loss."
       }
     },
