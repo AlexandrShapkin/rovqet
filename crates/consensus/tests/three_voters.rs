@@ -222,6 +222,57 @@ impl VoterSet {
         panic!("no leader other than {exclude:?} was elected within 20s");
     }
 
+    /// Waits until a voter's published Raft metrics show it applied every entry of its
+    /// own log. The two metric reads are taken applied-first so a log entry appended
+    /// in between can only make the condition harder to reach, never falsely pass.
+    ///
+    /// Both `last_applied` and `last_log_index` are published by the Raft core only
+    /// after it processes the state machine's result, while the state machine (and the
+    /// revision watch) advances first. Under load that publication lags, so a one-shot
+    /// read can catch a value that is still catching up.
+    async fn wait_for_log_caught_up(&self, id: usize) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let applied = self.node(id).last_applied_index().await;
+            let log_index = self.node(id).last_log_index().await;
+            match (applied, log_index) {
+                (Some(applied), Some(log_index)) if applied >= log_index => return,
+                (None, None) => return,
+                _ => {}
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "voter {id} did not apply its whole log within 20s, \
+                     observed applied={applied:?} log={log_index:?}"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Waits until one voter's published `last_applied` reaches `min_index`.
+    ///
+    /// The revision watch reports the applied state before the Raft core publishes
+    /// `last_applied`, so the published index must be waited for rather than read once.
+    async fn wait_for_applied_index(&self, id: usize, min_index: u64) -> u64 {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Some(applied) = self.node(id).last_applied_index().await {
+                if applied >= min_index {
+                    return applied;
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "voter {id} did not reach applied index {min_index} within 20s, \
+                     observed {:?}",
+                    self.node(id).last_applied_index().await
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     /// Waits until one voter applied `revision` or more.
     async fn wait_for_revision(&self, id: usize, revision: u64) {
         let mut updates = self.node(id).applied_updates();
@@ -280,8 +331,12 @@ async fn a_three_voter_shard_group_replicates_and_recovers() {
         }));
     }
 
-    // A stale metadata epoch is refused before it creates a Raft entry.
+    // A stale metadata epoch is refused before it creates a Raft entry. The applied
+    // index is read from the published metrics, so first wait until the leader has
+    // applied its whole log: the election's own entries must not land between the two
+    // reads below and masquerade as an entry created by the refusal.
     let leader_id = leader as usize;
+    cluster.wait_for_log_caught_up(leader_id).await;
     let applied_before = cluster.node(leader_id).last_applied_index().await;
     let refusal = cluster
         .node(leader_id)
@@ -409,6 +464,10 @@ async fn a_three_voter_shard_group_replicates_and_recovers() {
         .into_iter()
         .find(|id| *id as u64 != new_leader)
         .expect("a follower to stop");
+    // Read the follower's applied index from the published metrics only after it has
+    // applied its whole log; a stale-low value here would let the leader pass the
+    // compaction check without really purging what the stopped voter still needs.
+    cluster.wait_for_log_caught_up(stopped).await;
     let stopped_index = cluster
         .node(stopped)
         .last_applied_index()
@@ -485,14 +544,12 @@ async fn a_three_voter_shard_group_replicates_and_recovers() {
             "the recovered chain differs on a committed partition"
         );
     }
+    // The revision watch reports the applied state before the Raft core publishes
+    // `last_applied`, so wait for the published index instead of reading it once.
+    let recovered_applied = cluster.wait_for_applied_index(stopped, last_index).await;
     assert!(
-        cluster
-            .node(stopped)
-            .last_applied_index()
-            .await
-            .unwrap_or_default()
-            >= last_index,
-        "the recovered voter must reach the last committed index"
+        recovered_applied >= last_index,
+        "the recovered voter must reach the last committed index, observed {recovered_applied}"
     );
 
     // 5. A Q2 PUBLISH commits a logical offset that is not the Raft index and
