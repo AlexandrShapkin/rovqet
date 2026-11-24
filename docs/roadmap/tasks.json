@@ -1172,13 +1172,18 @@
         "C-04",
         "B-04"
       ],
-      "status": "TODO",
+      "status": "IN_PROGRESS",
       "architecture": "11",
       "proof": "Wrong class denied, Q1 incarnation/Q2 prefix separated",
       "paths": [
         "crates/testkit/"
       ],
-      "evidence": null
+      "evidence": {
+        "commit": "7d9713f480698b358edb1d12ed9822aee3d3cd65",
+        "ci_publication_campaign": "Closed the C-04 CI gap: `.github/workflows/fast.yml` now has a separate `q2-publish` job (timeout 10 min) that builds `cargo build -p rovqet-server -p rovqet-sdk --examples --bins --features fault-injection --locked` and runs `python3 scripts/test_q2_publish.py`. Verified locally (exit 0, 14 scenarios, oracle PASS) and in GitHub Actions run 45385294244 (jobs rust, q2-publish, docs all success).",
+        "verification": "IN_PROGRESS: the C-04 publication campaign now runs in CI and is green. The C-06 cross-class verification campaign (`scripts/test_q1_q2_isolation.py`) and its oracle reconciler have not been written yet, and the intermittent failure of `crates/consensus/tests/three_voters.rs::a_three_voter_shard_group_replicates_and_recovers` is diagnosed but not yet fixed. No C-06 acceptance claim is made.",
+        "remaining_work": "(1) stabilize the flaky three-voter consensus test at its real synchronization cause and prove stability over at least 10 repetitions including under load; (2) write `scripts/test_q1_q2_isolation.py` covering wrong-class rejection on both routes, class-config conflict, Q1 restart and irrecoverable-loss behaviour, Q1 migration class preservation, Q2 single-node failure and quorum loss, Q1 usability during Q2 quorum loss, Q2 history surviving isolated Q1 storage loss, and cross-partition/consumer isolation; (3) add the cross-class oracle reconciler plus negative fixtures; (4) store evidence under `benchmarks/evidence/c06-q1-q2-isolation/`."
+      }
     },
     {
       "id": "C-07",
