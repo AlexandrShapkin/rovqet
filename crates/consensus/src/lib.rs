@@ -27,6 +27,7 @@
 
 pub mod log;
 pub mod network;
+pub mod postmajority;
 pub mod premajority;
 pub mod sm;
 pub mod types;
@@ -382,7 +383,14 @@ impl ShardNode {
             }
         }
         match self.raft.client_write(command.clone()).await {
-            Ok(response) => Ok(response.data),
+            Ok(response) => {
+                // The response carries the applied result of an entry the group already
+                // committed by a majority. A test-controlled post-majority seam may park
+                // here, before this route can build the client acknowledgment; it is a
+                // no-op unless the `fault-injection` build is explicitly armed.
+                crate::postmajority::hold_publish_response(self.id, &response.data, &command).await;
+                Ok(response.data)
+            }
             Err(error) => {
                 // A follower forwards the proposal to the committed leader instead of
                 // pretending that it can commit on its own.
@@ -439,7 +447,14 @@ impl NodePeerHandler {
     /// A client write on this node: the leader commits it, a follower forwards it once.
     async fn client_write(&self, command: ShardCommand) -> ShardRpcResponse {
         match self.raft.client_write(command.clone()).await {
-            Ok(response) => ShardRpcResponse::ClientWrite(response.data),
+            Ok(response) => {
+                // Same post-majority point as `ShardNode::propose`, reached when a
+                // follower forwarded this publication to the leader it cannot commit
+                // itself: the entry is committed and applied here, and the answer is
+                // still on its way back to the client.
+                crate::postmajority::hold_publish_response(self.id, &response.data, &command).await;
+                ShardRpcResponse::ClientWrite(response.data)
+            }
             Err(error) => {
                 let Some(forward) = error.forward_to_leader() else {
                     return ShardRpcResponse::Error(format!("{error:?}"));
