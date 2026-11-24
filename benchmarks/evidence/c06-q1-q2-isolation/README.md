@@ -1,8 +1,28 @@
 # C-06 — partial evidence, not an acceptance claim
 
-C-06 remains **IN_PROGRESS**. This directory currently contains only the first,
-wire-level increment. The full isolation campaign and its independent reconciler
-are not implemented. Their verdict is **NOT_RUN**, not PASS.
+C-06 remains **IN_PROGRESS**. This directory contains the wire-level increment
+and three focused isolation scenarios. The full fault/migration campaign and its
+independent reconciler remain **NOT_RUN**, not PASS.
+
+## Focused isolation journal
+
+Run `timeout 600 python3 scripts/test_q1_q2_isolation.py` after the build below.
+`isolation.jsonl` records Q1 restart/dedup, fail-closed history loss with an
+explicit fresh incarnation, and
+`q2-quorum-loss-blocks-quorum-ack-while-q1-commits`.
+The last scenario shares one TCP broker between Q1 and Q2, with three real
+Q2 voters. It observes healthy Q2/Q1 offsets 0/0, reaps voters 2 and 3 after
+SIGKILL, and bounds a fresh Q2 request at 15 seconds. In the recorded run the
+client timed out with empty stdout/stderr: the outcome is uncertain, **not**
+proof of non-delivery. That same broker acknowledges Q1 at offset 2 while only
+one Q2 voter is alive. Restarting the original voter storage restores a Q2
+quorum commit at offset 2 (the uncertain request may commit after restoration).
+Every scenario has its own conclusion; these PASS results do not complete C-06.
+
+This disturbs the Q2 **data** quorum. Metadata is supplied by static JSON
+fixtures, not a live metadata Raft quorum, so no metadata-quorum isolation
+claim is made. All processes and storage are disposable loopback prototypes;
+no physical host-failure or production-security certification is implied.
 
 ## Reproduce the focused check
 
@@ -39,7 +59,7 @@ No production class-mismatch defect was found: `q2::Route::publish` already
 checks QOS before proposing, and dispatch sends non-Q2 durable publications to
 the unsupported-guarantee path rather than upgrading them.
 
-This focused test uses a separate Q1 broker and three Q2 brokers. It does **not**
+The wire test uses a separate Q1 broker and three Q2 brokers. It does **not**
 prove same-process isolation during data-quorum loss, class-conflict validation,
 storage-loss recovery, migration, independent consumer state, cross-partition
 ACK rejection, or any fault scenario. No general Q1-to-Q2 migration is provided.

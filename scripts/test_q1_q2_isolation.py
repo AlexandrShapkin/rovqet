@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""C-06 isolation: Q1 restart identity and fail-closed unrecoverable history.
+"""C-06 isolation: Q1 history and same-process Q2 quorum-loss isolation.
 
-Two scenarios over real TCP with external SDK clients, reusing the Q1 process
+Three scenarios over real TCP with external SDK clients, reusing the Q1 process
 harness from q1_smoke. A SIGKILL restart must preserve the incarnation, the
 logical offsets and producer dedup, while a destroyed history must refuse
 recovery explicitly; only an explicit new-log initialization may start a
 distinct fresh incarnation that does not honour the old token or cursor.
+The quorum-loss scenario shares one broker between Q1 and Q2 and restores the
+two killed Q2 voters on their original storage. Metadata uses static fixtures.
 
 Destructive work is confined to disposable temporary directories; the parent
 owns the fsynced journal at
@@ -17,16 +19,20 @@ from __future__ import annotations
 import subprocess
 import sys
 import tempfile
+import json
+import time
 from pathlib import Path
 
 import q1_oracle as oracle
 from q1_smoke import Q1, READ, SERVER, Broker, manifest_record_count
+from test_q2_publish import Campaign, EXAMPLE, INCARNATION, OWNER_EPOCH as Q2_OWNER
 
 EVIDENCE = (Path(__file__).resolve().parents[1] / "benchmarks" / "evidence"
             / "c06-q1-q2-isolation")
 
 S1 = "q1-restart-preserves-incarnation-and-offsets"
 S2 = "q1-unrecoverable-history-fails-closed-and-fresh-incarnation-is-distinct"
+S3 = "q2-quorum-loss-blocks-quorum-ack-while-q1-commits"
 
 TOPIC = "durable"
 TENANT_ID, TOPIC_ID, PARTITION_ID = 1, 3, 0
@@ -331,13 +337,174 @@ def scenario_fail_closed(journal: oracle.Journal) -> str:
             f"(manifest records {count_after})")
 
 
+def scenario_quorum_loss(journal: oracle.Journal) -> str:
+    """Stop two data voters; the surviving broker must still commit its Q1 route."""
+    class ScenarioJournal:
+        # Include the scenario even on observations emitted by the reused launcher.
+        def append(self, event, **fields):
+            return journal.append(event, scenario=S3, **fields)
+
+    scoped = ScenarioJournal()
+    with tempfile.TemporaryDirectory(prefix="rovqet-c06-quorum-") as temporary:
+        directory = Path(temporary)
+        cluster = directory / "q2"
+        cluster.mkdir()
+        local = directory / "q1"
+        local.mkdir()
+        campaign = Campaign(scoped, cluster)
+        primary = campaign.nodes[1]
+        # Cluster-mode routing needs an explicit placement for the local Q1
+        # partition as well as the Q2 placement supplied by Campaign.
+        for node in campaign.nodes.values():
+            metadata = json.loads(node.metadata.read_text())
+            metadata["topics"].append(
+                {"topic_id": TOPIC_ID, "durable_class": 1, "policy_revision": 1})
+            metadata["partitions"].append({
+                **partition_identity(), "owner": 1,
+                "ownership_epoch": OWNER_EPOCH, "lease_valid_for_ms": 600_000,
+                "desired_replicas": 1, "shard_id": 8,
+                "required_policy_revision": 1,
+            })
+            node.metadata.write_text(json.dumps(metadata), encoding="utf-8")
+        broker = None
+        try:
+            # Reuse the real voter configuration, but let Broker supply its Q1
+            # route and ephemeral TCP listener. No extra proxy or simulated voter.
+            broker = Broker(local, extra=primary.arguments(True)[3:])
+            primary.process = broker.process
+            primary.lines = broker.lines
+            for number in (2, 3):
+                campaign.nodes[number].start(bootstrap=False)
+            broker.start()
+            primary.client_port = int(broker.endpoint.rsplit(":", 1)[1])
+            for node in campaign.nodes.values():
+                node.wait_ready()
+            primary.wait_authority()
+            scoped.append("shared_broker_started", node=1, pid=broker.process.pid,
+                          endpoint=broker.endpoint, q1_topic=TOPIC,
+                          q2_topic="durable-q2")
+
+            def q2_call(producer, message, payload, timeout=15):
+                command = campaign._arguments(
+                    producer, 0, 0, message, payload, INCARNATION, Q2_OWNER)
+                scoped.append("q2_publish_attempt", producer=producer, epoch=0,
+                              sequence=0, message_id=message,
+                              payload_digest=oracle.digest_hex(payload.encode()))
+                timed_out = False
+                try:
+                    result = subprocess.run(
+                        command, env=broker.environment(), capture_output=True,
+                        text=True, timeout=timeout)
+                    stdout, stderr, code = result.stdout, result.stderr, result.returncode
+                except subprocess.TimeoutExpired as error:
+                    timed_out = True
+                    def text(value):
+                        return value.decode() if isinstance(value, bytes) else value or ""
+                    stdout, stderr, code = text(error.stdout), text(error.stderr), None
+                # Preserve exact output before interpreting or asserting anything.
+                scoped.append("q2_client_result", producer=producer,
+                              message_id=message, client_stdout=stdout,
+                              client_stderr=stderr, returncode=code,
+                              timed_out=timed_out, timeout_seconds=timeout)
+                # A success printed even by a subsequently hung client is still
+                # a success claim, never hidden behind the timeout classification.
+                observed = [json.loads(line) for line in stdout.splitlines() if line.strip()]
+                if timed_out:
+                    assert not any(item.get("outcome") == "committed_quorum"
+                                   for item in observed), stdout
+                    return {"outcome": "unknown", "detail": "client timeout"}
+                assert code == 0 and len(observed) == 1, (code, stdout, stderr)
+                return observed[0]
+
+            def certain(producer, message, payload):
+                deadline = time.monotonic() + 60
+                while True:
+                    observed = q2_call(producer, message, payload)
+                    if observed.get("outcome") != "unknown":
+                        assert observed.get("outcome") == "committed_quorum", observed
+                        return observed
+                    assert time.monotonic() < deadline, observed
+                    time.sleep(0.3)
+
+            baseline = certain(31, 300, "q2-baseline")
+            q2_offset = baseline["offset"]
+            states = campaign.await_message(q2_offset, 300)
+            assert set(states) == {1, 2, 3}, states
+            local_offset = committed_local(publish(broker, 0, OLD_INCARNATION),
+                                           OLD_INCARNATION, 0)
+            scoped.append("healthy_baseline", q2_ack=baseline,
+                          q2_offset=q2_offset,
+                          q2_payload_digest=oracle.digest_hex(b"q2-baseline"),
+                          q1_offset=local_offset, q1_ack="COMMITTED_LOCAL",
+                          voter_states=states)
+            for number in (2, 3):
+                node = campaign.nodes[number]
+                pid = node.process.pid
+                node.kill()
+                code = node.process.poll()
+                scoped.append("voter_stop_observed", node=number, pid=pid,
+                              signal="SIGKILL", returncode=code,
+                              observation="Popen.wait completed; poll returned exit status",
+                              storage=str(node.directory))
+                assert code == -9, code
+            assert campaign.live() == [1], campaign.live()
+            scoped.append(
+                "authority_disturbed", authority="Q2 data quorum",
+                live_voters=campaign.live(), stopped_voters=[2, 3],
+                configured_voters=[1, 2, 3], required_majority=2,
+                metadata_mode="static --cluster-metadata JSON fixtures",
+                metadata_quorum_tested=False,
+                evidence="Q2 voter processes 2 and 3 reaped; node 1 remains alive",
+            )
+            lost = q2_call(32, 301, "q2-without-quorum")
+            scoped.append("quorum_loss_outcome", observed=lost,
+                          delivery_claim="unknown; no claim of non-delivery")
+            assert lost.get("outcome") == "unknown" or (
+                lost.get("outcome") == "rejected"
+                and "quorum" in str(lost.get("detail", "")).lower()), lost
+            result = publish(broker, 1, OLD_INCARNATION)
+            new_offset = committed_local(result, OLD_INCARNATION, 2)
+            assert campaign.live() == [1], campaign.live()
+            scoped.append("q1_commits_without_q2_quorum", offset=new_offset,
+                          previous_offset=local_offset,
+                          client_stdout=result.stdout, client_stderr=result.stderr,
+                          returncode=result.returncode, broker_pid=broker.process.pid,
+                          live_q2_voters=campaign.live())
+            for number in (2, 3):
+                node = campaign.nodes[number]
+                if node.process.stderr is not None:
+                    node.process.stderr.close()
+                node.start(bootstrap=False)
+                node.wait_ready()
+                scoped.append("voter_restarted_on_original_storage", node=number,
+                              storage=str(node.directory), bootstrap=False)
+            restored = certain(33, 302, "q2-restored")
+            assert restored["offset"] > q2_offset, restored
+            states = campaign.await_message(restored["offset"], 302)
+            assert set(states) == {1, 2, 3}, states
+            scoped.append("q2_availability_restored", observed=restored,
+                          voter_states=states)
+        finally:
+            if broker is not None:
+                broker.close()
+            for number in (2, 3):
+                node = campaign.nodes[number]
+                node.kill()
+                if node.process is not None and node.process.stderr is not None:
+                    node.process.stderr.close()
+    return (f"baseline Q2 offset {q2_offset}, Q1 offset {local_offset}; "
+            f"two voters killed: Q2 {lost}; same broker Q1 offset {new_offset}; "
+            f"original-storage restart restored Q2 {restored}")
+
+
 def main() -> int:
-    missing = [str(path) for path in (SERVER, Q1, READ) if not path.is_file()]
+    missing = [str(path) for path in (SERVER, Q1, READ, EXAMPLE) if not path.is_file()]
     EVIDENCE.mkdir(parents=True, exist_ok=True)
     journal = oracle.Journal(EVIDENCE / "isolation.jsonl", "c06-q1-q2-isolation")
     verdicts: dict[str, str] = {}
     try:
-        for name, scenario in ((S1, scenario_restart), (S2, scenario_fail_closed)):
+        for name, scenario in ((S1, scenario_restart), (S2, scenario_fail_closed),
+                               (S3, scenario_quorum_loss)):
             if missing:
                 verdict, reason = oracle.NOT_RUN, (
                     "binaries not built: " + ", ".join(missing))

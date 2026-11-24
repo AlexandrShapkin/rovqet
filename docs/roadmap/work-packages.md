@@ -108,6 +108,14 @@ open, so C-02 stays IN_PROGRESS.
 
 **C-06 — Q1/Q2 class and migration gates** (depends C-04,B-04). TEST-017 incompatible publish rejects before append; Q1 owner migration with complete WAL+dedup; Q1 lost owner creates new incarnation; Q2 unaffected. Proof: external oracle across 3 nodes.
 
+Focused increment: `scripts/test_q1_q2_isolation.py` journals Q1 restart and
+fail-closed history loss, plus same-broker Q1 commits during loss of two of three
+Q2 data voters. The bounded Q2 call is uncertain, Q1 advances from offset 0 to 2,
+and restarting the original voter storage restores quorum commits. Evidence:
+`benchmarks/evidence/c06-q1-q2-isolation/isolation.jsonl`. Static metadata fixtures
+do not exercise metadata-quorum loss. This increment does not complete C-06 or
+start C-07; the remaining migration/fault matrix is still unproven.
+
 **C-07 — Cluster fault gate** (depends C-05,C-06). Kill 1 node, lose majority, stale metadata lease, log corruption; verify Q2 acknowledged records and Q0/Q1 isolation. Proof: raw failure matrix with oracle, explicit limitations on physical failure domains.
 
 ## D — Evaluate the concept
