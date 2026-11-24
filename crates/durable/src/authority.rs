@@ -68,6 +68,11 @@ impl Fence {
         }
     }
     pub fn install(&mut self, authority: Option<Authority>, now: Instant) {
+        // A metadata revision may repeat an unchanged placement. It is not a lease
+        // renewal: preserve the original installation clock, including after expiry.
+        if self.authority == authority {
+            return;
+        }
         self.authority = authority;
         self.installed_at = now;
     }
@@ -135,5 +140,42 @@ mod tests {
         assert!(fence.check(1, Some(5), now).is_ok());
         fence.install(Authority::new(2, 6, Duration::from_secs(60)), now);
         assert_eq!(fence.check(1, Some(5), now), Err(FenceError::NotOwner));
+    }
+
+    #[test]
+    fn an_identical_install_does_not_renew_an_expired_lease() {
+        let mut fence = Fence::standalone();
+        let now = Instant::now();
+        let authority = Authority::new(1, 7, Duration::from_millis(1));
+        fence.install(authority, now);
+        let expired = now + Duration::from_secs(3);
+        fence.install(authority, expired);
+        assert_eq!(
+            fence.check(1, Some(7), expired),
+            Err(FenceError::ExpiredLease)
+        );
+        assert_eq!(fence.installed_at, now);
+    }
+
+    #[test]
+    fn changed_authority_installs_a_fresh_clock() {
+        let now = Instant::now();
+        let later = now + Duration::from_secs(3);
+        for next in [
+            Authority::new(1, 8, Duration::from_millis(1)),
+            Authority::new(2, 7, Duration::from_millis(1)),
+            Authority::new(1, 7, Duration::from_millis(2)),
+        ] {
+            let mut fence = Fence::standalone();
+            fence.install(Authority::new(1, 7, Duration::from_millis(1)), now);
+            fence.install(next, later);
+            assert_eq!(fence.installed_at, later);
+            let authority = next.unwrap();
+            assert!(
+                fence
+                    .check(authority.owner, Some(authority.epoch), later)
+                    .is_ok()
+            );
+        }
     }
 }
