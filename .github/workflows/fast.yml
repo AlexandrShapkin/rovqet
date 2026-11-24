@@ -96,5 +96,16 @@ jobs:
       - name: Wrong durable class over authenticated TCP (C-06 partial)
         run: python3 scripts/test_q1_q2_wire.py
 
+  q1-q2-isolation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build normal broker and SDK examples
+        run: cargo build -p rovqet-server -p rovqet-sdk --examples --bins --locked
+      - name: Q1 restart, fail-closed history loss and Q2 quorum-loss isolation (C-06 partial)
+        run: python3 scripts/test_q1_q2_isolation.py
+
 # Fast checks only. No PR requirement, mandatory human review, release build,
 # long-running soak or full benchmark suite on ordinary main commits.
