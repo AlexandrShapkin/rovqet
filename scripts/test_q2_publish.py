@@ -31,14 +31,34 @@ barrier, kills the leader, verifies no voter committed the entry, disarms the se
 restarts the node and retries the same producer token: the retry must settle at the
 next logical offset exactly once on every voter.
 
+The distinct proof "leader crash after a durable majority but before the response" is
+exercised by the mirrored `ROVQET_Q2_POSTMAJORITY_BARRIER=<dir>` seam. It engages in
+the client-write completion of the leader - after openraft returned the applied result
+of the entry, so the majority already committed it, and before the caller can build
+the acknowledgment - writes `barrier.json` (node, committed index, logical offset,
+token) and never returns. The parent waits for that barrier, waits until every running
+voter's own `state.json` carries the message at the barrier's logical offset (the
+majority proof that predates the kill), SIGKILLs the named node, and records that the
+client call ended without any successful response. The group is then restarted on its
+original storage: the retry of the identical token must resolve to the one committed
+record at the barrier's offset, and a second retry must report the same offset without
+creating a duplicate.
+
+Two further scenarios close the remaining matrix rows: one stops exactly one follower
+(identified from the last applied entry every voter persisted), publishes a real
+COMMITTED_QUORUM publication through the SDK while that follower is unavailable and
+then restarts it to check the catch-up; the other is the post-majority crash window
+described above.
+
 The seam is compiled only into a build with the `fault-injection` cargo feature, so
 the live campaign needs the broker and the publishing example built with:
 
     cargo build -p rovqet-server --features fault-injection --locked
     cargo build -p rovqet-sdk --example q2_publish --locked
 
-A broker built without that feature has no active premajority behavior at all; the
-preflight reports it as NOT_RUN instead of letting scenario 12 fail at the barrier.
+A broker built without that feature has no active pre-majority or post-majority
+behavior at all; the preflight reports it as NOT_RUN instead of letting a barrier
+scenario fail at a barrier that cannot exist.
 
 Default invocation runs the negative fixtures and then the campaign. `--fixtures-only`
 runs only the oracle fixture suite. Missing binaries are a real NOT_RUN observation,
@@ -67,10 +87,11 @@ import q1_oracle as oracle  # noqa: E402
 ROOT = Path(__file__).resolve().parents[1]
 SERVER = ROOT / "target" / "debug" / "rovqet"
 EXAMPLE = ROOT / "target" / "debug" / "examples" / "q2_publish"
-# The barrier environment variable exists in the broker binary only when it was
+# The barrier environment variables exist in the broker binary only when it was
 # built with the `fault-injection` feature, which is the only build that compiles
-# the pre-majority seam.
+# the pre-majority and the post-majority seam.
 SEAM_MARKER = b"ROVQET_Q2_PREMAJORITY_BARRIER"
+POSTMAJORITY_MARKER = b"ROVQET_Q2_POSTMAJORITY_BARRIER"
 EVIDENCE_DIR = ROOT / "benchmarks" / "evidence" / "c04-q2-publish"
 JOURNAL_PATH = EVIDENCE_DIR / "q2-publish.jsonl"
 
@@ -193,6 +214,62 @@ def committed(**overrides) -> dict:
     }
     record.update(overrides)
     return record
+
+
+def postmajority_barrier(**overrides) -> dict:
+    record = {
+        "event": "postmajority_barrier",
+        "node": 1,
+        "committed_index": 9,
+        "logical_offset": 0,
+        "producer_id": 11,
+        "producer_epoch": 0,
+        "sequence": 0,
+        "message_id": 100,
+    }
+    record.update(overrides)
+    return record
+
+
+def killed(node: int = 1) -> dict:
+    return {"event": "broker_killed", "node": node, "exit_code": -9}
+
+
+def uncertain(**overrides) -> dict:
+    record = {
+        "event": "publication_unknown",
+        "producer": 11,
+        "epoch": 0,
+        "sequence": 0,
+        "message_id": 100,
+        "digest": digest_hex("alpha"),
+        "reason": "the client call ended without any successful response",
+    }
+    record.update(overrides)
+    return record
+
+
+def postmajority_base() -> list[dict]:
+    """A complete, consistent post-majority barrier evidence set.
+
+    The armed token is committed and applied, three pre-kill voter states witness it
+    at the barrier offset, the barrier node is then killed, the interrupted call is
+    recorded as uncertain and the retry commits at the same barrier offset.
+    """
+    return [
+        {"event": "scenario_started", "scenario": 14},
+        attempt(),
+        postmajority_barrier(),
+        state(1),
+        state(2),
+        state(3),
+        killed(),
+        uncertain(),
+        committed(),
+        state(1),
+        state(2),
+        state(3),
+    ]
 
 
 def base() -> list[dict]:
@@ -556,6 +633,142 @@ class Q2PublishOracleFixtures(unittest.TestCase):
         )
         self.assertEqual(result["verdict"], oracle.PASS, result)
 
+    # --- Post-majority barrier evidence ------------------------------------
+
+    def test_a_consistent_postmajority_barrier_passes(self):
+        result = self.reconcile(postmajority_base())
+        self.assertEqual(result["verdict"], oracle.PASS, result)
+        self.assertEqual(result["counts"]["majority_proofs"], 1, result)
+
+    def test_a_barrier_whose_node_is_never_killed_fails(self):
+        records = [
+            record
+            for record in postmajority_base()
+            if record.get("event") != "broker_killed"
+        ]
+        result = self.reconcile(records)
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+        self.assertTrue(
+            any("never SIGKILLed" in reason for reason in result["reasons"]), result
+        )
+
+    def test_an_acknowledgment_before_the_barrier_kill_fails(self):
+        records = postmajority_base()
+        index = next(
+            position
+            for position, record in enumerate(records)
+            if record.get("event") == "broker_killed"
+        )
+        records.insert(index, committed())
+        result = self.reconcile(records)
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+        self.assertTrue(
+            any("before the barrier node" in reason for reason in result["reasons"]),
+            result,
+        )
+
+    def test_a_barrier_without_an_uncertainty_record_fails(self):
+        records = [
+            record
+            for record in postmajority_base()
+            if record.get("event") != "publication_unknown"
+        ]
+        result = self.reconcile(records)
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+        self.assertTrue(
+            any(
+                "no uncertainty record follows" in reason
+                for reason in result["reasons"]
+            ),
+            result,
+        )
+
+    def test_a_barrier_without_a_prekill_majority_at_the_offset_fails(self):
+        records = postmajority_base()
+        kill = next(
+            position
+            for position, record in enumerate(records)
+            if record.get("event") == "broker_killed"
+        )
+        records = [
+            record
+            for position, record in enumerate(records)
+            if not (
+                position < kill and record.get("event") == "voter_state"
+            )
+        ]
+        result = self.reconcile(records)
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+        self.assertTrue(
+            any(
+                "pre-kill voter state" in reason for reason in result["reasons"]
+            ),
+            result,
+        )
+
+    def test_a_retry_at_another_offset_than_the_barrier_fails(self):
+        records = [
+            attempt(),
+            postmajority_barrier(logical_offset=1, message_id=101),
+            state(1, offset_count=2),
+            state(2, offset_count=2),
+            state(3, offset_count=2),
+            killed(),
+            uncertain(),
+            committed(offset=0),
+            state(1, offset_count=2),
+            state(2, offset_count=2),
+            state(3, offset_count=2),
+        ]
+        result = self.reconcile(records)
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+        self.assertTrue(
+            any(
+                "never committed at the barrier logical offset 1" in reason
+                for reason in result["reasons"]
+            ),
+            result,
+        )
+
+    def test_a_duplicate_token_message_in_a_voter_state_fails(self):
+        duplicated = state(1, offset_count=3)
+        duplicated["messages"][2] = {**duplicated["messages"][0], "offset": 2}
+        result = self.reconcile(
+            [attempt(), committed(), duplicated, state(2), state(3)]
+        )
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+        self.assertTrue(
+            any(
+                "2 messages for the single producer token" in reason
+                for reason in result["reasons"]
+            ),
+            result,
+        )
+
+    def test_an_incomplete_required_scenario_set_never_passes(self):
+        records = base()
+        for record in records:
+            record["run"] = "c04-q2-publish"
+        result = oracle.reconcile_q2_publish(concluded(records))
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+        self.assertTrue(
+            any(
+                "never ran required scenario" in reason
+                for reason in result["reasons"]
+            ),
+            result,
+        )
+
+    def test_a_complete_required_scenario_set_still_passes(self):
+        records = base() + [
+            {"event": "scenario_started", "scenario": number}
+            for number in range(2, 15)
+        ]
+        for record in records:
+            record["run"] = "c04-q2-publish"
+        result = oracle.reconcile_q2_publish(concluded(records))
+        self.assertEqual(result["verdict"], oracle.PASS, result)
+
 
 class Q2JournalRecordingFixtures(unittest.TestCase):
     """The campaign's own journal path must accept a complete voter-state record."""
@@ -869,6 +1082,28 @@ class Node:
             "outcomes": outcomes,
         }
 
+    def last_applied(self) -> dict | None:
+        """The `last_applied` log id this voter persisted, read from its own storage.
+
+        `leader_id.node_id` names the node that proposed that entry, so the entry every
+        voter applied last identifies the leader that produced it. `state.json` is
+        replaced atomically, so a running voter is never read half-written.
+        """
+        path = self.directory / "state" / "state.json"
+        if not path.exists():
+            return None
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+            applied = document["state"].get("last_applied") or {}
+            leader_id = applied.get("leader_id") or {}
+            index = applied["index"]
+            node_id = leader_id["node_id"]
+        except (OSError, KeyError, TypeError, json.JSONDecodeError):
+            return None
+        if not isinstance(index, int) or not isinstance(node_id, int):
+            return None
+        return {"index": index, "term": leader_id.get("term"), "node_id": node_id}
+
 
 class Campaign:
     def __init__(self, journal: oracle.Journal, directory: Path):
@@ -895,6 +1130,27 @@ class Campaign:
         self.journal.append("evidence", check=detail, ok=bool(ok), **fields)
         if not ok:
             raise CheckFailure(detail)
+
+    def has_journal_event(self, event: str, **fields) -> bool:
+        """Whether the journal on disk already holds such a record.
+
+        Used to assert, at a precise point of the campaign, that an observation the
+        oracle requires (or must not see yet) really is absent before the next fault
+        is injected.
+        """
+        try:
+            lines = self.journal.path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return False
+        for line in lines:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            if record.get("event") == event and all(
+                record.get(key) == value for key, value in fields.items()
+            ):
+                return True
+        return False
 
     def live(self) -> list[int]:
         return [
@@ -1032,6 +1288,7 @@ class Campaign:
         *,
         incarnation: int = INCARNATION,
         timeout: float = T_PUBLISH,
+        exit_event: str | None = None,
     ) -> dict | None:
         """Collect an attempt whose broker may be killed while it is in flight.
 
@@ -1039,6 +1296,12 @@ class Campaign:
         the SDK loses its socket when the harness kills the leader. The externally
         observed outcome is journaled only when the SDK actually printed one;
         otherwise the exit is recorded as its own evidence and no outcome is invented.
+
+        `exit_event` names the record written for an attempt that printed nothing at
+        all. When it is given the attempt is additionally collected as an uncertain
+        `publication_unknown` outcome, so a killed call is an observed uncertainty in
+        the journal instead of a silent gap: no acknowledgment is ever invented for
+        it.
         """
         try:
             stdout, stderr = process.communicate(timeout=timeout)
@@ -1048,7 +1311,7 @@ class Campaign:
         lines = [line for line in stdout.splitlines() if line.strip()]
         if not lines:
             self.journal.append(
-                "premajority_attempt_exit",
+                exit_event or "premajority_attempt_exit",
                 producer=producer,
                 producer_epoch=epoch,
                 sequence=sequence,
@@ -1056,6 +1319,20 @@ class Campaign:
                 exit_code=process.returncode,
                 stderr=stderr.strip()[-800:],
             )
+            if exit_event is not None:
+                self.journal.append(
+                    "publication_unknown",
+                    producer=producer,
+                    epoch=epoch,
+                    sequence=sequence,
+                    message_id=message_id,
+                    digest=digest_hex(payload),
+                    incarnation=incarnation,
+                    reason=(
+                        f"{exit_event}: the client call ended without any successful "
+                        "response"
+                    ),
+                )
             return None
         observed = self._observed(stdout)
         self._journal_outcome(
@@ -1089,6 +1366,32 @@ class Campaign:
             time.sleep(T_POLL)
         raise CheckFailure(
             f"the armed broker did not emit the pre-majority barrier: {last_error}"
+        )
+
+    def await_postmajority_barrier(
+        self, path: Path, process: subprocess.Popen, *, timeout: float = T_APPLIED
+    ) -> dict:
+        """Wait until the armed broker wrote its post-majority barrier document.
+
+        A barrier that never appears is a failed observation, never a pass: the
+        deadline is bounded and the caller reports the reason it missed.
+        """
+        deadline = time.monotonic() + timeout
+        last_error = "the barrier document never appeared"
+        while time.monotonic() < deadline:
+            if path.exists():
+                try:
+                    return json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as error:
+                    last_error = f"unreadable barrier: {error}"
+            if process.poll() is not None:
+                raise CheckFailure(
+                    "the SDK attempt finished before the armed broker emitted the "
+                    f"post-majority barrier (exit {process.returncode}): {last_error}"
+                )
+            time.sleep(T_POLL)
+        raise CheckFailure(
+            f"the armed broker did not emit the post-majority barrier: {last_error}"
         )
 
     @staticmethod
@@ -1231,6 +1534,39 @@ class Campaign:
                     f"{observed!r}"
                 )
             time.sleep(0.3)
+
+    def observe_leader(self, *, timeout: float = T_READY) -> int:
+        """Poll the three persisted `last_applied` documents until they name one leader.
+
+        openraft serializes `last_applied.leader_id.node_id`, so the entry every voter
+        applied last identifies the node that proposed it. All three voters must agree
+        on the same node before the campaign stops one of the others; a group that
+        never agrees fails instead of guessing.
+        """
+        deadline = time.monotonic() + timeout
+        last: dict[int, object] = {}
+        while time.monotonic() < deadline:
+            last = {
+                number: node.last_applied() for number, node in self.nodes.items()
+            }
+            applied = {
+                number: value["node_id"]
+                for number, value in last.items()
+                if isinstance(value, dict)
+            }
+            if len(applied) == len(self.nodes) and len(set(applied.values())) == 1:
+                leader = next(iter(applied.values()))
+                self.journal.append(
+                    "leader_observed",
+                    leader=leader,
+                    applied={str(key): value for key, value in applied.items()},
+                )
+                return leader
+            time.sleep(T_POLL)
+        raise CheckFailure(
+            "the three voters never agreed on one leader: "
+            + json.dumps(last, default=str)[:800]
+        )
 
     def record_states(self, numbers=None) -> dict[int, dict | None]:
         numbers = self.live() if numbers is None else numbers
@@ -1673,6 +2009,294 @@ def run_campaign(campaign: Campaign) -> None:
     )
     campaign.journal.append("scenario_conclusion", scenario=12, verdict=PASS)
 
+    campaign.journal.append(
+        "scenario_started",
+        scenario=13,
+        name="one-unavailable-follower-quorum",
+    )
+    # The leader is read from the entry every voter persisted, so exactly one
+    # follower can be stopped while the leader and the client entry point stay up.
+    leader = campaign.observe_leader()
+    campaign.check(
+        leader in campaign.nodes and leader in campaign.live(),
+        "one leader is running among the three voters",
+        leader=leader,
+        live=campaign.live(),
+    )
+    stopped = next(number for number in (2, 3) if number != leader)
+    campaign.nodes[stopped].stop()
+    campaign.check(
+        stopped not in campaign.live() and len(campaign.live()) == 2,
+        f"exactly one follower (node {stopped}) is unavailable while the leader runs",
+        stopped=stopped,
+        leader=leader,
+        live=campaign.live(),
+    )
+    campaign.journal.append(
+        "follower_unavailable",
+        stopped=stopped,
+        leader=leader,
+        live=campaign.live(),
+    )
+    producer, sequence, message_id, payload = 22, 0, 301, "one-down"
+    offset = 6
+    observed = campaign.publish_until_certain(
+        producer, 0, sequence, message_id, payload, timeout=75
+    )
+    campaign.expect_committed(observed, offset)
+    campaign.journal.append(
+        "ack_with_follower_down",
+        stopped=stopped,
+        leader=leader,
+        producer=producer,
+        epoch=0,
+        sequence=sequence,
+        message_id=message_id,
+        offset=offset,
+        live=campaign.live(),
+    )
+    states = campaign.await_message(offset, message_id, timeout=45)
+    campaign.check(
+        all(
+            state["next_logical_offset"] == offset + 1
+            and campaign.message(state, offset)["payload"] == payload_hex(payload)
+            and len(
+                [
+                    message
+                    for message in state["messages"]
+                    if message.get("message_id") == message_id
+                ]
+            )
+            == 1
+            for state in states.values()
+        ),
+        "the two available voters committed the publication exactly once at offset 6",
+        states={str(key): value for key, value in states.items()},
+    )
+    campaign.start([stopped])
+    states = campaign.await_message(offset, message_id, timeout=60)
+    campaign.check(
+        all(
+            state["next_logical_offset"] == offset + 1
+            and campaign.message(state, offset)["payload"] == payload_hex(payload)
+            and campaign.message(state, offset)["digest"] == digest_hex(payload)
+            for state in states.values()
+        ),
+        f"the restarted follower node {stopped} caught up to the same committed state",
+        states={str(key): value for key, value in states.items()},
+    )
+    campaign.journal.append(
+        "follower_recovered",
+        node=stopped,
+        leader=leader,
+        offset=offset,
+        message_id=message_id,
+        next_logical_offset=states[stopped]["next_logical_offset"],
+    )
+    campaign.journal.append("scenario_conclusion", scenario=13, verdict=PASS)
+
+    campaign.journal.append(
+        "scenario_started",
+        scenario=14,
+        name="leader-crash-after-majority-before-response",
+    )
+    # A fresh producer token no earlier scenario attempted: the seam may only hold
+    # this exact identity.
+    producer, sequence, message_id, payload = 23, 0, 302, "postmajority"
+    barrier_directory = campaign.directory / "postmajority"
+    barrier_directory.mkdir(parents=True, exist_ok=True)
+    arm_path = barrier_directory / "arm.json"
+    barrier_path = barrier_directory / "barrier.json"
+    barrier_path.unlink(missing_ok=True)
+    arm_path.write_text(
+        json.dumps(
+            {
+                "producer_id": producer,
+                "producer_epoch": 0,
+                "sequence": sequence,
+                "message_id": message_id,
+            }
+        ),
+        encoding="utf-8",
+    )
+    # Every broker is restarted so each process inherits the barrier directory: the
+    # seam can only engage on whichever node ends up committing the entry.
+    for number in (1, 2, 3):
+        campaign.nodes[number].stop()
+    campaign.check(
+        campaign.live() == [],
+        "all three brokers stopped before the post-majority seam was armed",
+        live=campaign.live(),
+    )
+    campaign.env["ROVQET_Q2_POSTMAJORITY_BARRIER"] = str(barrier_directory)
+    campaign.start([1, 2, 3])
+    # A warm-up publication proves the restarted group elected a leader before the one
+    # armed attempt; the armed token itself is attempted exactly once.
+    warmup = campaign.publish_until_certain(24, 0, 0, 303, "warmup", timeout=75)
+    campaign.check(
+        warmup.get("outcome") == "committed_quorum"
+        and isinstance(warmup.get("offset"), int),
+        "the restarted group elected a leader that committed a warm-up publication",
+        observed=warmup,
+    )
+    campaign.await_message(warmup["offset"], 303, timeout=45)
+    leader = campaign.observe_leader()
+    campaign.check(
+        leader in campaign.live(),
+        "a legitimate leader committed the warm-up publication",
+        leader=leader,
+        live=campaign.live(),
+    )
+
+    attempt = campaign.publish_start(producer, 0, sequence, message_id, payload)
+    barrier = campaign.await_postmajority_barrier(barrier_path, attempt)
+    campaign.journal.append(
+        "postmajority_barrier",
+        **{key: value for key, value in barrier.items() if key != "event"},
+    )
+    campaign.check(
+        barrier.get("event") == "postmajority_barrier"
+        and barrier.get("producer_id") == producer
+        and barrier.get("producer_epoch") == 0
+        and barrier.get("sequence") == sequence
+        and barrier.get("message_id") == message_id,
+        "the armed broker held this exact publication at the post-majority barrier",
+        barrier=barrier,
+    )
+    campaign.check(
+        isinstance(barrier.get("committed_index"), int)
+        and isinstance(barrier.get("logical_offset"), int)
+        and isinstance(barrier.get("node"), int),
+        "the barrier names the committed index, the logical offset and the node",
+        barrier=barrier,
+    )
+    barrier_node = barrier["node"]
+    barrier_offset = barrier["logical_offset"]
+    campaign.check(
+        barrier_node in campaign.live(),
+        "the barrier names a live voter that committed the entry",
+        barrier=barrier,
+    )
+    # The majority proof has to predate the kill: every running voter must carry the
+    # barrier message at the barrier's own logical offset first.
+    states = campaign.await_message(barrier_offset, message_id, timeout=45)
+    campaign.check(
+        len(states) >= 2
+        and all(
+            campaign.message(state, barrier_offset)["digest"] == digest_hex(payload)
+            and campaign.message(state, barrier_offset)["payload"] == payload_hex(payload)
+            for state in states.values()
+        ),
+        "every running voter carries the barrier message at the barrier offset "
+        "before the kill",
+        barrier=barrier,
+        states={str(key): value for key, value in states.items()},
+    )
+    campaign.check(
+        not campaign.has_journal_event(
+            "publication_committed", producer=producer, epoch=0, sequence=sequence
+        ),
+        "no acknowledgment for the armed token reached the client before the kill",
+        barrier_node=barrier_node,
+    )
+    campaign.nodes[barrier_node].kill()
+    campaign.check(
+        barrier_node not in campaign.live(),
+        f"the barrier node {barrier_node} was SIGKILLed after the barrier",
+        barrier=barrier,
+        live=campaign.live(),
+    )
+    interrupted = campaign.collect_attempt(
+        attempt,
+        producer,
+        0,
+        sequence,
+        message_id,
+        payload,
+        exit_event="postmajority_attempt_exit",
+    )
+    campaign.check(
+        interrupted is None or interrupted.get("outcome") != "committed_quorum",
+        "the interrupted call never observed COMMITTED_QUORUM",
+        observed=interrupted,
+    )
+    # The crash point has been witnessed. Disarm before recovery so the restarted
+    # group behaves exactly like a production broker.
+    arm_path.unlink(missing_ok=True)
+    campaign.env.pop("ROVQET_Q2_POSTMAJORITY_BARRIER", None)
+    for number in campaign.live():
+        campaign.nodes[number].stop()
+    campaign.check(
+        campaign.live() == [],
+        "the whole group stopped before recovery on its original storage",
+        live=campaign.live(),
+    )
+    campaign.start([1, 2, 3])
+    recovered_leader = campaign.observe_leader()
+    campaign.check(
+        recovered_leader in campaign.nodes and recovered_leader in campaign.live(),
+        "the recovered group elected a legitimate leader",
+        leader=recovered_leader,
+        live=campaign.live(),
+    )
+    states = campaign.await_message(barrier_offset, message_id, timeout=60)
+    expected = list(range(barrier_offset + 1))
+    campaign.check(
+        all(
+            all(campaign.message(state, index) is not None for index in expected)
+            for state in states.values()
+        ),
+        "every restarted voter retained the whole committed prefix, including the "
+        "record the barrier acknowledged",
+        barrier_offset=barrier_offset,
+        states={str(key): value for key, value in states.items()},
+    )
+    observed = campaign.publish_until_certain(
+        producer, 0, sequence, message_id, payload, timeout=75
+    )
+    campaign.expect_committed(observed, barrier_offset)
+    states = campaign.await_message(barrier_offset, message_id, timeout=60)
+    campaign.check(
+        all(
+            state["next_logical_offset"] == barrier_offset + 1
+            and len(
+                [
+                    message
+                    for message in state["messages"]
+                    if message.get("message_id") == message_id
+                ]
+            )
+            == 1
+            for state in states.values()
+        ),
+        "the retry resolved to exactly one committed record at the barrier offset",
+        barrier_offset=barrier_offset,
+        states={str(key): value for key, value in states.items()},
+    )
+    observed_again = campaign.publish_until_certain(
+        producer, 0, sequence, message_id, payload, timeout=75
+    )
+    campaign.expect_committed(observed_again, barrier_offset)
+    states = campaign.await_message(barrier_offset, message_id, timeout=60)
+    campaign.check(
+        all(
+            state["next_logical_offset"] == barrier_offset + 1
+            and len(
+                [
+                    message
+                    for message in state["messages"]
+                    if message.get("message_id") == message_id
+                ]
+            )
+            == 1
+            for state in states.values()
+        ),
+        "the second retry reports the same offset and creates no duplicate",
+        barrier_offset=barrier_offset,
+        states={str(key): value for key, value in states.items()},
+    )
+    campaign.journal.append("scenario_conclusion", scenario=14, verdict=PASS)
+
 
 def preflight_problem() -> str | None:
     missing = [
@@ -1685,6 +2309,12 @@ def preflight_problem() -> str | None:
     if SEAM_MARKER not in SERVER.read_bytes():
         return (
             "broker built without the fault-injection feature, so the pre-majority "
+            "seam does not exist: run "
+            "cargo build -p rovqet-server --features fault-injection --locked"
+        )
+    if POSTMAJORITY_MARKER not in SERVER.read_bytes():
+        return (
+            "broker built without the fault-injection feature, so the post-majority "
             "seam does not exist: run "
             "cargo build -p rovqet-server --features fault-injection --locked"
         )

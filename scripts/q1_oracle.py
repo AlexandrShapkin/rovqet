@@ -1649,6 +1649,11 @@ def reconcile_q2_raft(records: list[dict], *, require_conclusion: bool = True) -
 # whose committed state contains the acknowledged message.
 
 Q2_PUBLISH_MAJORITY = 2
+# The C-04 campaign's own journal identity and the scenarios it must have executed
+# before its conclusion may be accepted as PASS. An incomplete campaign is never a
+# PASS, whatever the rest of the evidence says.
+Q2_PUBLISH_RUN = "c04-q2-publish"
+Q2_PUBLISH_REQUIRED_SCENARIOS = frozenset(range(1, 15))
 
 
 def _q2_hex(value) -> str | None:
@@ -2261,6 +2266,139 @@ def reconcile_q2_publish(
                         "definitively rejected with a different message identity: "
                         f"retained {retained_identity}, rejected {rejected_identity}"
                     )
+
+    # The post-majority barrier is an externally observed commit point: the armed
+    # publication is already committed and applied by a majority, its response never
+    # left the named node, and that node was killed afterwards. Every one of those
+    # observations has to be present; a barrier without them is not evidence of the
+    # "leader crash after majority before response" window.
+    for barrier in (r for r in records if r.get("event") == "postmajority_barrier"):
+        barrier_seq = _q2_int(barrier.get("seq")) or 0
+        token = _q2_publish_key(barrier)
+        offset = _q2_int(barrier.get("logical_offset"))
+        committed_index = _q2_int(barrier.get("committed_index"))
+        node = _q2_int(barrier.get("node"))
+        if committed_index is None:
+            invalid.append(
+                f"the post-majority barrier at seq {barrier.get('seq')} carries no "
+                "committed index"
+            )
+        if token is None or offset is None or node is None:
+            invalid.append(
+                f"the post-majority barrier at seq {barrier.get('seq')} has no "
+                "producer token, logical offset or node"
+            )
+            continue
+        kills = [
+            record
+            for record in records
+            if record.get("event") == "broker_killed"
+            and _q2_int(record.get("node")) == node
+            and (_q2_int(record.get("seq")) or 0) > barrier_seq
+        ]
+        kill_seq = _q2_int(kills[0].get("seq")) if kills else None
+        if kill_seq is None:
+            reasons.append(
+                f"the barrier node {node} was never SIGKILLed after the post-majority "
+                f"barrier at seq {barrier.get('seq')}"
+            )
+        acknowledged_before_kill = [
+            record
+            for record in committed
+            if _q2_publish_key(record) == token
+            and kill_seq is not None
+            and (_q2_int(record.get("seq")) or 0) < kill_seq
+        ]
+        if acknowledged_before_kill:
+            reasons.append(
+                f"producer token {token} was acknowledged at seq "
+                f"{acknowledged_before_kill[0].get('seq')} before the barrier node "
+                f"{node} was killed"
+            )
+        uncertainties = [
+            record
+            for record in records
+            if record.get("event") == "publication_unknown"
+            and _q2_publish_key(record) == token
+            and (_q2_int(record.get("seq")) or 0) > barrier_seq
+        ]
+        if not uncertainties:
+            reasons.append(
+                f"no uncertainty record follows the post-majority barrier for "
+                f"producer token {token}"
+            )
+        # The majority that predates the kill: only voter states observed after the
+        # barrier and before the kill may witness the barrier's own commit point.
+        pre_kill = (
+            [
+                state
+                for state in states
+                if state["seq"] is not None
+                and barrier_seq < state["seq"] < kill_seq
+            ]
+            if kill_seq is not None
+            else []
+        )
+        witness_nodes = {
+            state["node"]
+            for state in pre_kill
+            if state["messages"].get(offset) is not None
+            and state["messages"][offset]["message_id"]
+            == _q2_int(barrier.get("message_id"))
+        }
+        if len(witness_nodes) < Q2_PUBLISH_MAJORITY:
+            reasons.append(
+                f"only {len(witness_nodes)} pre-kill voter state(s) carry the barrier "
+                f"message of {token} at offset {offset}; {Q2_PUBLISH_MAJORITY} are "
+                "required before the kill"
+            )
+        retries = [
+            record
+            for record in committed
+            if _q2_publish_key(record) == token
+            and _q2_int(record.get("offset")) == offset
+            and kill_seq is not None
+            and (_q2_int(record.get("seq")) or 0) > kill_seq
+        ]
+        if not retries:
+            reasons.append(
+                f"the retry of producer token {token} never committed at the barrier "
+                f"logical offset {offset}"
+            )
+
+    # One producer token may own at most one retained message in a voter's committed
+    # state: a second message for the same token is a duplicated publication and the
+    # whole journal is rejected, not merely noted.
+    for state in states:
+        per_token: dict[tuple, int] = {}
+        for message in state["messages"].values():
+            key = (message["producer"], message["epoch"], message["sequence"])
+            if key[0] is None or key[1] is None or key[2] is None:
+                invalid.append(
+                    f"node {state['node']} retains a message without a complete "
+                    "producer token; duplication cannot be checked"
+                )
+                continue
+            per_token[key] = per_token.get(key, 0) + 1
+        for key, count in sorted(per_token.items()):
+            if count > 1:
+                reasons.append(
+                    f"node {state['node']} retains {count} messages for the single "
+                    f"producer token {key}"
+                )
+
+    # The C-04 campaign must have executed every required scenario: a journal of
+    # this run that stops early can never be reported as PASS.
+    if any(record.get("run") == Q2_PUBLISH_RUN for record in records):
+        missing = sorted(
+            Q2_PUBLISH_REQUIRED_SCENARIOS
+            - {_q2_int(record.get("scenario")) for record in started}
+        )
+        if missing:
+            reasons.append(
+                "the C-04 Q2 publication campaign never ran required scenario(s) "
+                + ", ".join(str(number) for number in missing)
+            )
 
     counts = {
         "scenarios": len(started),
