@@ -1,7 +1,7 @@
 //! Cluster mode: explicit peers, a metadata authority fixture and owner-aware routing.
 //!
 //! Cluster mode is opt-in. It never invents ownership authority: the local metadata store
-//! is the only source of placement and epoch, and a node that is not the owner refuses to
+//! (or the Raft node's committed snapshot) supplies placement and epoch; a non-owner refuses to
 //! mutate. A routed request is forwarded at most once.
 use crate::q1::Route;
 use rovqet_control::ids::{ClusterId, NodeId, PeerEndpoint, TrustContext};
@@ -222,7 +222,13 @@ impl Cluster {
 
     /// The committed ownership authority of one partition, if the snapshot places it.
     pub fn authority_for(&self, partition: &PartitionRef) -> Option<rovqet_durable::Authority> {
-        let snapshot = self.store.current()?;
+        // The store publisher and authority watcher are independent subscribers to
+        // committed_updates. The watcher must not read a lagging store and then miss
+        // the placement forever when there is no subsequent commit to wake it.
+        let snapshot = match &self.raft {
+            Some(node) => Arc::new(node.committed_snapshot()?),
+            None => self.store.current()?,
+        };
         let placement = snapshot.owner_of(partition)?;
         rovqet_durable::Authority::new(
             placement.owner.get(),
@@ -635,7 +641,7 @@ mod tests {
             metadata_raft: Some(raft_options(port, path.clone())),
             transfer_staging: None,
         };
-        let cluster = Cluster::new(&options).await.expect("cluster");
+        let mut cluster = Cluster::new(&options).await.expect("cluster");
         let node = cluster.raft_node().expect("the metadata voter");
 
         // No committed metadata yet: the data plane has no authority at all.
@@ -716,6 +722,12 @@ mod tests {
             .find(|placement| placement.partition == partition)
             .expect("placement");
         assert!(!cluster.store.authority_expired(placement));
+
+        // Model the publication task not having run yet. Authority must come from the
+        // committed Raft state, independently of the routing store's scheduling.
+        cluster.store = Arc::new(MetadataStore::new(ClusterId::new(5150).unwrap()));
+        assert!(cluster.store.current().is_none());
+        assert_eq!(cluster.authority_for(&partition), Some(authority));
         let _ = std::fs::remove_dir_all(path);
     }
 }
