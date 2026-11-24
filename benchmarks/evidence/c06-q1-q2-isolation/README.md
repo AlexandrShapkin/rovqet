@@ -29,7 +29,7 @@ broker and SDK examples and runs this regression.
 
 ## 2. Focused isolation journal — `0008cfb`, `391e8b5`
 
-Artifact: `isolation.jsonl` (51 records, three scenario conclusions).
+Artifact: `isolation.jsonl` (73 records, four scenario conclusions).
 
 ```sh
 timeout 600 python3 scripts/test_q1_q2_isolation.py
@@ -53,6 +53,17 @@ timeout 600 python3 scripts/test_q1_q2_isolation.py
   restarting the voters on their original storage restores a Q2 quorum commit at
   offset 2. The uncertain request may commit after restoration; the timeout is not
   proof of non-delivery.
+- `q2-history-survives-isolated-q1-storage-loss` **PASS**: Q2 incarnation 42,
+  offset 0, payload digest
+  `dc77d1451d876efa4c85e159ab73f2c9baa24366b783d44358676a487743f9f1`
+  survives truncating a throwaway Q1 WAL segment and overwriting its MANIFEST.
+  Fresh reads of all three voters' persisted committed states recover the same
+  offset and payload digest. The journal names each separate data directory and
+  the exact corruption operations, and distinguishes Q1 `COMMITTED_LOCAL 43 0`
+  from Q2 `COMMITTED_QUORUM` incarnation 42 offset 0. This is a persisted-state
+  inspection, not a Q2 wire consumer or restart test. The previously executed
+  C-04 `one-unavailable-follower-quorum` evidence and its recorded oracle PASS
+  are cited, not rerun.
 
 The Q2 scenario disturbs the Q2 **data** quorum. Metadata is supplied by static
 JSON fixtures, not a live metadata Raft quorum, so no metadata-quorum isolation
@@ -69,7 +80,9 @@ python3 -c "import json,sys; sys.path.insert(0,'scripts'); import q1_oracle as o
 
 The verifier reads the journal only. `oracle.json` records verdict **PASS**,
 reasons `[]`, and counts
-`{"records": 51, "scenarios": 3, "q1_acknowledged": 9, "q2_quorum_acknowledged": 3, "q2_blocked_timeouts": 1, "majority_loss_windows": 1, "violations": 0}`.
+`{"records": 73, "scenarios": 3, "q1_acknowledged": 9, "q2_quorum_acknowledged": 3, "q2_blocked_timeouts": 1, "majority_loss_windows": 1, "violations": 0}`.
+The unchanged reconciler checks its three original scenarios; the fourth
+scenario's read-back assertions and conclusion are emitted by the campaign.
 The reconciler enforces ten violation classes and is covered by eleven fixtures
 added in `e422185`:
 
@@ -90,10 +103,9 @@ the documentation increment that added this job; CI executes it.
 
 These are explicit gaps, not failures and not PASS:
 
-1. **`q2-history-survives-isolated-q1-storage-loss` was not executed.** No
-   recorded scenario wipes Q1 storage while a Q2 history is preserved. The
-   `q1-unrecoverable-history-fails-closed-and-fresh-incarnation-is-distinct`
-   scenario proves Q1 fail-closed behavior only.
+1. **Physical host/disk loss is not certified.** The Q1 corruption scenario
+   mutates only disposable Q1 files while the Q2 voters remain running; it does
+   not simulate a shared-device failure or restart Q2 after the corruption.
 2. **Per-partition isolation (§7) was not exercised.** No recorded scenario
    addresses multiple logical partitions in one shard. This evidence does not
    establish whether the current build supports that configuration; the question

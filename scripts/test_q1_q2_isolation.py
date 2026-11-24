@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """C-06 isolation: Q1 history and same-process Q2 quorum-loss isolation.
 
-Three scenarios over real TCP with external SDK clients, reusing the Q1 process
+Four scenarios with external SDK clients, reusing the Q1 process
 harness from q1_smoke. A SIGKILL restart must preserve the incarnation, the
 logical offsets and producer dedup, while a destroyed history must refuse
 recovery explicitly; only an explicit new-log initialization may start a
@@ -33,6 +33,7 @@ EVIDENCE = (Path(__file__).resolve().parents[1] / "benchmarks" / "evidence"
 S1 = "q1-restart-preserves-incarnation-and-offsets"
 S2 = "q1-unrecoverable-history-fails-closed-and-fresh-incarnation-is-distinct"
 S3 = "q2-quorum-loss-blocks-quorum-ack-while-q1-commits"
+S4 = "q2-history-survives-isolated-q1-storage-loss"
 
 TOPIC = "durable"
 TENANT_ID, TOPIC_ID, PARTITION_ID = 1, 3, 0
@@ -497,6 +498,118 @@ def scenario_quorum_loss(journal: oracle.Journal) -> str:
             f"original-storage restart restored Q2 {restored}")
 
 
+def scenario_storage_loss(journal: oracle.Journal) -> str:
+    """Corrupt only a disposable Q1 WAL; reread Q2's committed payload on disk."""
+    class ScenarioJournal:
+        def append(self, event, **fields):
+            return journal.append(event, scenario=S4, **fields)
+
+    scoped = ScenarioJournal()
+    with tempfile.TemporaryDirectory(prefix="rovqet-c06-storage-loss-") as temporary:
+        directory = Path(temporary)
+        cluster = directory / "q2"
+        cluster.mkdir()
+        campaign = Campaign(scoped, cluster)
+        payload = "q2-survives-q1-storage-loss"
+        digest = oracle.digest_hex(payload.encode())
+        broker = None
+        try:
+            campaign.start((1, 2, 3), bootstrap_only_node=1)
+            committed = campaign.publish_until_certain(41, 0, 0, 400, payload)
+            assert committed["outcome"] == "committed_quorum", committed
+            assert committed["incarnation"] == INCARNATION, committed
+            offset = committed["offset"]
+            before = campaign.await_message(offset, 400)
+            assert set(before) == {1, 2, 3}, before
+            scoped.append("q2_history_committed", acknowledgment="COMMITTED_QUORUM",
+                          observed=committed, offset=offset, payload_digest=digest)
+
+            local = directory / "throwaway-q1"
+            local.mkdir()
+            broker = Broker(local, incarnation=NEW_INCARNATION)
+            broker.start()
+            result = publish(broker, 0, NEW_INCARNATION)
+            local_offset = committed_local(result, NEW_INCARNATION, 0)
+            broker.stop()
+            scoped.append("throwaway_q1_stopped", returncode=broker.process.returncode,
+                          data_directory=str(broker.wal))
+            scoped.append(
+                "distinct_durability_acknowledgments",
+                q2_ack="COMMITTED_QUORUM", q2_client_line=json.dumps(committed),
+                q2_incarnation=INCARNATION, q2_offset=offset,
+                q2_partition={"tenant_id": 1, "topic_id": 4, "partition_id": 0},
+                q1_client_line=result.stdout.strip(),
+                q1_incarnation=NEW_INCARNATION, q1_offset=local_offset,
+                q1_partition=partition_identity(),
+            )
+            voter_dirs = {str(number): str(node.directory.resolve())
+                          for number, node in campaign.nodes.items()}
+            q1_dir = broker.wal.resolve()
+            assert q1_dir.is_relative_to(directory.resolve()), q1_dir
+            for voter_dir in voter_dirs.values():
+                assert not q1_dir.is_relative_to(voter_dir), voter_dir
+                assert not Path(voter_dir).is_relative_to(q1_dir), voter_dir
+            scoped.append(
+                "storage_domains_distinct", corrupted_q1_directory=str(q1_dir),
+                q2_voter_directories=voter_dirs,
+                reason="Q1 WAL is outside every Q2 voter data directory; only Q1 files are mutated",
+            )
+            segment = next(iter(sorted(q1_dir.glob("segment-*.wal"))))
+            manifest = q1_dir / "MANIFEST"
+            assert segment.stat().st_size > 0 and manifest.is_file(), q1_dir
+            for path, operation, replacement in (
+                    (segment, "truncate to zero bytes", b""),
+                    (manifest, "overwrite with invalid manifest bytes", b"corrupt-q1-manifest\n")):
+                old_size = path.stat().st_size
+                path.write_bytes(replacement)
+                scoped.append("q1_storage_corrupted", path=str(path),
+                              operation=operation, bytes_before=old_size,
+                              bytes_after=path.stat().st_size)
+
+            # Fresh reads from each voter's persisted committed state, not the
+            # pre-corruption snapshots. This is not a wire consumer/failover test.
+            for number, node in campaign.nodes.items():
+                state = node.read_state()
+                assert state is not None, number
+                record = campaign.message(state, offset)
+                assert record is not None and record["offset"] == offset, record
+                assert record["message_id"] == 400, record
+                read_digest = oracle.digest_hex(bytes.fromhex(record["payload"]))
+                assert read_digest == record["digest"] == digest, record
+                scoped.append("q2_history_read_back", node=number,
+                              path=str(node.directory / "state" / "state.json"),
+                              incarnation=INCARNATION, offset=record["offset"],
+                              payload_digest=read_digest, payload=record["payload"],
+                              source="fresh persisted committed-state read")
+            reused = (Path(__file__).resolve().parents[1] / "benchmarks/evidence"
+                      / "c04-q2-publish/q2-publish.jsonl")
+            reused_records = [json.loads(line) for line in reused.read_text().splitlines()
+                              if line.strip()]
+            reused_oracle = next(record for record in reversed(reused_records)
+                                 if record.get("event") == "oracle_verdict")
+            assert reused_oracle["verdict"] == oracle.PASS, reused_oracle
+            assert any("one-unavailable-follower-quorum" in record.values()
+                       for record in reused_records), "C-04 scenario missing"
+            scoped.append(
+                "reused_evidence",
+                path="benchmarks/evidence/c04-q2-publish/q2-publish.jsonl",
+                reused_scenario="one-unavailable-follower-quorum",
+                oracle_verdict=reused_oracle["verdict"],
+                property="Q2 single-unavailable-follower quorum",
+                execution="previously executed C-04 evidence; not rerun",
+            )
+        finally:
+            if broker is not None:
+                broker.close()
+            for node in campaign.nodes.values():
+                node.kill()
+                if node.process is not None and node.process.stderr is not None:
+                    node.process.stderr.close()
+    return (f"Q2 incarnation {INCARNATION} offset {offset} digest {digest} "
+            f"read back from all three persisted voter states after isolated "
+            f"Q1 corruption of {segment} and {manifest}")
+
+
 def main() -> int:
     missing = [str(path) for path in (SERVER, Q1, READ, EXAMPLE) if not path.is_file()]
     EVIDENCE.mkdir(parents=True, exist_ok=True)
@@ -504,7 +617,7 @@ def main() -> int:
     verdicts: dict[str, str] = {}
     try:
         for name, scenario in ((S1, scenario_restart), (S2, scenario_fail_closed),
-                               (S3, scenario_quorum_loss)):
+                               (S3, scenario_quorum_loss), (S4, scenario_storage_loss)):
             if missing:
                 verdict, reason = oracle.NOT_RUN, (
                     "binaries not built: " + ", ".join(missing))
