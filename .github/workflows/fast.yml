@@ -74,5 +74,16 @@ jobs:
       - name: Replay NATS independent oracle evidence
         run: target/debug/rovqet-testkit replay --run /tmp/rovqet-nats-ci/A-basic-r1/generator
 
+  q2-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build the fault-injection broker and the SDK example
+        run: cargo build -p rovqet-server -p rovqet-sdk --examples --bins --features fault-injection --locked
+      - name: Q2 publication campaign and oracle
+        run: python3 scripts/test_q2_publish.py
+
 # Fast checks only. No PR requirement, mandatory human review, release build,
 # long-running soak or full benchmark suite on ordinary main commits.
