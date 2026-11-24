@@ -1,0 +1,4 @@
+cluster mode: node=3 cluster=4242 peers=2 metadata_revision=1
+Q2 route: topic=durable-q2 partition=PartitionRef { tenant_id: 1, topic_id: 4, partition_id: 0 } incarnation=42 shard_id=7 peers=3 bootstrap=false applied_revision=49
+rovqet development profile listening on 127.0.0.1:42117
+BROKER_METRICS {"time_mono_ns":566712365,"max_connections":1024,"connection_envelope_bytes":1380352,"offered":0,"admitted":0,"rejected":0,"enqueued":0,"dropped_overflow":0,"dropped_expired":0,"dropped_unsubscribed":0,"dropped_shutdown_ingress":0,"egress_rejected":0,"flow_rejected":0,"overload_transitions":0,"overload_state":"Drain","delivered":0,"delivered_bytes":0,"outbound_enqueued":0,"writer_expired":0,"write_failed":0,"dropped_newest":0,"dropped_oldest":0,"coalesced":0,"dropped_closed":0,"dropped_shutdown_outbound":0,"ingress_messages":0,"ingress_bytes":0,"egress_messages":0,"egress_bytes":0,"active_subscriptions":0,"broker_work_sessions":0}

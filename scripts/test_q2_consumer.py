@@ -183,6 +183,7 @@ class ConsumerCampaign:
         before = self.partition(self.leader)
         assert self.ack(tokens[2]) == saved
         assert self.partition(self.leader) == before, "duplicate caused a second mutation"
+        self.journal.append("consumer_duplicate_check", token=tokens[2], before=before, after=self.partition(self.leader))
         self.journal.append("consumer_duplicate", token=tokens[2], result=saved)
         self.verdict("idempotent", oracle.NOT_RUN, "duplicate PASS; held/lost response pending crash scenario")
 
@@ -240,6 +241,80 @@ class ConsumerCampaign:
         self.ack(dict(token, message_id=99999), "SequenceConflict")
         self.verdict("negative", oracle.PASS)
 
+    @staticmethod
+    def command(token):
+        command = {k: token[k] for k in ("incarnation", "group_id", "generation",
+            "lease_id", "metadata_epoch", "offset", "attempt", "principal", "message_id")}
+        command["partition"] = {k: token[k] for k in ("tenant_id", "topic_id", "partition_id")}
+        return {"GroupAck": command}
+
+    def run_crashes(self, fault_binary):
+        harness.SERVER = fault_binary
+        for number, stage in enumerate(("before_proposal", "before_majority", "after_majority"), 50):
+            for node in self.c.nodes.values():
+                node.stop()
+            barrier_dir = self.c.directory / stage
+            barrier_dir.mkdir()
+            env = ("ROVQET_Q2_PREMAJORITY_BARRIER" if stage == "before_majority"
+                   else "ROVQET_Q2_POSTMAJORITY_BARRIER")
+            self.c.env[env] = str(barrier_dir)
+            self.c.start([1, 2, 3])
+            self.elect()
+            batch = self.fetch(number)
+            token = batch["messages"][0]
+            arm = {"stage": stage, "command": self.command(token)}
+            arm_path = barrier_dir / "arm.json"
+            with arm_path.open("w") as handle:
+                json.dump(arm, handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+            attempt = self.start_ack(token)
+            barrier = self.c.await_postmajority_barrier(barrier_dir / "barrier.json", attempt)
+            assert barrier["event"] == "consumer_ack_barrier" and barrier["stage"] == stage, barrier
+            assert barrier["command"] == arm["command"] and barrier["node"] == self.leader, barrier
+            self.journal.append("consumer_barrier", stage=stage, barrier=barrier, token=token)
+            if stage == "after_majority":
+                self.await_ack(token)
+                assert all(self.state(n)["last_applied"]["index"] >= barrier["committed_index"]
+                           for n in self.c.live())
+            else:
+                assert all(not self.partition(n).get("groups", {}).get(str(number), {}).get("outcomes")
+                           for n in self.c.live()), "pre-commit barrier already closed an offset"
+                if stage == "before_majority":
+                    assert barrier["durable_index"] >= barrier["log_index"], barrier
+                self.observe()
+            self.c.nodes[barrier["node"]].kill()
+            self.journal.append("consumer_barrier_kill", stage=stage, node=barrier["node"],
+                token=token, signal="SIGKILL")
+            result = self.finish_ack(token, attempt)
+            assert result["outcome"] == "error" and "OutcomeUnknown" in result["detail"], result
+            arm_path.unlink()
+            self.c.env.pop(env)
+            self.restart_all()
+            if stage == "after_majority":
+                original = self.ack(token)
+                before = self.partition(self.leader)
+                assert self.ack(token) == original
+                assert self.partition(self.leader) == before, "saved retry mutated committed state"
+                self.journal.append("consumer_duplicate_check", token=token, before=before, after=self.partition(self.leader))
+                self.cursor(number, 1)
+                self.verdict("idempotent", oracle.PASS, "duplicate and actually lost held response resolved identically")
+            elif stage == "before_majority" and str(token["offset"]) in self.partition(self.leader).get("groups", {}).get(str(number), {}).get("outcomes", {}):
+                # A locally durable, previously uncommitted tail may legitimately
+                # commit after quorum recovery. It was uncertain, not rejected.
+                # Resolve the original saved identity; never demand its absence.
+                self.ack(token)
+                self.journal.append("consumer_premajority_resolution", token=token, outcome="committed_after_recovery")
+            else:
+                self.ack(token, "LeaseExpired")
+                redelivery = self.fetch(number, batch["generation"])
+                offsets = [t["offset"] for t in redelivery["messages"]]
+                assert token["offset"] in offsets
+                self.journal.append("consumer_redelivery", offset=token["offset"], delivered_offsets=offsets)
+                self.ack(redelivery["messages"][0])
+            self.journal.append("consumer_crash_recovered", stage=stage, token=token)
+            self.verdict("crash_" + stage, oracle.PASS)
+
 
 def main():
     EVIDENCE.mkdir(parents=True, exist_ok=True)
@@ -263,7 +338,19 @@ def main():
             commands=["cargo build -p rovqet-server --locked",
                       "cargo build -p rovqet-sdk --example q2_publish --example q2_consumer --locked"])
         campaign = ConsumerCampaign(journal, directory, consumer)
+        journal.append("consumer_launch_configuration", nodes={
+            str(n): {"arguments": node.arguments(n == 1),
+                     "metadata": json.loads(node.metadata.read_text())}
+            for n, node in campaign.c.nodes.items()})
         campaign.run_core()
+        build(["build", "-p", "rovqet-server", "--features", "fault-injection", "--locked"])
+        fault_binary = directory / "fault-broker"
+        shutil.copy2(ROOT / "target/debug/rovqet", fault_binary)
+        assert harness.SEAM_MARKER in fault_binary.read_bytes()
+        assert harness.POSTMAJORITY_MARKER in fault_binary.read_bytes()
+        journal.append("consumer_fault_build", binary_sha256=hashlib.sha256(fault_binary.read_bytes()).hexdigest(),
+            command="cargo build -p rovqet-server --features fault-injection --locked")
+        campaign.run_crashes(fault_binary)
     except Exception:
         failure = traceback.format_exc()
         journal.append("consumer_failure", detail=failure)
@@ -277,6 +364,10 @@ def main():
                 node.stop()
             # Preserve complete raw recovery evidence before removing scratch storage.
             for number, node in campaign.c.nodes.items():
+                target_dir = EVIDENCE / f"node{number}"
+                target_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(node.metadata, target_dir / "metadata.json")
+                (target_dir / "stderr.txt").write_text("\n".join(node.lines) + "\n")
                 for name in ("state/state.json", "snapshot.json", "state/snapshot.json", "raft/purged.json"):
                     source = node.directory / name
                     if source.exists():

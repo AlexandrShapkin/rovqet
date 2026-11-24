@@ -65,8 +65,8 @@ The broker must validate authorization and a previously delivered, live volatile
 lease before proposing an ACK. The replicated apply path checks committed
 offset/message identity, incarnation, epoch, current generation and exact retry
 token; committed message existence is not proof of delivery. The broker route and
-SDK now implement this boundary; the three-node consumer campaign and its oracle
-remain the next increment.
+SDK implement this boundary; the independent-process campaign and oracle below
+provide the C-05 consumer proof.
 
 Cursor is encoded as the **next incomplete logical offset**, initially zero:
 ACK 2 and ACK 1 leave it at zero, then ACK 0 advances it to three. Sparse state
@@ -122,7 +122,34 @@ delivery token and message_id; the Q1 token/API remains unchanged.
 Q2 transport loss or timeout during ACK is GroupError::OutcomeUnknown.
 Missing FETCH_END discards the partial batch and closes the framing-uncertain
 SDK stream. In-process three-voter quorum-loss tests and real TCP/SDK tests cover
-this route, but are not the independent-process consumer campaign/oracle gate.
+the route alongside the separate independent-process consumer campaign/oracle gate.
+
+### C-05 independent-process consumer proof
+
+`scripts/test_q2_consumer.py` now drives three actual brokers with separate persistent
+Raft storage through external SDK producer/consumer executables, with a parent-owned
+fsynced observation journal. It builds and copies fresh normal binaries for normal
+scenarios and fresh fault-injection binaries for the deterministic crash windows.
+`q1_oracle.reconcile_q2_consumer` independently checks full saved ACK identity against
+distinct applied voter states, recovery on all three voters, contiguous/sparse closure,
+generation/cursor regression, duplicate mutation and required scenario completeness.
+The campaign also forces snapshot installation by keeping a follower offline until
+the leader purges beyond its old applied index, then comparing recovered group state.
+
+ACK arms extend the existing pre-/post-majority seams; they do not introduce a second
+fault framework. Before-proposal and post-majority holds use the existing post-majority
+seam directory; a stage discriminator and complete ACK command prevent accidental
+cross-topic/lease matches. Pre-majority replication holds await the real local fsync
+observation before emitting their barrier. The post-majority route hold is after the
+applied ACK outcome and before response construction. Its recorded applied index is
+a committed-prefix observation, never an application offset. The parent requires
+matching persisted ACK state on a real majority before SIGKILL, then retries the exact
+identity after recovery. Default builds have inert hooks and never read fault controls.
+
+A real-process fencing check exposed premature removal of fenced volatile grants.
+The route now retains them until their bounded expiry, so delivered stale tokens
+receive STALE_GENERATION/EPOCH; retired grants count against the global lease bound
+but do not block current-generation inflight admission or redelivery.
 
 | Event | Write allowed? | Cursor effect | Client result |
 |---|---|---|---|

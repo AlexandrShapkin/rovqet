@@ -1,0 +1,28 @@
+{
+  "profile": "three independent processes and persistent directories on one loopback host; not independent physical failure domains",
+  "commands": {
+    "cargo fmt --all -- --check": 0,
+    "cargo check --workspace --locked": 0,
+    "cargo test --workspace --locked": 0,
+    "cargo test -p rovqet-consensus --features fault-injection --locked": 0,
+    "python3 scripts/test_q2_raft.py": 0,
+    "python3 scripts/test_q2_publish.py": 0,
+    "python3 scripts/test_q2_consumer.py": 0,
+    "python3 scripts/test_q1_oracle.py": 0,
+    "python3 scripts/check_docs.py": 0,
+    "git diff --check": 0
+  },
+  "q2_raft_scenarios": "18 PASS, 0 FAIL, 0 BLOCKED",
+  "q2_publish_scenarios": "14 PASS; independent oracle PASS",
+  "q2_consumer_scenarios": "12 PASS; independent oracle PASS; 16 successful ACK observations and 16 majority proofs",
+  "oracle_fixture_tests": "66 passed",
+  "release": "SHA and CI run are indexed in release.json after push",
+  "workspace_tests": {
+    "passed": 413,
+    "failed": 0
+  },
+  "fault_consensus_tests": {
+    "passed": 52,
+    "failed": 0
+  }
+}

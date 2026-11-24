@@ -60,15 +60,17 @@ def reconcile_q2_consumer(records: list[dict], *, require_conclusion: bool = Tru
     failures, invalid = [], []
     conclusions = [r for r in records if r.get("event") == "conclusion"]
     own = conclusions[-1].get("verdict") if conclusions else None
-    if require_conclusion and own is None:
+    if require_conclusion and (own is None or not records or records[-1].get("event") != "conclusion"):
         invalid.append("missing campaign conclusion")
+    if own == INVALID or own not in (None, PASS, FAIL, INVALID, NOT_RUN):
+        invalid.append("campaign concluded INVALID or with an unknown verdict")
     scenarios = {r.get("name"): r.get("verdict") for r in records
                  if r.get("event") == "consumer_scenario"}
     missing = Q2_CONSUMER_REQUIRED - scenarios.keys()
     incomplete = missing | {n for n, v in scenarios.items() if v != PASS}
     if own == PASS and incomplete:
         failures.append("incomplete consumer campaign reported as PASS")
-    if any(v == FAIL for v in scenarios.values()) or own == FAIL:
+    if any(r.get("verdict") == FAIL for r in records if r.get("event") == "consumer_scenario") or own == FAIL:
         failures.append("consumer scenario failed")
     configurations = [r for r in records if r.get("event") == "consumer_configuration"]
     if not configurations or any(r.get("q1_configured") is not False for r in configurations):
@@ -99,6 +101,9 @@ def reconcile_q2_consumer(records: list[dict], *, require_conclusion: bool = Tru
                     raise ValueError("missing voter identity/index")
                 partition = record["partition"]
                 messages = {m["logical_offset"]: m["message_id"] for m in partition["messages"]}
+                old_groups = {scope[1] for scope in previous if scope[0] == node}
+                if not old_groups.issubset(partition.get("groups", {}).keys()):
+                    failures.append("recovery erased a previously observed group")
                 for group_id, group in partition.get("groups", {}).items():
                     cursor, generation = group["cursor"], group["generation"]
                     outcomes = group["outcomes"]
@@ -121,7 +126,8 @@ def reconcile_q2_consumer(records: list[dict], *, require_conclusion: bool = Tru
                         if (key[0:3] != (1, 4, 0) or key[3] != partition["incarnation"]
                             or key[4] != int(group_id) or key[8] != int(offset)
                             or messages.get(int(offset)) != key[11]
-                            or outcome["generation"] != key[5] or outcome["offset"] != key[8]):
+                            or key[5] > generation or outcome["generation"] != key[5]
+                            or outcome["offset"] != key[8] or outcome["group_id"] != key[4]):
                             failures.append("saved ACK contradicts committed record/token")
                         witnesses.setdefault(key, set()).add(node)
                         if record.get("recovered"):
@@ -129,6 +135,9 @@ def reconcile_q2_consumer(records: list[dict], *, require_conclusion: bool = Tru
             elif event == "consumer_rejection_check":
                 if record.get("before") != record.get("after"):
                     failures.append("rejected stale/invalid ACK mutated group progress")
+            elif event == "consumer_duplicate_check":
+                if record.get("before") != record.get("after"):
+                    failures.append("identical saved ACK retry caused another mutation")
             elif event == "consumer_redelivery":
                 if record.get("offset") not in record.get("delivered_offsets", []):
                     failures.append("unacknowledged record was not redelivered")
@@ -152,6 +161,48 @@ def reconcile_q2_consumer(records: list[dict], *, require_conclusion: bool = Tru
             for other_key, other in successes
         ):
             failures.append("new ACK success without an available majority")
+    for stage in ("before_proposal", "before_majority", "after_majority"):
+        if scenarios.get("crash_" + stage) != PASS:
+            continue
+        barriers = [r for r in records if r.get("event") == "consumer_barrier" and r.get("stage") == stage]
+        kills = [r for r in records if r.get("event") == "consumer_barrier_kill" and r.get("stage") == stage]
+        recoveries = [r for r in records if r.get("event") == "consumer_crash_recovered" and r.get("stage") == stage]
+        if len(barriers) != 1 or len(kills) != 1 or len(recoveries) != 1:
+            invalid.append(f"missing deterministic {stage} barrier/kill/recovery evidence")
+            continue
+        barrier, kill, recovery = barriers[0], kills[0], recoveries[0]
+        try:
+            key = _consumer_token(barrier["token"])
+            document = barrier["barrier"]
+            if (_consumer_token(document["command"]) != key
+                or document["stage"] != stage or document["node"] != kill["node"]
+                or kill["signal"] != "SIGKILL"
+                or not barrier["seq"] < kill["seq"] < recovery["seq"]):
+                failures.append("crash barrier identity/order does not match the killed leader")
+            before_kill = set()
+            for state in records:
+                if state.get("event") != "consumer_state" or not barrier["seq"] < state["seq"] < kill["seq"]:
+                    continue
+                for group in state["partition"].get("groups", {}).values():
+                    for saved in group["outcomes"].values():
+                        if _consumer_token(saved["command"]) == key:
+                            if stage == "after_majority" and state["applied_index"] >= document["committed_index"]:
+                                before_kill.add(state["node"])
+                            elif stage != "after_majority":
+                                failures.append("pre-commit barrier already carried a committed ACK")
+            if stage == "after_majority" and len(before_kill) < 2:
+                failures.append("post-majority kill lacks a real persisted majority before the kill")
+            if stage == "before_majority" and document["durable_index"] < document["log_index"]:
+                failures.append("pre-majority barrier preceded local fsync")
+            interrupted = [r for r in records if r.get("event") == "consumer_result"
+                and kill["seq"] < r["seq"] < recovery["seq"]
+                and _consumer_token(r["token"]) == key
+                and r["result"].get("outcome") == "error"
+                and "OutcomeUnknown" in r["result"].get("detail", "")]
+            if not interrupted:
+                invalid.append("held ACK response was not externally observed as uncertain")
+        except (KeyError, ValueError, TypeError) as error:
+            invalid.append(f"invalid crash evidence: {error}")
     counts = {"successful_acks": len(successes), "majority_proofs": majority_proofs,
               "scenario_passes": sum(v == PASS for v in scenarios.values())}
     if failures:

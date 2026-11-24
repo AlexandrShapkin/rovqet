@@ -1,0 +1,43 @@
+{
+  "cluster_id": 4242,
+  "revision": 1,
+  "issued_at_ms": 1,
+  "revalidate_after_ms": 600000,
+  "acl_revision": 1,
+  "policy_revision": 1,
+  "capability_revision": 1,
+  "nodes": [
+    {
+      "node": 1,
+      "address": "127.0.0.1:36053"
+    },
+    {
+      "node": 2,
+      "address": "127.0.0.1:60585"
+    },
+    {
+      "node": 3,
+      "address": "127.0.0.1:51085"
+    }
+  ],
+  "topics": [
+    {
+      "topic_id": 4,
+      "durable_class": 2,
+      "policy_revision": 1
+    }
+  ],
+  "partitions": [
+    {
+      "tenant_id": 1,
+      "topic_id": 4,
+      "partition_id": 0,
+      "owner": 1,
+      "ownership_epoch": 5,
+      "lease_valid_for_ms": 600000,
+      "desired_replicas": 3,
+      "shard_id": 7,
+      "required_policy_revision": 1
+    }
+  ]
+}

@@ -1118,14 +1118,47 @@
         "C-04",
         "B-05"
       ],
-      "status": "IN_PROGRESS",
+      "status": "DONE",
       "architecture": "08",
       "proof": "Fail leader after ACK and cursor remains committed",
       "paths": [
-        "crates/durable/"
+        "crates/consensus/",
+        "crates/server/src/q2.rs",
+        "crates/sdk/src/group.rs",
+        "scripts/test_q2_consumer.py",
+        "scripts/q1_oracle.py"
       ],
       "evidence": {
-        "note": "C-05 stays IN_PROGRESS. The real-process campaign passes normal, sparse ACK, fencing, duplicate ACK, quorum loss/restoration, follower restart, forced snapshot installation, full restart and negative-token checks. Oracle: NOT_RUN, not PASS: lost-response and the three deterministic crash windows remain. Next: extend the existing ACK fault seams and execute the missing crash scenarios.",
+        "note": "C-05 DONE: all 12 real-process consumer scenarios execute and PASS; independent consumer oracle PASS with 16 successful ACK observations, 16 distinct-majority proofs and recovered saved outcomes on all three voters. Normal/sparse/fencing/idempotent/quorum/follower restart/full restart/snapshot installation/negative tokens and all three deterministic crash windows pass. No C-06/C-07 work started.",
+        "campaign": "benchmarks/evidence/c05-q2-consumer/consumer.jsonl",
+        "commit": "da84b84",
+        "tests": [
+          "cargo fmt --all -- --check",
+          "cargo check --workspace --locked",
+          "cargo test --workspace --locked",
+          "python3 scripts/test_q2_raft.py",
+          "python3 scripts/test_q2_publish.py",
+          "python3 scripts/test_q2_consumer.py",
+          "python3 scripts/test_q1_oracle.py",
+          "python3 scripts/check_docs.py",
+          "git diff --check"
+        ],
+        "oracle": "benchmarks/evidence/c05-q2-consumer/oracle.json",
+        "verification": "benchmarks/evidence/c05-q2-consumer/verification.json",
+        "scenario_verdicts": {
+          "normal": "PASS",
+          "sparse": "PASS",
+          "fencing": "PASS",
+          "idempotent": "PASS",
+          "quorum": "PASS",
+          "follower_restart": "PASS",
+          "full_restart": "PASS",
+          "snapshot_install": "PASS",
+          "negative": "PASS",
+          "crash_before_proposal": "PASS",
+          "crash_before_majority": "PASS",
+          "crash_after_majority": "PASS"
+        },
         "scope": "Topic-qualified GroupClaim/GroupAck, partition-wide generation fence, bounded per-group sparse cursor and saved ACK outcomes, snapshot/restart recovery; Q2 FETCH/MESSAGE/FETCH_END and CONSUMER_ACK/RESULT over TCP, bounded volatile delivery leases, applied-only ACK_COMMITTED, read-only saved-outcome lookup and explicit uncertainty under quorum loss."
       }
     },

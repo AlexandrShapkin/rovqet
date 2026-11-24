@@ -28,9 +28,25 @@ class Q2ConsumerFixtures(unittest.TestCase):
                 recovered=True, partition=dict(incarnation=42, group_generation=1,
                     next_logical_offset=1, messages=[dict(logical_offset=0, message_id=100)],
                     groups={"7": copy.deepcopy(group)})))
+        for index, stage in enumerate(("before_proposal", "before_majority", "after_majority")):
+            armed = dict(token, group_id=8 + index) if stage != "after_majority" else token
+            armed_command = copy.deepcopy(command)
+            armed_command["group_id"] = armed["group_id"]
+            barrier = dict(stage=stage, node=1, command={"GroupAck": armed_command},
+                           committed_index=5, log_index=6, durable_index=6)
+            records.append(dict(event="consumer_barrier", stage=stage, token=armed, barrier=barrier))
+            if stage == "after_majority":
+                records.extend(copy.deepcopy(r) for r in list(records)
+                               if r["event"] == "consumer_state")
+            records.append(dict(event="consumer_barrier_kill", stage=stage, node=1, signal="SIGKILL"))
+            records.append(dict(event="consumer_result", token=armed, live=[2, 3],
+                                result=dict(outcome="error", detail="OutcomeUnknown")))
+            records.append(dict(event="consumer_crash_recovered", stage=stage))
         records.extend(dict(event="consumer_scenario", name=name, verdict=oracle.PASS)
                        for name in oracle.Q2_CONSUMER_REQUIRED)
         records.append(dict(event="conclusion", verdict=oracle.PASS))
+        for seq, record in enumerate(records):
+            record["seq"] = seq
         return records
 
     def test_complete_evidence_is_accepted(self):

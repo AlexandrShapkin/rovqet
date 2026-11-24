@@ -624,8 +624,30 @@ impl Route {
             {
                 return Err(ErrorCode::SequenceConflict);
             }
-            match tokio::time::timeout(PROPOSAL_TIMEOUT, self.node.propose(command)).await {
-                Ok(Ok(result @ ShardCommandResponse::GroupAcked { .. })) => result,
+            rovqet_consensus::postmajority::hold_group_ack(
+                self.node_id,
+                0,
+                "before_proposal",
+                &command,
+            )
+            .await;
+            match tokio::time::timeout(PROPOSAL_TIMEOUT, self.node.propose(command.clone())).await {
+                Ok(Ok(result @ ShardCommandResponse::GroupAcked { .. })) => {
+                    let index = self
+                        .node
+                        .applied_state()
+                        .last_applied
+                        .map(|l| l.index)
+                        .unwrap_or(0);
+                    rovqet_consensus::postmajority::hold_group_ack(
+                        self.node_id,
+                        index,
+                        "after_majority",
+                        &command,
+                    )
+                    .await;
+                    result
+                }
                 // A concurrent external claim/epoch may reject after validation.
                 // Never infer success from proposal submission or a timeout.
                 Ok(Ok(ShardCommandResponse::Rejected { reason })) => {

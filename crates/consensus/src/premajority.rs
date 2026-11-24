@@ -91,6 +91,65 @@ mod active {
     }
 
     impl Premajority {
+        /// ACK arm of the same transport/fsync barrier used by publications.
+        async fn hold_group_ack_replication(
+            &self,
+            local: ShardNodeId,
+            entries: &[Entry<ShardRaftTypeConfig>],
+        ) {
+            #[derive(serde::Deserialize)]
+            struct Arm {
+                stage: String,
+                command: ShardCommand,
+            }
+            let Ok(bytes) = std::fs::read(self.directory.join(ARM_FILE)) else {
+                return;
+            };
+            let Ok(arm) = serde_json::from_slice::<Arm>(&bytes) else {
+                return;
+            };
+            if arm.stage != "before_majority"
+                || !matches!(arm.command, ShardCommand::GroupAck { .. })
+            {
+                return;
+            }
+            for entry in entries {
+                if !matches!(&entry.payload, EntryPayload::Normal(command) if *command == arm.command)
+                {
+                    continue;
+                }
+                let mut durable = self.durable.subscribe();
+                while *durable.borrow() < entry.log_id.index {
+                    if durable.changed().await.is_err() {
+                        return;
+                    }
+                }
+                #[derive(serde::Serialize)]
+                struct Barrier<'a> {
+                    event: &'a str,
+                    stage: &'a str,
+                    node: u64,
+                    log_index: u64,
+                    durable_index: u64,
+                    command: &'a ShardCommand,
+                }
+                if !self.fired.swap(true, Ordering::SeqCst) {
+                    let document = Barrier {
+                        event: "consumer_ack_barrier",
+                        stage: "before_majority",
+                        node: local,
+                        log_index: entry.log_id.index,
+                        durable_index: *durable.borrow(),
+                        command: &arm.command,
+                    };
+                    if let Ok(bytes) = serde_json::to_vec_pretty(&document) {
+                        let _ = write_durable(&self.directory.join(BARRIER_FILE), &bytes);
+                    }
+                }
+                std::future::pending::<()>().await;
+            }
+        }
+
         /// Opens a seam over `directory`. Without a later [`Self::arm`] document the seam
         /// holds nothing, whatever else is configured.
         pub fn open(directory: impl Into<PathBuf>) -> Self {
@@ -127,6 +186,7 @@ mod active {
             local: ShardNodeId,
             entries: &[Entry<ShardRaftTypeConfig>],
         ) {
+            self.hold_group_ack_replication(local, entries).await;
             let Some(token) = self.armed() else {
                 return;
             };

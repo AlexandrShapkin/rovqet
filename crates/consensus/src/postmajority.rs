@@ -92,6 +92,55 @@ mod active {
     }
 
     impl Postmajority {
+        /// Shares the existing feature-gated seam/directory with publications.
+        /// The full ACK command is required: no cross-topic or cross-lease arm.
+        pub async fn hold_group_ack(
+            &self,
+            local: ShardNodeId,
+            index: u64,
+            stage: &str,
+            command: &ShardCommand,
+        ) {
+            #[derive(serde::Deserialize)]
+            struct Arm {
+                stage: String,
+                command: ShardCommand,
+            }
+            let Ok(bytes) = std::fs::read(self.directory.join(ARM_FILE)) else {
+                return;
+            };
+            let Ok(arm) = serde_json::from_slice::<Arm>(&bytes) else {
+                return;
+            };
+            if arm.stage != stage
+                || arm.command != *command
+                || !matches!(command, ShardCommand::GroupAck { .. })
+            {
+                return;
+            }
+            #[derive(serde::Serialize)]
+            struct Barrier<'a> {
+                event: &'a str,
+                stage: &'a str,
+                node: u64,
+                committed_index: u64,
+                command: &'a ShardCommand,
+            }
+            if !self.fired.swap(true, Ordering::SeqCst) {
+                let document = Barrier {
+                    event: "consumer_ack_barrier",
+                    stage,
+                    node: local,
+                    committed_index: index,
+                    command,
+                };
+                if let Ok(bytes) = serde_json::to_vec_pretty(&document) {
+                    let _ = write_durable(&self.directory.join(BARRIER_FILE), &bytes);
+                }
+            }
+            std::future::pending::<()>().await;
+        }
+
         /// Opens a seam over `directory`. Without a later `arm.json` document the seam
         /// holds nothing, whatever else is configured.
         pub fn open(directory: impl Into<PathBuf>) -> Self {
@@ -182,6 +231,18 @@ mod active {
     }
 
     /// Whether `command` is exactly the armed Q2 publication.
+    pub async fn hold_group_ack(
+        local: ShardNodeId,
+        index: u64,
+        stage: &str,
+        command: &ShardCommand,
+    ) {
+        if let Some(seam) = seam() {
+            seam.hold_group_ack(local, index, stage, command).await;
+        }
+    }
+
+    /// Whether `command` is exactly the armed Q2 publication.
     fn is_armed_publish(command: &ShardCommand, token: &ArmedToken) -> bool {
         match command {
             ShardCommand::Publish(publish) => {
@@ -230,6 +291,54 @@ mod active {
                 sequence: 5,
                 message_id: 105,
             }
+        }
+
+        #[tokio::test]
+        async fn the_ack_arm_requires_the_exact_stage_and_full_delivery_identity() {
+            let directory = tempfile::tempdir().unwrap();
+            let seam = Postmajority::open(directory.path());
+            let command = ShardCommand::GroupAck {
+                partition: PartitionRef {
+                    tenant_id: 1,
+                    topic_id: 4,
+                    partition_id: 0,
+                },
+                incarnation: 42,
+                metadata_epoch: 5,
+                generation: 1,
+                group_id: 7,
+                offset: 0,
+                message_id: 100,
+                principal: 1,
+                lease_id: u128::MAX,
+                attempt: 1,
+            };
+            let arm = format!(
+                "{{\"stage\":\"after_majority\",\"command\":{}}}",
+                serde_json::to_string(&command).unwrap()
+            );
+            std::fs::write(directory.path().join(ARM_FILE), arm).unwrap();
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                seam.hold_group_ack(1, 9, "before_proposal", &command),
+            )
+            .await
+            .unwrap();
+            assert!(!directory.path().join(BARRIER_FILE).exists());
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(100),
+                    seam.hold_group_ack(1, 9, "after_majority", &command)
+                )
+                .await
+                .is_err()
+            );
+            let raw = std::fs::read_to_string(directory.path().join(BARRIER_FILE)).unwrap();
+            assert!(
+                raw.contains(&u128::MAX.to_string()),
+                "barrier must not round the full lease identity"
+            );
+            assert!(raw.contains("\"committed_index\": 9"));
         }
 
         fn publish_command() -> ShardCommand {
@@ -417,6 +526,15 @@ use crate::types::{ShardCommand, ShardCommandResponse, ShardNodeId};
 pub async fn hold_publish_response(
     _local: ShardNodeId,
     _response: &ShardCommandResponse,
+    _command: &ShardCommand,
+) {
+}
+
+#[cfg(not(feature = "fault-injection"))]
+pub async fn hold_group_ack(
+    _local: ShardNodeId,
+    _index: u64,
+    _stage: &str,
     _command: &ShardCommand,
 ) {
 }
