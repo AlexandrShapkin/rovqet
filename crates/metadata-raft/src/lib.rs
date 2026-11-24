@@ -75,6 +75,23 @@ pub struct MetadataNode {
 impl MetadataNode {
     /// Starts a metadata voter: opens the durable storage, joins the group and serves peers.
     pub async fn start(config: MetadataNodeConfig) -> Result<Self, MetadataError> {
+        let listener = TcpListener::bind(config.listen)
+            .await
+            .map_err(|error| MetadataError::Network(format!("{error:?}")))?;
+        Self::start_with_listener(config, listener).await
+    }
+
+    /// Starts a voter with an already-bound peer listener, taking ownership of it.
+    ///
+    /// The listener's local address is authoritative for this node's bootstrap identity.
+    /// Peer addresses must describe the same bound endpoints. No rebind is performed.
+    pub async fn start_with_listener(
+        mut config: MetadataNodeConfig,
+        listener: TcpListener,
+    ) -> Result<Self, MetadataError> {
+        config.listen = listener
+            .local_addr()
+            .map_err(|error| MetadataError::Network(format!("{error:?}")))?;
         let log = FileLogStorage::open(config.data_directory.join("raft"))
             .map_err(|error| MetadataError::Storage(format!("{error:?}")))?;
         let (machine, shared) = MetadataStateMachine::open_shared(
@@ -152,9 +169,6 @@ impl MetadataNode {
             }
         }
 
-        let listener = TcpListener::bind(config.listen)
-            .await
-            .map_err(|error| MetadataError::Network(format!("{error:?}")))?;
         let (shutdown, mut stop_rx) = tokio::sync::watch::channel(false);
         let server_raft = raft.clone();
         let server = tokio::spawn(async move {

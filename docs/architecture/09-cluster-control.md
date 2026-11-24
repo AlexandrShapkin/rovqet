@@ -101,6 +101,24 @@ without the owner's own durable barrier.
 Metadata consensus and membership management are implemented in C-02; ownership handover, WAL
 migration, Q2 replication and majority acknowledgment remain C-02/C-03 work.
 
+### Metadata listener ownership
+
+`MetadataNode::start(config)` binds the configured peer endpoint and starts the voter.
+`MetadataNode::start_with_listener(config, tokio::net::TcpListener)` instead takes ownership
+of an already-bound listener without rebinding. Its `local_addr()` supplies the local
+bootstrap identity; the caller must supply peer lists for those same bound endpoints.
+Both constructors use the same storage, consensus and RPC implementation; configuration
+and serialized wire/storage forms are unchanged. Binding now precedes storage initialization
+in `start`, so an occupied endpoint fails before any storage/consensus startup side effects.
+
+Loopback integration tests reserve all voter sockets simultaneously before startup. They
+retain nonblocking standard-library descriptors and pass cloned descriptors into Tokio,
+including on restart. A stopped voter has no acceptor, but its endpoint stays bound until
+the test drops the reservation: peer RPCs may time out rather than fail to connect while
+the voter is stopped. Only one acceptor runs per socket, and restart never releases or
+rebinds the endpoint. This prevents duplicate endpoints and cross-test port theft without
+retries, sleeps or weaker quorum assertions.
+
 ## C-02 ownership fencing protocol (implemented part)
 
 The durable Q1 partition owns the fencing state, not only the routing layer. A partition in
