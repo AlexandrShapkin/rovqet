@@ -132,6 +132,11 @@ partition with an installed authority is a fenced owner:
   DLQ) all fail closed with a stale-epoch error when this node is not the committed owner.
 - The ownership lease is bounded and counted from local installation. An expired lease fails
   closed; a restart never extends it.
+- Reinstalling an identical `{ owner, epoch, lease }` preserves its original local
+  installation time, even if already expired. An unrelated metadata revision is not
+  a lease renewal. In Raft mode, authority installation reads the committed snapshot
+  directly, not the asynchronously published routing-store copy: independent update
+  subscribers must not lose a placement through publication ordering.
 - An older epoch can never replace a newer authority, so a stale snapshot cannot un-fence a
   fenced owner.
 - A mutation whose lease expires while its durability barrier runs is reported as an
