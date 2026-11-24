@@ -1131,7 +1131,9 @@
       "evidence": {
         "note": "C-05 DONE: all 12 real-process consumer scenarios execute and PASS; independent consumer oracle PASS with 16 successful ACK observations, 16 distinct-majority proofs and recovered saved outcomes on all three voters. Normal/sparse/fencing/idempotent/quorum/follower restart/full restart/snapshot installation/negative tokens and all three deterministic crash windows pass. No C-06/C-07 work started.",
         "campaign": "benchmarks/evidence/c05-q2-consumer/consumer.jsonl",
-        "commit": "da84b84",
+        "commit": "5c86086faf686ed31cd41aba56d9fbdde18b8a23",
+        "ci_run": "45369496297",
+        "ci_conclusion": "success",
         "tests": [
           "cargo fmt --all -- --check",
           "cargo check --workspace --locked",

@@ -1,0 +1,7 @@
+{
+  "implementation_sha": "5c86086faf686ed31cd41aba56d9fbdde18b8a23",
+  "ci_run": 45369496297,
+  "ci_conclusion": "success",
+  "ci_url": "https://github.com/AlexandrShapkin/rovqet/actions/runs/45369496297",
+  "note": "This metadata-only follow-up records the verified final implementation commit. All required local command exit codes and scenario verdicts are in verification.json and the parent-owned journal."
+}
