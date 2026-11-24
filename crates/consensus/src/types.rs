@@ -65,6 +65,31 @@ pub enum ShardCommand {
     Request(ShardRequest),
     /// A Q2 idempotent publication.
     Publish(ShardPublish),
+    /// Partition-wide consumer generation fence (the claim has no group selector).
+    GroupClaim {
+        #[serde(with = "partition_ref_serde")]
+        partition: rovqet_core::PartitionRef,
+        incarnation: u128,
+        metadata_epoch: u64,
+        requested_generation: u64,
+    },
+    /// Commit a broker-validated delivery ACK. Before proposing, the broker MUST
+    /// validate the volatile live delivery lease, authorized principal and attempt.
+    /// Apply validates committed message identity, incarnation, epoch, generation
+    /// and retry identity; message existence alone is NOT proof of delivery.
+    GroupAck {
+        #[serde(with = "partition_ref_serde")]
+        partition: rovqet_core::PartitionRef,
+        incarnation: u128,
+        metadata_epoch: u64,
+        generation: u64,
+        group_id: u64,
+        offset: u64,
+        message_id: u128,
+        principal: u128,
+        lease_id: u128,
+        attempt: u32,
+    },
 }
 
 impl ShardCommand {
@@ -73,6 +98,8 @@ impl ShardCommand {
         match self {
             ShardCommand::Request(request) => request.metadata_epoch,
             ShardCommand::Publish(publish) => publish.metadata_epoch,
+            ShardCommand::GroupClaim { metadata_epoch, .. }
+            | ShardCommand::GroupAck { metadata_epoch, .. } => *metadata_epoch,
         }
     }
 }
@@ -228,6 +255,16 @@ impl std::error::Error for InlinePayloadTooLarge {}
 /// The state machine must return exactly one response per applied entry.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ShardCommandResponse {
+    /// A partition-wide consumer fence was installed.
+    GroupClaimed { generation: u64 },
+    /// Saved committed ACK result. Cursor is the next incomplete logical offset
+    /// at the original commit, not the cursor at retry time.
+    GroupAcked {
+        generation: u64,
+        group_id: u64,
+        offset: u64,
+        cursor: u64,
+    },
     /// A committed command mutated the shard state.
     Applied {
         index: u64,

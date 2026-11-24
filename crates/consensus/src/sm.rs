@@ -61,7 +61,7 @@ use openraft::{
     Entry, EntryPayload, ErrorSubject, ErrorVerb, LogId, Snapshot, SnapshotMeta, StorageError,
     StorageIOError, StoredMembership,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -98,6 +98,31 @@ pub const MAX_RETAINED_MESSAGES_PER_PARTITION: usize = 65_536;
 /// partition still fits the [`MAX_SNAPSHOT_BYTES`] envelope with room for the JSON
 /// encoding of its retained bytes.
 pub const MAX_RETAINED_PAYLOAD_BYTES_PER_PARTITION: usize = 8 * 1024 * 1024;
+/// Prototype admission bounds; never evict committed ACK outcomes.
+pub const MAX_GROUPS_PER_PARTITION: usize = 1024;
+/// Maximum out-of-order ACKs per group. Closing the cursor gap remains possible
+/// at this bound; new sparse admissions fail without mutation.
+pub const MAX_SPARSE_ACKS_PER_GROUP: usize = 4096;
+/// Saved ACK identities per group; backpressure instead of unsafe retry eviction.
+pub const MAX_ACK_OUTCOMES_PER_GROUP: usize = MAX_RETAINED_MESSAGES_PER_PARTITION;
+
+/// Replicated group state, scoped by its parent topic-qualified partition and
+/// locked incarnation. Generation fences all previous mutation authority.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReplicatedGroupState {
+    pub generation: u64,
+    /// Next incomplete logical offset (zero before any contiguous completion).
+    pub cursor: u64,
+    pub sparse_acks: BTreeSet<u64>,
+    pub outcomes: BTreeMap<u64, CommittedAck>,
+}
+
+/// Full retry identity and original result; leases themselves remain volatile.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CommittedAck {
+    pub command: ShardCommand,
+    pub outcome: ShardCommandResponse,
+}
 
 /// The publication bounds of one state machine.
 ///
@@ -385,6 +410,12 @@ pub struct ProducerState {
 /// Q2 PUBLISH existed still decodes.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PartitionState {
+    /// Partition-wide committed fence: GroupClaim intentionally has no group_id.
+    #[serde(default, skip_serializing_if = "is_zero_generation")]
+    pub group_generation: u64,
+    /// Groups inherit this partition's full identity and immutable incarnation.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub groups: BTreeMap<u64, ReplicatedGroupState>,
     /// Number of committed commands this partition has applied. It never decreases and
     /// a rejected or duplicate command never increments it.
     pub applied_count: u64,
@@ -480,6 +511,124 @@ impl ShardState {
         match command {
             ShardCommand::Request(request) => self.apply_request(raft_index, request),
             ShardCommand::Publish(publish) => self.apply_publish(raft_index, publish, limits),
+            ShardCommand::GroupClaim { .. } | ShardCommand::GroupAck { .. } => {
+                self.apply_group(command)
+            }
+        }
+    }
+
+    fn apply_group(&mut self, command: &ShardCommand) -> ShardCommandResponse {
+        let (reference, incarnation, epoch) = match command {
+            ShardCommand::GroupClaim {
+                partition,
+                incarnation,
+                metadata_epoch,
+                ..
+            }
+            | ShardCommand::GroupAck {
+                partition,
+                incarnation,
+                metadata_epoch,
+                ..
+            } => (partition, *incarnation, *metadata_epoch),
+            _ => unreachable!("group dispatch"),
+        };
+        let Some(partition) = self.partitions.get_mut(&PartitionKey::from(reference)) else {
+            return rejected("unknown committed partition");
+        };
+        if partition.messages.is_empty() || incarnation != partition.incarnation {
+            return rejected("wrong incarnation or no committed messages");
+        }
+        if epoch < partition.last_metadata_epoch {
+            return rejected("stale metadata epoch");
+        }
+        match command {
+            ShardCommand::GroupClaim {
+                requested_generation,
+                ..
+            } => {
+                if *requested_generation <= partition.group_generation {
+                    return rejected("generation must exceed committed fence");
+                }
+                partition.group_generation = *requested_generation;
+                for group in partition.groups.values_mut() {
+                    group.generation = *requested_generation;
+                }
+                partition.last_metadata_epoch = epoch;
+                partition.applied_count = partition.applied_count.saturating_add(1);
+                self.revision = self.revision.saturating_add(1);
+                ShardCommandResponse::GroupClaimed {
+                    generation: *requested_generation,
+                }
+            }
+            ShardCommand::GroupAck {
+                generation,
+                group_id,
+                offset,
+                message_id,
+                ..
+            } => {
+                if *generation == 0 || *generation != partition.group_generation {
+                    return rejected("stale or unclaimed generation");
+                }
+                if !partition.messages.iter().any(|message| {
+                    message.logical_offset == *offset && message.message_id == *message_id
+                }) {
+                    return rejected("unknown committed offset or conflicting message identity");
+                }
+                if let Some(group) = partition.groups.get(group_id) {
+                    if let Some(saved) = group.outcomes.get(offset) {
+                        return if saved.command == *command {
+                            saved.outcome.clone()
+                        } else {
+                            rejected("conflicting ACK identity")
+                        };
+                    }
+                    if group.outcomes.len() >= MAX_ACK_OUTCOMES_PER_GROUP
+                        || (*offset != group.cursor
+                            && group.sparse_acks.len() >= MAX_SPARSE_ACKS_PER_GROUP)
+                    {
+                        return rejected("group ACK resource exhausted");
+                    }
+                } else if partition.groups.len() >= MAX_GROUPS_PER_PARTITION {
+                    return rejected("group resource exhausted");
+                }
+                let group =
+                    partition
+                        .groups
+                        .entry(*group_id)
+                        .or_insert_with(|| ReplicatedGroupState {
+                            generation: *generation,
+                            cursor: 0,
+                            sparse_acks: BTreeSet::new(),
+                            outcomes: BTreeMap::new(),
+                        });
+                group.sparse_acks.insert(*offset);
+                while group.sparse_acks.remove(&group.cursor) {
+                    group.cursor = group
+                        .cursor
+                        .checked_add(1)
+                        .expect("committed offset below watermark");
+                }
+                let outcome = ShardCommandResponse::GroupAcked {
+                    generation: *generation,
+                    group_id: *group_id,
+                    offset: *offset,
+                    cursor: group.cursor,
+                };
+                group.outcomes.insert(
+                    *offset,
+                    CommittedAck {
+                        command: command.clone(),
+                        outcome: outcome.clone(),
+                    },
+                );
+                partition.last_metadata_epoch = epoch;
+                partition.applied_count = partition.applied_count.saturating_add(1);
+                self.revision = self.revision.saturating_add(1);
+                outcome
+            }
+            _ => unreachable!("group dispatch"),
         }
     }
 
@@ -882,6 +1031,8 @@ impl PartitionState {
     /// The state of a partition that has never applied a command.
     pub fn empty() -> Self {
         Self {
+            group_generation: 0,
+            groups: BTreeMap::new(),
             applied_count: 0,
             last_request_id: 0,
             last_metadata_epoch: 0,
@@ -902,13 +1053,78 @@ fn rejected(reason: &str) -> ShardCommandResponse {
     }
 }
 
+fn is_zero_generation(value: &u64) -> bool {
+    *value == 0
+}
+
 /// Internal consistency of the retained publication state of one partition: every
 /// committed message carries the payload bytes whose `sha256` equals its recorded
 /// digest inside the inline bound, the logical offsets increase strictly, and the
 /// retained byte counter agrees with the payloads. A document that lost or mutated
 /// its payload bytes — for example an image written before payload retention
 /// existed — fails closed instead of recovering a record without its content.
-fn validate_committed_messages(partition: &PartitionState) -> Result<(), String> {
+fn validate_committed_messages(
+    key: &PartitionKey,
+    partition: &PartitionState,
+) -> Result<(), String> {
+    if partition.groups.len() > MAX_GROUPS_PER_PARTITION {
+        return Err("group count exceeds bound".into());
+    }
+    for (group_id, group) in &partition.groups {
+        if group.generation == 0
+            || group.generation != partition.group_generation
+            || group.cursor > partition.next_logical_offset
+            || group.sparse_acks.len() > MAX_SPARSE_ACKS_PER_GROUP
+            || group.outcomes.len() > MAX_ACK_OUTCOMES_PER_GROUP
+            || group.outcomes.range(..group.cursor).count() as u64 != group.cursor
+            || group.sparse_acks.contains(&group.cursor)
+        {
+            return Err("inconsistent group fence, cursor or bounds".into());
+        }
+        let expected_sparse: BTreeSet<u64> = group
+            .outcomes
+            .range(group.cursor..)
+            .map(|(offset, _)| *offset)
+            .collect();
+        if group.sparse_acks != expected_sparse {
+            return Err("inconsistent sparse ACK set".into());
+        }
+        for (offset, saved) in &group.outcomes {
+            match (&saved.command, &saved.outcome) {
+                (
+                    ShardCommand::GroupAck {
+                        partition: reference,
+                        incarnation,
+                        generation,
+                        group_id: saved_group,
+                        offset: saved_offset,
+                        message_id,
+                        ..
+                    },
+                    ShardCommandResponse::GroupAcked {
+                        generation: result_generation,
+                        group_id: result_group,
+                        offset: result_offset,
+                        cursor,
+                    },
+                ) if PartitionKey::from(reference) == *key
+                    && *incarnation == partition.incarnation
+                    && *generation > 0
+                    && *generation <= group.generation
+                    && result_generation == generation
+                    && saved_group == group_id
+                    && result_group == group_id
+                    && saved_offset == offset
+                    && result_offset == offset
+                    && *cursor <= group.cursor
+                    && partition
+                        .messages
+                        .iter()
+                        .any(|m| m.logical_offset == *offset && m.message_id == *message_id) => {}
+                _ => return Err("inconsistent committed ACK outcome".into()),
+            }
+        }
+    }
     let mut total: u64 = 0;
     let mut previous: Option<u64> = None;
     for message in &partition.messages {
@@ -1383,7 +1599,7 @@ impl ShardSnapshot {
             }
             // The committed payload bytes are part of the recovered state, so an image
             // that lost or mutated them is refused before it can be activated.
-            validate_committed_messages(partition)
+            validate_committed_messages(key, partition)
                 .map_err(|error| format!("shard snapshot partition {key}: {error}"))?;
             previous = Some(*key);
         }
@@ -1460,7 +1676,7 @@ impl ShardStateMachine {
                 // Recovery must not silently resume with committed records whose
                 // payload bytes are missing or no longer match their digest.
                 for (key, partition) in &state.partitions {
-                    validate_committed_messages(partition).map_err(|error| {
+                    validate_committed_messages(key, partition).map_err(|error| {
                         storage_error(
                             Target::State.subject(),
                             ErrorVerb::Read,
@@ -2466,6 +2682,352 @@ mod tests {
                 "{malformed} must be refused"
             );
         }
+    }
+
+    fn group_claim(generation: u64) -> ShardCommand {
+        ShardCommand::GroupClaim {
+            partition: key(1, 2, 3).into(),
+            incarnation: 1,
+            metadata_epoch: 5,
+            requested_generation: generation,
+        }
+    }
+
+    fn group_ack(offset: u64) -> ShardCommand {
+        ShardCommand::GroupAck {
+            partition: key(1, 2, 3).into(),
+            incarnation: 1,
+            metadata_epoch: 5,
+            generation: 1,
+            group_id: 7,
+            offset,
+            message_id: 1000 + offset as u128,
+            principal: 10,
+            lease_id: 500 + offset as u128,
+            attempt: 1,
+        }
+    }
+
+    fn group_seed() -> ShardState {
+        let mut state = ShardState::new(identity());
+        for offset in 0..3 {
+            expect_published(state.apply_command(
+                100 + offset,
+                &publish_command(publish(
+                    1,
+                    2,
+                    3,
+                    10,
+                    20,
+                    1,
+                    offset,
+                    1000 + offset as u128,
+                    vec![1],
+                )),
+            ));
+        }
+        assert_eq!(
+            state.apply_command(110, &group_claim(1)),
+            ShardCommandResponse::GroupClaimed { generation: 1 }
+        );
+        state
+    }
+
+    #[test]
+    fn replicated_group_commands_round_trip_and_groups_keep_independent_cursors() {
+        let mut state = group_seed();
+        for command in [group_claim(2), group_ack(0)] {
+            let encoded = serde_json::to_vec(&command).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<ShardCommand>(&encoded).unwrap(),
+                command
+            );
+            assert_eq!(command.metadata_epoch(), 5);
+        }
+        state.apply_command(200, &group_ack(0));
+        let mut other = group_ack(2);
+        if let ShardCommand::GroupAck { group_id, .. } = &mut other {
+            *group_id = 8;
+        }
+        state.apply_command(201, &other);
+        let partition = &state.partitions[&key(1, 2, 3)];
+        assert_eq!(partition.groups[&7].cursor, 1);
+        assert_eq!(partition.groups[&8].cursor, 0);
+        assert_eq!(partition.groups[&8].sparse_acks, BTreeSet::from([2]));
+        validate_committed_messages(&key(1, 2, 3), partition).unwrap();
+    }
+
+    #[test]
+    fn replicated_sparse_bound_backpressures_without_blocking_gap_closure() {
+        let mut state = group_seed();
+        // Populate committed history with logical offsets; two producers keep
+        // each producer's independent outcome limit below its admission bound.
+        for offset in 3..=(MAX_SPARSE_ACKS_PER_GROUP as u64 + 1) {
+            let producer = 30 + offset % 2;
+            let sequence = (offset - 3) / 2;
+            expect_published(state.apply_command(
+                100 + offset,
+                &publish_command(publish(
+                    1,
+                    2,
+                    3,
+                    10,
+                    producer as u128,
+                    1,
+                    sequence,
+                    1000 + offset as u128,
+                    vec![1],
+                )),
+            ));
+        }
+        for offset in 1..=MAX_SPARSE_ACKS_PER_GROUP as u64 {
+            assert!(matches!(
+                state.apply_command(10000 + offset, &group_ack(offset)),
+                ShardCommandResponse::GroupAcked { cursor: 0, .. }
+            ));
+        }
+        group_refused(&mut state, &group_ack(MAX_SPARSE_ACKS_PER_GROUP as u64 + 1));
+        let before = state.clone();
+        assert!(matches!(
+            state.apply_command(20000, &group_ack(1)),
+            ShardCommandResponse::GroupAcked { .. }
+        ));
+        assert_eq!(state, before, "full sparse set still supports retries");
+        assert!(
+            matches!(state.apply_command(20001, &group_ack(0)), ShardCommandResponse::GroupAcked { cursor, .. } if cursor == MAX_SPARSE_ACKS_PER_GROUP as u64 + 1)
+        );
+        let partition = &state.partitions[&key(1, 2, 3)];
+        assert!(partition.groups[&7].sparse_acks.is_empty());
+        validate_committed_messages(&key(1, 2, 3), partition).unwrap();
+    }
+
+    fn group_refused(state: &mut ShardState, command: &ShardCommand) {
+        let before = state.clone();
+        assert!(matches!(
+            state.apply_command(999, command),
+            ShardCommandResponse::Rejected { .. }
+        ));
+        assert_eq!(*state, before, "rejection cannot mutate any state");
+    }
+
+    #[test]
+    fn replicated_group_sparse_cursor_retry_and_identity() {
+        let mut state = group_seed();
+        let first = state.apply_command(200, &group_ack(2));
+        assert_eq!(
+            first,
+            ShardCommandResponse::GroupAcked {
+                generation: 1,
+                group_id: 7,
+                offset: 2,
+                cursor: 0
+            }
+        );
+        state.apply_command(201, &group_ack(1));
+        assert_eq!(state.partitions[&key(1, 2, 3)].groups[&7].cursor, 0);
+        state.apply_command(202, &group_ack(0));
+        let group = &state.partitions[&key(1, 2, 3)].groups[&7];
+        assert_eq!(group.cursor, 3);
+        assert!(group.sparse_acks.is_empty());
+        let before = state.clone();
+        assert_eq!(
+            state.apply_command(203, &group_ack(2)),
+            first,
+            "original saved result, not current cursor"
+        );
+        assert_eq!(state, before);
+        for field in 0..4 {
+            let mut conflict = group_ack(2);
+            if let ShardCommand::GroupAck {
+                message_id,
+                principal,
+                lease_id,
+                attempt,
+                ..
+            } = &mut conflict
+            {
+                match field {
+                    0 => *message_id += 1,
+                    1 => *principal += 1,
+                    2 => *lease_id += 1,
+                    _ => *attempt += 1,
+                }
+            }
+            group_refused(&mut state, &conflict);
+        }
+    }
+
+    #[test]
+    fn replicated_group_fences_and_validation_are_partition_qualified() {
+        let mut state = group_seed();
+        group_refused(&mut state, &group_claim(0));
+        group_refused(&mut state, &group_claim(1));
+        for case in 0..6 {
+            let mut bad = group_ack(0);
+            if let ShardCommand::GroupAck {
+                partition,
+                incarnation,
+                metadata_epoch,
+                generation,
+                offset,
+                message_id,
+                ..
+            } = &mut bad
+            {
+                match case {
+                    0 => *generation = 0,
+                    1 => *incarnation = 99,
+                    2 => *metadata_epoch = 4,
+                    3 => *offset = 999,
+                    4 => *message_id = 999,
+                    _ => partition.topic_id = 99,
+                }
+            }
+            group_refused(&mut state, &bad);
+        }
+        // Another topic has its own committed offset 0 and message identity.
+        expect_published(state.apply_command(
+            250,
+            &publish_command(publish(1, 99, 3, 10, 20, 1, 0, 9999, vec![2])),
+        ));
+        let mut other_claim = group_claim(1);
+        if let ShardCommand::GroupClaim { partition, .. } = &mut other_claim {
+            partition.topic_id = 99;
+        }
+        state.apply_command(251, &other_claim);
+        let mut crossed = group_ack(0);
+        if let ShardCommand::GroupAck { partition, .. } = &mut crossed {
+            partition.topic_id = 99;
+        }
+        group_refused(&mut state, &crossed);
+        state.apply_command(252, &group_ack(2));
+        state.apply_command(253, &group_claim(2));
+        assert_eq!(state.partitions[&key(1, 2, 3)].groups[&7].generation, 2);
+        group_refused(&mut state, &group_ack(0));
+        group_refused(&mut state, &group_ack(2));
+        group_refused(&mut state, &group_claim(1));
+        group_refused(&mut state, &group_claim(2));
+        let mut fresh = group_ack(0);
+        if let ShardCommand::GroupAck { generation, .. } = &mut fresh {
+            *generation = 2;
+        }
+        assert!(matches!(
+            state.apply_command(254, &fresh),
+            ShardCommandResponse::GroupAcked { cursor: 1, .. }
+        ));
+        // The state machine intentionally cannot detect a never-delivered but
+        // committed offset: the broker must enforce the volatile lease boundary.
+        let mut claim = group_claim(3);
+        if let ShardCommand::GroupClaim { metadata_epoch, .. } = &mut claim {
+            *metadata_epoch = 6;
+        }
+        state.apply_command(255, &claim);
+        let mut stale = group_ack(1);
+        if let ShardCommand::GroupAck { generation, .. } = &mut stale {
+            *generation = 3;
+        }
+        group_refused(&mut state, &stale);
+        for case in 0..3 {
+            let mut bad = group_claim(4);
+            if let ShardCommand::GroupClaim {
+                partition,
+                incarnation,
+                ..
+            } = &mut bad
+            {
+                match case {
+                    0 => *incarnation = 99,
+                    1 => partition.topic_id = 98,
+                    _ => {}
+                }
+            }
+            group_refused(&mut state, &bad);
+        }
+    }
+
+    #[tokio::test]
+    async fn replicated_group_snapshot_and_restart_preserve_fence_cursor_sparse_and_outcomes() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut source = ShardStateMachine::open(directory.path(), identity()).unwrap();
+        for offset in 0..3 {
+            source
+                .apply(vec![command_entry(
+                    100 + offset,
+                    publish_command(publish(
+                        1,
+                        2,
+                        3,
+                        10,
+                        20,
+                        1,
+                        offset,
+                        1000 + offset as u128,
+                        vec![1],
+                    )),
+                )])
+                .await
+                .unwrap();
+        }
+        source
+            .apply(vec![
+                command_entry(110, group_claim(1)),
+                command_entry(111, group_ack(2)),
+                command_entry(112, group_ack(0)),
+            ])
+            .await
+            .unwrap();
+        let snapshot = source
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+        let target_directory = tempfile::tempdir().unwrap();
+        let mut target = ShardStateMachine::open(target_directory.path(), identity()).unwrap();
+        install_bytes(&mut target, &snapshot.meta, &snapshot_bytes(&snapshot))
+            .await
+            .unwrap();
+        assert_eq!(target.state(), source.state());
+        let group = &target.state().partitions[&key(1, 2, 3)].groups[&7];
+        assert_eq!(group.generation, 1);
+        assert_eq!(group.cursor, 1);
+        assert_eq!(group.sparse_acks, BTreeSet::from([2]));
+        drop(target);
+        let mut target = ShardStateMachine::open(target_directory.path(), identity()).unwrap();
+        assert_eq!(target.state(), source.state());
+        let before = target.state().revision;
+        let responses = target
+            .apply(vec![command_entry(113, group_ack(2))])
+            .await
+            .unwrap();
+        assert_eq!(
+            responses[0],
+            ShardCommandResponse::GroupAcked {
+                generation: 1,
+                group_id: 7,
+                offset: 2,
+                cursor: 0
+            }
+        );
+        assert_eq!(target.state().revision, before);
+        target
+            .apply(vec![command_entry(114, group_ack(1))])
+            .await
+            .unwrap();
+        assert_eq!(
+            target.state().partitions[&key(1, 2, 3)].groups[&7].cursor,
+            3
+        );
+        let mut malformed: ShardSnapshot =
+            serde_json::from_slice(&snapshot_bytes(&snapshot)).unwrap();
+        malformed.partitions[0].1.groups.get_mut(&7).unwrap().cursor = 3;
+        let before = target.state().clone();
+        assert!(
+            install_bytes(&mut target, &snapshot.meta, &reseal(malformed))
+                .await
+                .is_err()
+        );
+        assert_eq!(target.state(), &before);
     }
 
     #[test]

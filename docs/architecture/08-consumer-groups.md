@@ -48,6 +48,42 @@ Reference MVP sequencing: single group with one consumer, then reconnect + ACK, 
 
 ## API behavior table
 
+### C-05 replicated Q2 state-machine increment
+
+`ShardCommand::GroupClaim { partition: PartitionRef, incarnation, metadata_epoch,
+requested_generation }` and `GroupAck { partition: PartitionRef, incarnation,
+metadata_epoch, generation, group_id, offset, message_id, principal, lease_id,
+attempt }` are additive commands; Request/Publish identifiers stay unchanged.
+The claim deliberately has no group selector: it installs a **partition-wide**
+strictly increasing generation fence and fences every group's earlier mutation
+authority. Groups retain independent cursors and ACK histories within that fence.
+The parent partition includes tenant, topic and partition number and locks the
+incarnation on publication; no group may carry progress into another incarnation.
+Claims require an existing committed publication in that incarnation.
+
+The broker must validate authorization and a previously delivered, live volatile
+lease before proposing an ACK. The replicated apply path checks committed
+offset/message identity, incarnation, epoch, current generation and exact retry
+token; committed message existence is not proof of delivery. The broker route,
+SDK and three-node consumer campaign are not implemented in this increment.
+
+Cursor is encoded as the **next incomplete logical offset**, initially zero:
+ACK 2 and ACK 1 leave it at zero, then ACK 0 advances it to three. Sparse state
+is bounded at 4096 offsets per group; closing the cursor gap remains admissible
+at that bound. Group count is capped at 1024 per partition and saved outcomes
+at 65536 per group (prototype admission limits, not production sizing).
+No outcome is evicted: admission fails without mutation on exhaustion. Identical
+current-generation retries return the original saved result, including its
+original cursor, without mutation; conflicting tokens are rejected. Stale epoch
+or generation is rejected even on retry (saved-success after fencing is optional,
+not provided by this increment).
+
+Group generation, cursor, sparse set and full committed ACK identity/result live
+inside `PartitionState`, covered by the existing atomic state persistence and
+checksummed snapshot build/install paths. Recovery validates group bounds,
+fence, contiguous-prefix/sparse consistency and saved message/token identity.
+No terminal disposition, SEEK, Q1 change or client-facing Q2 ACK route is added.
+
 | Event | Write allowed? | Cursor effect | Client result |
 |---|---|---|---|
 | valid ACK before barrier | pending | none yet | ACK_PENDING / outcome unknown |

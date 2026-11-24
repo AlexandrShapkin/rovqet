@@ -1118,13 +1118,16 @@
         "C-04",
         "B-05"
       ],
-      "status": "TODO",
+      "status": "IN_PROGRESS",
       "architecture": "08",
       "proof": "Fail leader after ACK and cursor remains committed",
       "paths": [
         "crates/durable/"
       ],
-      "evidence": null
+      "evidence": {
+        "note": "The replicated group state machine is implemented and tested; the broker route, the SDK and the three-node campaign are the next increments. C-05 is not DONE.",
+        "scope": "Topic-qualified GroupClaim/GroupAck, partition-wide generation fence, bounded per-group sparse cursor and saved ACK outcomes, snapshot/restart recovery. Broker validates volatile delivery leases before proposal."
+      }
     },
     {
       "id": "C-06",
