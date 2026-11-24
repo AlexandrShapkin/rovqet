@@ -1,0 +1,6 @@
+.
+----------------------------------------------------------------------
+Ran 1 test in 1.260s
+
+OK
+{"full_c06": "NOT_RUN", "no_durable_record": "PASS", "q1_qos2": "PASS", "q2_qos1": "PASS", "scope": "C-06 wire-level wrong durable class"}
