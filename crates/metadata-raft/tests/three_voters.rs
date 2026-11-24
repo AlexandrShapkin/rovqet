@@ -5,18 +5,13 @@
 //! library's own results, never through internal metrics.
 use rovqet_metadata_raft::types::{MetadataCommand, MetadataCommandResponse};
 use rovqet_metadata_raft::{MetadataNode, MetadataNodeConfig};
-use std::net::TcpListener;
+mod support;
+use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+use support::{listener, reserve};
 
 const CLUSTER: u128 = 990011;
-
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("port");
-    let port = listener.local_addr().expect("addr").port();
-    drop(listener);
-    port
-}
 
 fn directory(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!(
@@ -32,23 +27,19 @@ fn directory(name: &str) -> PathBuf {
     path
 }
 
-fn config(id: u64, ports: [u16; 3], path: PathBuf, bootstrap: bool) -> MetadataNodeConfig {
+fn config(
+    id: u64,
+    addresses: [SocketAddr; 3],
+    path: PathBuf,
+    bootstrap: bool,
+) -> MetadataNodeConfig {
     let peers: Vec<(u64, std::net::SocketAddr)> = (1..=3)
-        .map(|node| {
-            (
-                node,
-                format!("127.0.0.1:{}", ports[node as usize - 1])
-                    .parse()
-                    .expect("addr"),
-            )
-        })
+        .map(|node| (node, addresses[node as usize - 1]))
         .collect();
     MetadataNodeConfig {
         id,
         cluster_id: CLUSTER,
-        listen: format!("127.0.0.1:{}", ports[id as usize - 1])
-            .parse()
-            .expect("addr"),
+        listen: addresses[id as usize - 1],
         peers,
         data_directory: path,
         bootstrap,
@@ -111,15 +102,18 @@ fn node_command(node: u64) -> MetadataCommand {
     }
 }
 
-async fn start_group(ports: [u16; 3], directories: &[PathBuf]) -> Vec<MetadataNode> {
+async fn start_group(reserved: &[TcpListener; 3], directories: &[PathBuf]) -> Vec<MetadataNode> {
     let mut nodes = Vec::new();
     for index in 0..3 {
-        let node = MetadataNode::start(config(
-            index as u64 + 1,
-            ports,
-            directories[index].clone(),
-            index == 0,
-        ))
+        let node = MetadataNode::start_with_listener(
+            config(
+                index as u64 + 1,
+                std::array::from_fn(|index| reserved[index].local_addr().expect("addr")),
+                directories[index].clone(),
+                index == 0,
+            ),
+            listener(&reserved[index]),
+        )
         .await
         .expect("metadata node");
         nodes.push(node);
@@ -161,11 +155,11 @@ async fn converged(nodes: &[MetadataNode], node: u64) -> bool {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn three_voters_elect_a_leader() {
     init_tracing();
-    let ports = [free_port(), free_port(), free_port()];
+    let reserved = [reserve(), reserve(), reserve()];
     let directories: Vec<PathBuf> = (1..=3)
         .map(|index| directory(&format!("node{index}")))
         .collect();
-    let nodes = start_group(ports, &directories).await;
+    let nodes = start_group(&reserved, &directories).await;
 
     // A real election happens through the library: the bootstrap node is elected leader.
     let leader = wait_for_leader(&nodes, Duration::from_secs(20))
@@ -191,11 +185,11 @@ async fn three_voters_elect_a_leader() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn commits_replicate_and_survive_a_leader_failure() {
     init_tracing();
-    let ports = [free_port(), free_port(), free_port()];
+    let reserved = [reserve(), reserve(), reserve()];
     let directories: Vec<PathBuf> = (1..=3)
         .map(|index| directory(&format!("commit{index}")))
         .collect();
-    let nodes = start_group(ports, &directories).await;
+    let nodes = start_group(&reserved, &directories).await;
     let leader = wait_for_leader(&nodes, Duration::from_secs(20))
         .await
         .expect("a leader must be elected");
@@ -264,11 +258,11 @@ async fn commits_replicate_and_survive_a_leader_failure() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_minority_cannot_commit_a_new_command() {
     init_tracing();
-    let ports = [free_port(), free_port(), free_port()];
+    let reserved = [reserve(), reserve(), reserve()];
     let directories: Vec<PathBuf> = (1..=3)
         .map(|index| directory(&format!("minority{index}")))
         .collect();
-    let nodes = start_group(ports, &directories).await;
+    let nodes = start_group(&reserved, &directories).await;
     let leader = wait_for_leader(&nodes, Duration::from_secs(20))
         .await
         .expect("a leader must be elected");
@@ -311,11 +305,11 @@ async fn a_minority_cannot_commit_a_new_command() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_restarted_follower_catches_up_on_the_committed_log() {
     init_tracing();
-    let ports = [free_port(), free_port(), free_port()];
+    let reserved = [reserve(), reserve(), reserve()];
     let directories: Vec<PathBuf> = (1..=3)
         .map(|index| directory(&format!("catchup{index}")))
         .collect();
-    let nodes = start_group(ports, &directories).await;
+    let nodes = start_group(&reserved, &directories).await;
     let leader = wait_for_leader(&nodes, Duration::from_secs(20))
         .await
         .expect("a leader must be elected");
@@ -353,12 +347,15 @@ async fn a_restarted_follower_catches_up_on_the_committed_log() {
         .expect("committed command");
 
     // The follower restarts from its own storage and must catch up.
-    let restarted = MetadataNode::start(config(
-        follower,
-        ports,
-        directories[(follower - 1) as usize].clone(),
-        false,
-    ))
+    let restarted = MetadataNode::start_with_listener(
+        config(
+            follower,
+            std::array::from_fn(|index| reserved[index].local_addr().expect("addr")),
+            directories[(follower - 1) as usize].clone(),
+            false,
+        ),
+        listener(&reserved[(follower - 1) as usize]),
+    )
     .await
     .expect("restarted follower");
     running.push(restarted);
@@ -384,11 +381,11 @@ async fn a_restarted_follower_catches_up_on_the_committed_log() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn all_three_nodes_restart_with_their_original_storage() {
     init_tracing();
-    let ports = [free_port(), free_port(), free_port()];
+    let reserved = [reserve(), reserve(), reserve()];
     let directories: Vec<PathBuf> = (1..=3)
         .map(|index| directory(&format!("allrestart{index}")))
         .collect();
-    let nodes = start_group(ports, &directories).await;
+    let nodes = start_group(&reserved, &directories).await;
     let leader = wait_for_leader(&nodes, Duration::from_secs(20))
         .await
         .expect("a leader must be elected");
@@ -411,12 +408,15 @@ async fn all_three_nodes_restart_with_their_original_storage() {
     let mut restarted = Vec::new();
     for index in 0..3 {
         restarted.push(
-            MetadataNode::start(config(
-                index as u64 + 1,
-                ports,
-                directories[index].clone(),
-                false,
-            ))
+            MetadataNode::start_with_listener(
+                config(
+                    index as u64 + 1,
+                    std::array::from_fn(|index| reserved[index].local_addr().expect("addr")),
+                    directories[index].clone(),
+                    false,
+                ),
+                listener(&reserved[index]),
+            )
             .await
             .expect("restarted node"),
         );
@@ -456,11 +456,11 @@ async fn all_three_nodes_restart_with_their_original_storage() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn revisions_are_monotonic_and_ownership_epochs_never_regress() {
     init_tracing();
-    let ports = [free_port(), free_port(), free_port()];
+    let reserved = [reserve(), reserve(), reserve()];
     let directories: Vec<PathBuf> = (1..=3)
         .map(|index| directory(&format!("epoch{index}")))
         .collect();
-    let nodes = start_group(ports, &directories).await;
+    let nodes = start_group(&reserved, &directories).await;
     let leader = wait_for_leader(&nodes, Duration::from_secs(20))
         .await
         .expect("a leader must be elected");
@@ -557,11 +557,11 @@ async fn revisions_are_monotonic_and_ownership_epochs_never_regress() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_lagging_follower_catches_up_after_log_compaction() {
     init_tracing();
-    let ports = [free_port(), free_port(), free_port()];
+    let reserved = [reserve(), reserve(), reserve()];
     let directories: Vec<PathBuf> = (1..=3)
         .map(|index| directory(&format!("snapshot{index}")))
         .collect();
-    let nodes = start_group(ports, &directories).await;
+    let nodes = start_group(&reserved, &directories).await;
     let leader = wait_for_leader(&nodes, Duration::from_secs(20))
         .await
         .expect("a leader must be elected");
@@ -606,12 +606,15 @@ async fn a_lagging_follower_catches_up_after_log_compaction() {
     );
 
     // The follower returns far behind a compacted log: only a snapshot can bring it back.
-    let restarted = MetadataNode::start(config(
-        follower,
-        ports,
-        directories[(follower - 1) as usize].clone(),
-        false,
-    ))
+    let restarted = MetadataNode::start_with_listener(
+        config(
+            follower,
+            std::array::from_fn(|index| reserved[index].local_addr().expect("addr")),
+            directories[(follower - 1) as usize].clone(),
+            false,
+        ),
+        listener(&reserved[(follower - 1) as usize]),
+    )
     .await
     .expect("restarted follower");
     running.push(restarted);

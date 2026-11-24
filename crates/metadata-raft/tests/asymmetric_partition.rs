@@ -12,18 +12,13 @@ use rovqet_metadata_raft::types::{
     FenceProof, MetadataCommand, MetadataCommandResponse, MigrationStage,
 };
 use rovqet_metadata_raft::{MetadataNode, MetadataNodeConfig};
-use std::net::TcpListener;
+mod support;
+use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+use support::{listener, reserve};
 
 const CLUSTER: u128 = 660066;
-
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("port");
-    let port = listener.local_addr().expect("addr").port();
-    drop(listener);
-    port
-}
 
 fn directory(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!(
@@ -38,31 +33,31 @@ fn directory(name: &str) -> PathBuf {
     path
 }
 
-async fn voter(id: u64, ports: [u16; 3], path: PathBuf, bootstrap: bool) -> MetadataNode {
+async fn voter(
+    id: u64,
+    addresses: [SocketAddr; 3],
+    reserved: &TcpListener,
+    path: PathBuf,
+    bootstrap: bool,
+) -> MetadataNode {
     let peers: Vec<(u64, std::net::SocketAddr)> = (1..=3)
-        .map(|node| {
-            (
-                node,
-                format!("127.0.0.1:{}", ports[node as usize - 1])
-                    .parse()
-                    .expect("addr"),
-            )
-        })
+        .map(|node| (node, addresses[node as usize - 1]))
         .collect();
-    MetadataNode::start(MetadataNodeConfig {
-        id,
-        cluster_id: CLUSTER,
-        listen: format!("127.0.0.1:{}", ports[id as usize - 1])
-            .parse()
-            .expect("addr"),
-        peers,
-        data_directory: path,
-        bootstrap,
-        election_timeout_ms: 300,
-        heartbeat_interval_ms: 80,
-        max_payload_entries: 64,
-        snapshot_logs_since_last: 8,
-    })
+    MetadataNode::start_with_listener(
+        MetadataNodeConfig {
+            id,
+            cluster_id: CLUSTER,
+            listen: addresses[id as usize - 1],
+            peers,
+            data_directory: path,
+            bootstrap,
+            election_timeout_ms: 300,
+            heartbeat_interval_ms: 80,
+            max_payload_entries: 64,
+            snapshot_logs_since_last: 8,
+        },
+        listener(reserved),
+    )
     .await
     .expect("metadata node")
 }
@@ -87,13 +82,15 @@ async fn propose_until_answered(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn an_isolated_old_owner_blocks_the_activation() {
-    let ports = [free_port(), free_port(), free_port()];
+    let reserved = [reserve(), reserve(), reserve()];
+    let addresses = std::array::from_fn(|index| reserved[index].local_addr().expect("addr"));
     let mut nodes = Vec::new();
     for index in 0..3 {
         nodes.push(
             voter(
                 index as u64 + 1,
-                ports,
+                addresses,
+                &reserved[index],
                 directory(&format!("voter{}", index + 1)),
                 index == 0,
             )

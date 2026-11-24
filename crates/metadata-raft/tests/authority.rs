@@ -2,17 +2,11 @@
 //! become authoritative, and an expired lease must fail closed.
 use rovqet_metadata_raft::types::MetadataCommand;
 use rovqet_metadata_raft::{MetadataNode, MetadataNodeConfig};
-use std::net::TcpListener;
+mod support;
 use std::time::Duration;
+use support::{listener, reserve};
 
 const CLUSTER: u128 = 770077;
-
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("port");
-    let port = listener.local_addr().expect("addr").port();
-    drop(listener);
-    port
-}
 
 fn directory() -> std::path::PathBuf {
     let path = std::env::temp_dir().join(format!(
@@ -29,20 +23,24 @@ fn directory() -> std::path::PathBuf {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn only_committed_metadata_becomes_authoritative() {
-    let port = free_port();
+    let reserved = reserve();
+    let address = reserved.local_addr().expect("addr");
     let path = directory();
-    let node = MetadataNode::start(MetadataNodeConfig {
-        id: 1,
-        cluster_id: CLUSTER,
-        listen: format!("127.0.0.1:{port}").parse().expect("addr"),
-        peers: vec![(1, format!("127.0.0.1:{port}").parse().expect("addr"))],
-        data_directory: path.clone(),
-        bootstrap: true,
-        election_timeout_ms: 300,
-        heartbeat_interval_ms: 80,
-        max_payload_entries: 64,
-        snapshot_logs_since_last: 8,
-    })
+    let node = MetadataNode::start_with_listener(
+        MetadataNodeConfig {
+            id: 1,
+            cluster_id: CLUSTER,
+            listen: address,
+            peers: vec![(1, address)],
+            data_directory: path.clone(),
+            bootstrap: true,
+            election_timeout_ms: 300,
+            heartbeat_interval_ms: 80,
+            max_payload_entries: 64,
+            snapshot_logs_since_last: 8,
+        },
+        listener(&reserved),
+    )
     .await
     .expect("metadata node");
 
@@ -134,5 +132,42 @@ async fn only_committed_metadata_becomes_authoritative() {
     );
 
     node.shutdown().await.expect("shutdown");
+    let _ = std::fs::remove_dir_all(path);
+}
+
+#[tokio::test]
+async fn an_injected_listener_is_not_rebound_and_owns_the_advertised_endpoint() {
+    let reserved = reserve();
+    let other = reserve();
+    let address = reserved.local_addr().expect("reserved address");
+    let path = directory();
+    let node = MetadataNode::start_with_listener(
+        MetadataNodeConfig {
+            id: 1,
+            cluster_id: CLUSTER,
+            // Deliberately occupied by another socket: the injected endpoint must win.
+            listen: other.local_addr().expect("other address"),
+            peers: vec![(1, address)],
+            data_directory: path.clone(),
+            bootstrap: true,
+            election_timeout_ms: 300,
+            heartbeat_interval_ms: 80,
+            max_payload_entries: 64,
+            snapshot_logs_since_last: 8,
+        },
+        listener(&reserved),
+    )
+    .await
+    .expect("use the injected socket without rebinding");
+    assert!(
+        std::net::TcpListener::bind(address).is_err(),
+        "the running endpoint stays reserved"
+    );
+    node.shutdown().await.expect("shutdown");
+    assert!(
+        std::net::TcpListener::bind(address).is_err(),
+        "the retained descriptor reserves the endpoint across restart"
+    );
+    drop(reserved);
     let _ = std::fs::remove_dir_all(path);
 }
