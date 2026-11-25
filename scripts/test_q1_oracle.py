@@ -1074,6 +1074,314 @@ class IsolationOracle(unittest.TestCase):
         self.assertIn(ISO_S4, reasons)
 
 
+GATE_S1 = "healthy-q0-q1-q2-baseline"
+GATE_S2 = "consumer-ack-refused-without-q2-majority"
+GATE_S3 = "metadata-election-preserves-ownership-epoch"
+GATE_S4 = "expired-authority-fails-closed"
+GATE_Q1 = {"tenant_id": 1, "topic_id": 3, "partition_id": 0}
+GATE_Q2 = {"tenant_id": 1, "topic_id": 4, "partition_id": 0}
+
+
+def gate_record(event, scenario, **overrides) -> dict:
+    record = {"event": event, "scenario": scenario}
+    record.update(overrides)
+    return record
+
+
+def gate_message(offset, message_id) -> dict:
+    return {"offset": offset, "message_id": message_id}
+
+
+def gate_commit(scenario, partition, offset, message_id, **overrides) -> dict:
+    record = gate_record(
+        "publication_committed", scenario, partition=dict(partition),
+        offset=offset, message_id=message_id, producer=11, epoch=0, sequence=offset,
+    )
+    record.update(overrides)
+    return record
+
+
+def gate_voter_state(scenario, node, messages) -> dict:
+    return gate_record("voter_state", scenario, node=node,
+                       messages=[dict(m) for m in messages])
+
+
+def gate_ack(scenario, group, offset, generation=1) -> dict:
+    return gate_record("consumer_result", scenario, group=group,
+                       parsed={"outcome": "ack_committed", "offset": offset,
+                               "generation": generation})
+
+
+def cluster_fault_gate_journal() -> list[dict]:
+    """A minimal four-scenario journal that the fault gate rejects nothing in."""
+    return [
+        # -- S1: healthy Q0/Q1/Q2 baseline --
+        gate_record("scenario_started", GATE_S1,
+                    q1_route={"partition": GATE_Q1, "owner_epoch": 7},
+                    q2_route={"partition": GATE_Q2, "owner_epoch": 5},
+                    voters={"1": "/tmp/q2/node1", "2": "/tmp/q2/node2",
+                            "3": "/tmp/q2/node3"}),
+        gate_commit(GATE_S1, GATE_Q2, 0, 400, outcome="committed_quorum"),
+        gate_voter_state(GATE_S1, 1, [gate_message(0, 400)]),
+        gate_voter_state(GATE_S1, 2, [gate_message(0, 400)]),
+        gate_voter_state(GATE_S1, 3, [gate_message(0, 400)]),
+        gate_commit(GATE_S1, GATE_Q1, 0, 100, durable_class="q1-local",
+                    acknowledgment="COMMITTED_LOCAL", sequence=5),
+        gate_record("healthy_baseline", GATE_S1,
+                    identities={"q1": {"offsets": [0]}, "q2": {"offsets": [0]}}),
+        gate_record("consumer_delivery", GATE_S1,
+                    token={"group_id": 70, "generation": 1}),
+        gate_ack(GATE_S1, 70, 0),
+        gate_record("consumer_state", GATE_S1, kind="group_cursor", group=70,
+                    cursors={"1": 1, "2": 1, "3": 1}),
+        gate_record("conclusion", GATE_S1, verdict=oracle.PASS),
+
+        # -- S2: ACK refused during majority loss, then resolved idempotently --
+        gate_record("scenario_started", GATE_S2,
+                    voters={"1": "/tmp/q2/node1", "2": "/tmp/q2/node2",
+                            "3": "/tmp/q2/node3"}),
+        gate_commit(GATE_S2, GATE_Q2, 0, 500, outcome="committed_quorum"),
+        gate_voter_state(GATE_S2, 1, [gate_message(0, 500)]),
+        gate_voter_state(GATE_S2, 2, [gate_message(0, 500)]),
+        gate_voter_state(GATE_S2, 3, [gate_message(0, 500)]),
+        gate_record("broker_killed", GATE_S2, node=2, exit_code=-9),
+        gate_record("broker_killed", GATE_S2, node=3, exit_code=-9),
+        gate_record("quorum_loss_outcome", GATE_S2, live_voters=[1],
+                    quorum_scope={"configured_voters": [1, 2, 3],
+                                  "required_majority": 2}),
+        gate_record("consumer_result", GATE_S2, group=71,
+                    parsed={"outcome": "error", "detail": "OutcomeUnknown"}),
+        gate_commit(GATE_S2, GATE_Q1, 0, 100, durable_class="q1-local",
+                    acknowledgment="COMMITTED_LOCAL", sequence=5),
+        gate_record("q1_commits_without_q2_quorum", GATE_S2,
+                    acknowledgment="COMMITTED_LOCAL", live_q2_voters=[1],
+                    partition=dict(GATE_Q1), offset=0),
+        gate_record("voter_restarted_on_original_storage", GATE_S2, node=2),
+        gate_record("voter_restarted_on_original_storage", GATE_S2, node=3),
+        gate_ack(GATE_S2, 71, 0),
+        gate_record("consumer_state", GATE_S2, kind="group_cursor", group=71,
+                    cursors={"1": 1, "2": 1, "3": 1}),
+        gate_record("conclusion", GATE_S2, verdict=oracle.PASS),
+
+        # -- S3: a metadata election keeps the placement and its epoch --
+        gate_record("scenario_started", GATE_S3),
+        gate_record("metadata_revision", GATE_S3,
+                    evidence={"placements": [dict(GATE_Q1, ownership_epoch=7)]}),
+        gate_record("publication_attempt", GATE_S3, partition=dict(GATE_Q1),
+                    offset=0, message_id=100, producer=11, epoch=0, sequence=5,
+                    owner_epoch=7),
+        gate_commit(GATE_S3, GATE_Q1, 0, 100, durable_class="q1-local",
+                    acknowledgment="COMMITTED_LOCAL", sequence=5),
+        gate_record("conclusion", GATE_S3, verdict=oracle.PASS),
+
+        # -- S4: an expired authority refuses rather than committing --
+        gate_record("scenario_started", GATE_S4),
+        gate_record("dlq_authority_installed", GATE_S4, ownership_epoch=7, lease_ms=200),
+        gate_commit(GATE_S4, GATE_Q1, 0, 100, durable_class="q1-local",
+                    acknowledgment="COMMITTED_LOCAL", sequence=5),
+        gate_record("authority_expiry_window", GATE_S4, lease_ms=200),
+        gate_record("publication_refused", GATE_S4, refusal_code="StaleEpoch"),
+        gate_record("conclusion", GATE_S4, verdict=oracle.PASS),
+    ]
+
+
+class ClusterFaultGateOracle(unittest.TestCase):
+    def reconcile(self, records=None):
+        return oracle.reconcile_cluster_fault_gate(
+            cluster_fault_gate_journal() if records is None else records
+        )
+
+    def reasons(self, records) -> str:
+        return " | ".join(self.reconcile(records)["reasons"])
+
+    def index_of(self, records, event, scenario, **fields) -> int:
+        return next(
+            i for i, r in enumerate(records)
+            if r["event"] == event and r["scenario"] == scenario
+            and all(r.get(k) == v for k, v in fields.items())
+        )
+
+    def test_well_formed_journal_passes(self):
+        result = self.reconcile()
+        self.assertEqual(result["verdict"], oracle.PASS, result)
+        self.assertEqual(result["counts"]["scenarios"], 4, result)
+        self.assertEqual(result["counts"]["q2_committed"], 2, result)
+        self.assertEqual(result["counts"]["majority_proofs"], 2, result)
+        self.assertEqual(result["counts"]["ack_committed"], 2, result)
+        self.assertEqual(result["counts"]["uncertain"], 1, result)
+        self.assertEqual(result["counts"]["violations"], 0, result)
+
+    def test_acknowledged_offset_missing_from_retention_fails(self):
+        records = cluster_fault_gate_journal()
+        index = self.index_of(records, "healthy_baseline", GATE_S1)
+        records.insert(index + 1, gate_commit(
+            GATE_S1, GATE_Q1, 7, 107, durable_class="q1-local",
+            acknowledgment="COMMITTED_LOCAL", sequence=7,
+        ))
+        self.assertIn("acknowledged Q1 offset 7 is missing from the retaining evidence",
+                      self.reasons(records))
+        self.assertEqual(self.reconcile(records)["verdict"], oracle.FAIL)
+
+    def test_committed_quorum_without_two_distinct_voters_fails(self):
+        records = cluster_fault_gate_journal()
+        # Repeated observations from voter 1 and 2 are still only one witness each;
+        # a third record whose node is also 1 never forms a distinct majority.
+        for node in (2, 3):
+            index = self.index_of(records, "voter_state", GATE_S1, node=node)
+            records[index] = gate_voter_state(GATE_S1, 1, [gate_message(0, 400)])
+        self.assertIn("committed quorum without two distinct voter witnesses",
+                      self.reasons(records))
+        self.assertEqual(self.reconcile(records)["verdict"], oracle.FAIL)
+
+    def test_committed_quorum_without_witness_node_is_invalid(self):
+        records = cluster_fault_gate_journal()
+        index = self.index_of(records, "voter_state", GATE_S1, node=3)
+        records[index] = gate_record("voter_state", GATE_S1,
+                                     messages=[gate_message(0, 400)])
+        result = self.reconcile(records)
+        self.assertEqual(result["verdict"], oracle.INVALID, result)
+        self.assertIn("without a witness node", " | ".join(result["reasons"]))
+
+    def test_ack_committed_without_live_majority_fails(self):
+        records = cluster_fault_gate_journal()
+        index = next(
+            i for i, r in enumerate(records)
+            if r["event"] == "consumer_result" and r["scenario"] == GATE_S2
+            and (r.get("parsed") or {}).get("outcome") == "ack_committed"
+        )
+        records.insert(index, gate_record("broker_killed", GATE_S2, node=2,
+                                          exit_code=-9))
+        records.insert(index, gate_record("broker_killed", GATE_S2, node=3,
+                                          exit_code=-9))
+        self.assertIn(
+            "ack_committed recorded with 1 live Q2 voters while 2 are required",
+            self.reasons(records),
+        )
+        self.assertEqual(self.reconcile(records)["verdict"], oracle.FAIL)
+
+    def test_one_producer_token_two_committed_records_fails(self):
+        records = cluster_fault_gate_journal()
+        for record in records:
+            if record["event"] == "voter_state" and record["scenario"] == GATE_S1:
+                record["messages"].append(gate_message(1, 401))
+        index = self.index_of(records, "healthy_baseline", GATE_S1)
+        records.insert(index, gate_commit(GATE_S1, GATE_Q2, 1, 401,
+                                          outcome="committed_quorum", sequence=0))
+        self.assertIn("produced two committed records", self.reasons(records))
+        self.assertEqual(self.reconcile(records)["verdict"], oracle.FAIL)
+
+    def test_retry_changing_the_logical_offset_fails(self):
+        records = cluster_fault_gate_journal()
+        index = self.index_of(records, "healthy_baseline", GATE_S1)
+        records.insert(index, gate_record("dedup_check", GATE_S1,
+                                          original_offset=0, retry_offset=1))
+        self.assertIn("retry changed the logical offset 0 -> 1",
+                      self.reasons(records))
+        self.assertEqual(self.reconcile(records)["verdict"], oracle.FAIL)
+
+    def test_cursor_beyond_contiguous_prefix_fails(self):
+        records = cluster_fault_gate_journal()
+        for record in records:
+            if record["event"] == "voter_state" and record["scenario"] == GATE_S1:
+                record["messages"].append(gate_message(1, 401))
+        index = self.index_of(records, "healthy_baseline", GATE_S1)
+        records.insert(index, gate_commit(GATE_S1, GATE_Q2, 1, 401,
+                                          outcome="committed_quorum", sequence=1))
+        cursor = records[self.index_of(records, "consumer_state", GATE_S1)]
+        cursor["cursors"]["3"] = 2
+        self.assertIn(
+            "cursor 2 of voter 3 is beyond the contiguous acknowledged prefix 1",
+            self.reasons(records),
+        )
+        self.assertEqual(self.reconcile(records)["verdict"], oracle.FAIL)
+
+    def test_stale_generation_mutating_state_fails(self):
+        records = cluster_fault_gate_journal()
+        index = self.index_of(records, "consumer_result", GATE_S1, group=70)
+        records[index]["parsed"]["generation"] = 0
+        self.assertIn("stale generation 0 mutated group 70 while 1 is current",
+                      self.reasons(records))
+        self.assertEqual(self.reconcile(records)["verdict"], oracle.FAIL)
+
+    def test_uncommitted_tail_reported_committed_fails(self):
+        records = cluster_fault_gate_journal()
+        cursor = records[self.index_of(records, "consumer_state", GATE_S1)]
+        index = records.index(cursor)
+        cursor["cursors"] = {"1": 2, "2": 2, "3": 2}
+        records.insert(index, gate_ack(GATE_S1, 70, 1))
+        self.assertIn("uncommitted tail at offset 1 reported committed by cursor 2",
+                      self.reasons(records))
+        self.assertEqual(self.reconcile(records)["verdict"], oracle.FAIL)
+
+    def test_quorum_justified_by_q1_evidence_fails(self):
+        records = cluster_fault_gate_journal()
+        index = next(
+            i for i, r in enumerate(records)
+            if r["event"] == "publication_committed"
+            and r.get("outcome") == "committed_quorum"
+        )
+        records[index]["partition"] = dict(GATE_Q1)
+        records[index]["sequence"] = 9
+        self.assertIn("COMMITTED_QUORUM justified only by Q1 evidence",
+                      self.reasons(records))
+        self.assertEqual(self.reconcile(records)["verdict"], oracle.FAIL)
+
+    def test_local_ack_presented_as_quorum_fails(self):
+        records = cluster_fault_gate_journal()
+        index = next(
+            i for i, r in enumerate(records)
+            if r["event"] == "publication_committed"
+            and r.get("acknowledgment") == "COMMITTED_LOCAL"
+            and r["scenario"] == GATE_S1
+        )
+        records[index]["outcome"] = "committed_quorum"
+        self.assertIn("COMMITTED_LOCAL presented as a quorum result",
+                      self.reasons(records))
+        self.assertEqual(self.reconcile(records)["verdict"], oracle.FAIL)
+
+    def test_continuation_after_corrupted_replica_fails(self):
+        records = cluster_fault_gate_journal()
+        index = self.index_of(records, "publication_committed", GATE_S1, offset=0)
+        records.insert(index, gate_record("replica_corrupted", GATE_S1, node=2))
+        self.assertIn(
+            "continuation claimed after a corrupted replica without detection "
+            "or recovery",
+            self.reasons(records),
+        )
+        self.assertEqual(self.reconcile(records)["verdict"], oracle.FAIL)
+
+    def test_incomplete_scenario_set_fails(self):
+        records = [r for r in cluster_fault_gate_journal()
+                   if not (r["event"] == "conclusion" and r["scenario"] == GATE_S4)]
+        result = self.reconcile(records)
+        self.assertEqual(result["verdict"], oracle.FAIL, result)
+        self.assertEqual(result["counts"]["scenarios"], 4, result)
+        self.assertIn(
+            "incomplete scenario set: missing conclusion for " + GATE_S4,
+            " | ".join(result["reasons"]),
+        )
+
+    def test_cited_evidence_must_exist_and_record_pass(self):
+        records = cluster_fault_gate_journal()
+        records.insert(0, gate_record(
+            "reused_evidence", GATE_S1,
+            path="benchmarks/evidence/c07-cluster-fault-gate/absent.jsonl",
+        ))
+        result = self.reconcile(records)
+        self.assertEqual(result["verdict"], oracle.INVALID, result)
+        self.assertIn("does not exist", " | ".join(result["reasons"]))
+
+        target = oracle.EVIDENCE_ROOT / "c07-cluster-fault-gate" / "fixture-fail.jsonl"
+        target.write_text(json.dumps({"verdict": "FAIL"}) + "\n", encoding="utf-8")
+        try:
+            records[0] = gate_record("reused_evidence", GATE_S1, path=str(target))
+            result = self.reconcile(records)
+        finally:
+            target.unlink()
+        self.assertEqual(result["verdict"], oracle.INVALID, result)
+        self.assertIn("records verdict FAIL", " | ".join(result["reasons"]))
+
+
 if __name__ == "__main__":
     from test_q2_consumer_oracle import Q2ConsumerFixtures
 
