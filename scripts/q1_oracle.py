@@ -3139,3 +3139,614 @@ def reconcile_q1_q2_isolation(records: list[dict], *, require_conclusion: bool =
     counts["violations"] = len(unique_failures)
     verdict = FAIL if unique_failures else INVALID if unique_invalid else PASS
     return {"verdict": verdict, "reasons": unique_failures + unique_invalid, "counts": counts}
+
+
+# ---------------------------------------------------------------------------
+# C-07 cluster fault gate
+#
+# The gate's journal is written by the parent harness from observed client results,
+# kill/restart observations and post-scenario voter state.  It is reconciled here
+# from those records alone: no scenario verdict is itself durability evidence.
+# An uncertain outcome (OutcomeUnknown) during majority loss and a typed refusal
+# after an observed lease expiry are the *correct* results and count as evidence
+# for the quorum rules; neither is a commit.
+# ---------------------------------------------------------------------------
+
+FAULT_GATE_SCENARIOS = (
+    "healthy-q0-q1-q2-baseline",
+    "consumer-ack-refused-without-q2-majority",
+    "metadata-election-preserves-ownership-epoch",
+    "expired-authority-fails-closed",
+)
+REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
+EVIDENCE_ROOT = REPOSITORY_ROOT / "benchmarks" / "evidence"
+
+
+def _gate_partition(value) -> tuple | None:
+    """A hashable partition identity from a route, placement or publication record."""
+    if isinstance(value, dict):
+        value = value.get("partition", value)
+        fields = [value.get(k) for k in ("tenant_id", "topic_id", "partition_id")]
+        if all(isinstance(v, int) and not isinstance(v, bool) for v in fields):
+            return tuple(fields)
+    return None
+
+
+def _gate_placements(record: dict) -> list[dict]:
+    """Every metadata placement carried by one observation."""
+    found: list[dict] = []
+    for key in ("placement", "committed_placement"):
+        value = record.get(key)
+        if isinstance(value, dict):
+            found.extend(p for p in value.get("placements") or [] if isinstance(p, dict))
+    evidence = record.get("evidence")
+    if isinstance(evidence, dict):
+        found.extend(p for p in evidence.get("placements") or [] if isinstance(p, dict))
+    placements = record.get("placements")
+    if isinstance(placements, list):
+        found.extend(p for p in placements if isinstance(p, dict))
+    return found
+
+
+def _gate_consumer_outcome(record: dict) -> dict:
+    """The parsed consumer result, falling back to the raw client stdout."""
+    parsed = record.get("parsed")
+    if isinstance(parsed, dict) and parsed:
+        return parsed
+    stdout = record.get("stdout")
+    if isinstance(stdout, str) and stdout.lstrip().startswith("{"):
+        try:
+            value = json.loads(stdout)
+        except json.JSONDecodeError:
+            return {}
+        if isinstance(value, dict):
+            return value
+    return {}
+
+
+def _gate_group_progress(record: dict) -> tuple[set[int], dict[int, int]]:
+    """Saved group outcomes of a consumer_state observation.
+
+    Returns the saved logical offsets and, per offset, the generation they were
+    saved under, so a later observation can be checked for a stale mutation.
+    """
+    offsets: set[int] = set()
+    generations: dict[int, int] = {}
+    progress = record.get("progress")
+    if isinstance(progress, dict):
+        for node in progress.values():
+            outcomes = node.get("outcomes") if isinstance(node, dict) else None
+            if not isinstance(outcomes, dict):
+                continue
+            for offset, saved in outcomes.items():
+                try:
+                    number = int(offset)
+                except (TypeError, ValueError):
+                    continue
+                offsets.add(number)
+                if not isinstance(saved, dict):
+                    continue
+                acked = (saved.get("outcome") or {}).get("GroupAcked")
+                generation = acked.get("generation") if isinstance(acked, dict) else None
+                if isinstance(generation, int):
+                    generations[number] = generation
+    return offsets, generations
+
+
+def _gate_cited_verdicts(path: Path) -> list:
+    """Verdicts recorded by a cited evidence file, JSONL or a single document."""
+    text = path.read_text(encoding="utf-8")
+    try:
+        document = json.loads(text)
+    except json.JSONDecodeError:
+        document = None
+    if isinstance(document, dict):
+        return [document["verdict"]] if "verdict" in document else []
+    verdicts = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            return [INVALID]
+        if isinstance(record, dict) and "verdict" in record:
+            verdicts.append(record["verdict"])
+    return verdicts
+
+
+def reconcile_cluster_fault_gate(
+    records: list[dict], *, require_conclusion: bool = True
+) -> dict:
+    """Reconcile the C-07 cluster fault gate from the journal it produced.
+
+    The journal is the only evidence: externally received client results, the
+    parent's kill/restart observations and broker-printed voter state.  A commit
+    needs distinct voter witnesses; an ACK or cursor may not outrun them.  An
+    uncertain outcome during majority loss is the expected result and a typed
+    refusal after an observed ``lease_ms`` expiry is the correct fail-closed
+    result.  Missing evidence is INVALID, never PASS.
+    """
+    failures: list[str] = []
+    invalid: list[str] = []
+    counts = {
+        "records": len(records),
+        "scenarios": 0,
+        "conclusions": 0,
+        "scenario_passes": 0,
+        "q1_committed": 0,
+        "q2_committed": 0,
+        "majority_proofs": 0,
+        "ack_committed": 0,
+        "refusals": 0,
+        "uncertain": 0,
+        "reused_evidence": 0,
+        "violations": 0,
+    }
+    if not records:
+        return _result(NOT_RUN, ["no cluster fault gate evidence"], counts)
+
+    conclusions: dict = {}
+    for record in records:
+        if record.get("event") == "conclusion":
+            conclusions.setdefault(record.get("scenario"), record)
+    journals: dict[str, list[dict]] = {}
+    for record in records:
+        scenario = record.get("scenario")
+        if isinstance(scenario, str):
+            journals.setdefault(scenario, []).append(record)
+    counts["scenarios"] = len(journals)
+    counts["conclusions"] = len(conclusions)
+    counts["scenario_passes"] = sum(
+        1 for conclusion in conclusions.values() if conclusion.get("verdict") == PASS
+    )
+
+    # 11. The scenario set and its conclusions.
+    if require_conclusion and not conclusions:
+        invalid.append("missing campaign conclusion")
+    if require_conclusion:
+        for name in FAULT_GATE_SCENARIOS:
+            conclusion = conclusions.get(name)
+            if conclusion is None:
+                failures.append(
+                    f"incomplete scenario set: missing conclusion for {name}"
+                )
+            elif conclusion.get("verdict") != PASS:
+                failures.append(
+                    f"incomplete scenario set: {name} concluded "
+                    f"{conclusion.get('verdict')} instead of PASS"
+                )
+
+    witness_fields = 0
+    for scenario, journal in journals.items():
+        # -- the routes, voters and metadata epochs this scenario advertises --
+        q1_partition = q2_partition = None
+        voters: set[int] = set()
+        declared_majority = None
+        declared_epoch = None
+        epochs: set[int] = set()
+        epochs_by_partition: dict[tuple, set[int]] = {}
+        for record in journal:
+            event = record.get("event")
+            if event == "scenario_started":
+                route = record.get("q1_route")
+                if isinstance(route, dict):
+                    q1_partition = _gate_partition(route.get("partition"))
+                    if isinstance(route.get("owner_epoch"), int):
+                        declared_epoch = route["owner_epoch"]
+                        epochs_by_partition.setdefault(q1_partition, set()).add(
+                            route["owner_epoch"]
+                        )
+                route = record.get("q2_route")
+                if isinstance(route, dict):
+                    q2_partition = _gate_partition(route.get("partition"))
+                    # The Q2 data domain owns its own epoch; it is not the Q1 epoch.
+                    if isinstance(route.get("owner_epoch"), int):
+                        epochs_by_partition.setdefault(q2_partition, set()).add(
+                            route["owner_epoch"]
+                        )
+                observed = record.get("voters")
+                if isinstance(observed, dict):
+                    voters |= {int(node) for node in observed}
+            elif event == "healthy_baseline":
+                identities = record.get("identities")
+                if isinstance(identities, dict):
+                    q1_identity = identities.get("q1")
+                    q2_identity = identities.get("q2")
+                    if isinstance(q1_identity, dict) and q1_partition is None:
+                        q1_partition = _gate_partition(q1_identity)
+                    if isinstance(q2_identity, dict) and q2_partition is None:
+                        q2_partition = _gate_partition(q2_identity)
+            quorum = record.get("quorum_scope")
+            if isinstance(quorum, dict):
+                if isinstance(quorum.get("required_majority"), int):
+                    declared_majority = quorum["required_majority"]
+                configured = quorum.get("configured_voters")
+                if isinstance(configured, list):
+                    voters |= {v for v in configured if isinstance(v, int)}
+            for placement in _gate_placements(record):
+                epoch = placement.get("ownership_epoch")
+                if isinstance(epoch, int):
+                    epochs.add(epoch)
+                    epochs_by_partition.setdefault(
+                        _gate_partition(placement), set()
+                    ).add(epoch)
+        required = declared_majority or (len(voters) // 2 + 1 if voters else 2)
+        expected_epoch = max(epochs) if epochs else declared_epoch
+        for partition, observed in epochs_by_partition.items():
+            epochs_by_partition[partition] = {max(observed)}
+
+        # -- observed voter witnesses: offset -> nodes, identity -> nodes --
+        carriers: dict[int, set[int]] = {}
+        identity_carriers: dict[tuple, set[int]] = {}
+        for record in journal:
+            if record.get("event") != "voter_state":
+                continue
+            node = record.get("node")
+            for collection in ("messages", "outcomes"):
+                entries = record.get(collection)
+                if not isinstance(entries, list):
+                    continue
+                for entry in entries:
+                    if not isinstance(entry, dict):
+                        continue
+                    offset = entry.get("offset")
+                    if not isinstance(offset, int):
+                        continue
+                    if not isinstance(node, int):
+                        # A witness without a voter identity is not a majority.
+                        invalid.append(
+                            "voter state without a witness node field for "
+                            f"offset {offset}"
+                        )
+                        continue
+                    witness_fields += 1
+                    carriers.setdefault(offset, set()).add(node)
+                    message_id = entry.get("message_id")
+                    if isinstance(message_id, int):
+                        identity_carriers.setdefault(
+                            (offset, message_id), set()
+                        ).add(node)
+
+        # -- the publications this scenario acknowledged --
+        q1_offsets: set[int] = set()
+        quorum_publications: list[dict] = []
+        for record in journal:
+            if record.get("event") != "publication_committed":
+                continue
+            acknowledgment = str(record.get("acknowledgment", "")).upper()
+            outcome = str(record.get("outcome", "")).lower()
+            if acknowledgment == "COMMITTED_LOCAL" or record.get("durable_class") == "q1-local":
+                if isinstance(record.get("offset"), int):
+                    q1_offsets.add(record["offset"])
+                continue
+            if outcome == "committed_quorum":
+                quorum_publications.append(record)
+                if isinstance(record.get("offset"), int):
+                    counts["q2_committed"] += 1
+        counts["q1_committed"] += len(q1_offsets)
+
+        # -- 1. every acknowledged offset survives in the evidence that retains it --
+        for record in quorum_publications:
+            offset = record.get("offset")
+            if isinstance(offset, int) and not carriers.get(offset):
+                failures.append(
+                    f"acknowledged Q2 offset {offset} is missing from the retaining evidence"
+                )
+        retained = None
+        for record in journal:
+            if record.get("event") == "healthy_baseline":
+                identities = record.get("identities")
+                if isinstance(identities, dict):
+                    identity = identities.get("q1")
+                    if isinstance(identity, dict) and isinstance(identity.get("offsets"), list):
+                        retained = {o for o in identity["offsets"] if isinstance(o, int)}
+            elif record.get("event") == "q1_retained_offsets":
+                offsets = record.get("offsets")
+                if isinstance(offsets, list):
+                    retained = {o for o in offsets if isinstance(o, int)}
+        if retained is not None:
+            for offset in sorted(q1_offsets - retained):
+                failures.append(
+                    f"acknowledged Q1 offset {offset} is missing from the retaining evidence"
+                )
+
+        # -- 2. a committed quorum needs two distinct voter witnesses --
+        for record in quorum_publications:
+            offset, message_id = record.get("offset"), record.get("message_id")
+            witnesses = identity_carriers.get((offset, message_id), set())
+            if len(witnesses) < max(required, 2):
+                failures.append(
+                    "committed quorum without two distinct voter witnesses for "
+                    f"offset {offset} message {message_id}: {sorted(witnesses)}"
+                )
+            else:
+                counts["majority_proofs"] += 1
+
+        # -- 3. an ACK is never committed without a live majority --
+        dead: set[int] = set()
+        for record in journal:
+            event = record.get("event")
+            node = record.get("node")
+            if str(record.get("role", "")).startswith("metadata"):
+                continue
+            if event in ("broker_killed", "voter_stop_observed"):
+                if isinstance(node, int) and node in voters:
+                    dead.add(node)
+            elif event in ("broker_started", "voter_restarted_on_original_storage"):
+                if isinstance(node, int) and node in voters:
+                    dead.discard(node)
+            elif event in ("quorum_loss_outcome", "q1_commits_without_q2_quorum"):
+                live = record.get("live_voters", record.get("live_q2_voters"))
+                if isinstance(live, list) and voters:
+                    dead = set(voters) - {v for v in live if isinstance(v, int)}
+            elif event == "consumer_result":
+                outcome = _gate_consumer_outcome(record)
+                if outcome.get("outcome") == "ack_committed":
+                    counts["ack_committed"] += 1
+                    live = set(voters) - dead
+                    if voters and len(live) < required:
+                        failures.append(
+                            "ack_committed recorded with %d live Q2 voters while %d are required"
+                            % (len(live), required)
+                        )
+                elif outcome.get("outcome") == "error":
+                    detail = str(outcome.get("detail", ""))
+                    if "OutcomeUnknown" in detail:
+                        counts["uncertain"] += 1
+                    elif detail:
+                        counts["refusals"] += 1
+        for record in journal:
+            if record.get("event") == "publication_refused":
+                counts["refusals"] += 1
+
+        # -- 4. one producer token never produces two committed records or offsets --
+        committed_by_token: dict[tuple, list[dict]] = {}
+        committed_by_identity: dict[tuple, set[int]] = {}
+        for record in journal:
+            if record.get("event") != "publication_committed":
+                continue
+            key = (
+                _gate_partition(record.get("partition")),
+                record.get("producer"),
+                record.get("epoch"),
+                record.get("sequence"),
+            )
+            committed_by_token.setdefault(key, []).append(record)
+            if isinstance(record.get("offset"), int) and isinstance(record.get("message_id"), int):
+                identity = (_gate_partition(record.get("partition")), record["message_id"])
+                committed_by_identity.setdefault(identity, set()).add(record["offset"])
+        for key, committed in committed_by_token.items():
+            pairs = {(r.get("offset"), r.get("message_id")) for r in committed}
+            offsets = {r.get("offset") for r in committed}
+            if len(pairs) > 1:
+                failures.append(f"producer token {key} produced two committed records")
+            if len(offsets) > 1:
+                failures.append(f"producer token {key} produced two offsets")
+
+        # -- 5. a retry keeps the original logical offset --
+        for (_, message_id), offsets in committed_by_identity.items():
+            if len(offsets) > 1:
+                failures.append(
+                    f"retry changed the logical offset of message {message_id}: {sorted(offsets)}"
+                )
+        for record in journal:
+            if record.get("event") != "dedup_check":
+                continue
+            original, retry = record.get("original_offset"), record.get("retry_offset")
+            if isinstance(original, int) and isinstance(retry, int) and original != retry:
+                failures.append(
+                    f"retry changed the logical offset {original} -> {retry}"
+                )
+
+        # -- 6. a cursor never crosses the contiguous acknowledged prefix --
+        acknowledged: dict[object, set[int]] = {}
+        for record in journal:
+            event = record.get("event")
+            group = record.get("group")
+            if event == "consumer_result":
+                outcome = _gate_consumer_outcome(record)
+                if outcome.get("outcome") == "ack_committed" and isinstance(
+                    outcome.get("offset"), int
+                ):
+                    acknowledged.setdefault(group, set()).add(outcome["offset"])
+            elif event == "consumer_state":
+                offsets, _ = _gate_group_progress(record)
+                if offsets:
+                    acknowledged.setdefault(group, set()).update(offsets)
+        for record in journal:
+            if record.get("event") != "consumer_state" or record.get("kind") != "group_cursor":
+                continue
+            cursors = record.get("cursors")
+            if not isinstance(cursors, dict):
+                continue
+            group = record.get("group")
+            acked = acknowledged.get(group, set())
+            prefix = 0
+            while prefix in acked:
+                prefix += 1
+            for voter, cursor in cursors.items():
+                if not isinstance(cursor, int):
+                    continue
+                if cursor > prefix:
+                    failures.append(
+                        f"cursor {cursor} of voter {voter} is beyond the contiguous "
+                        f"acknowledged prefix {prefix}"
+                    )
+                # -- 8. the uncommitted tail is never reported committed --
+                for offset in range(max(cursor, 0)):
+                    if len(carriers.get(offset, set())) < max(required, 2):
+                        failures.append(
+                            f"uncommitted tail at offset {offset} reported committed by "
+                            f"cursor {cursor}"
+                        )
+
+        # -- 7. a stale epoch or generation never mutates state it does not own --
+        generation: dict[object, int] = {}
+        for record in journal:
+            event = record.get("event")
+            if event == "consumer_delivery":
+                token = record.get("token")
+                if isinstance(token, dict):
+                    group = token.get("group_id")
+                    value = token.get("generation")
+                    if isinstance(group, int) and isinstance(value, int):
+                        generation[group] = max(generation.get(group, 0), value)
+            elif event == "consumer_result":
+                outcome = _gate_consumer_outcome(record)
+                group, value = record.get("group"), outcome.get("generation")
+                if (
+                    outcome.get("outcome") == "ack_committed"
+                    and isinstance(group, int)
+                    and isinstance(value, int)
+                ):
+                    current = generation.get(group, value)
+                    if value < current:
+                        failures.append(
+                            f"stale generation {value} mutated group {group} while "
+                            f"{current} is current"
+                        )
+                    generation[group] = max(current, value)
+            elif event == "consumer_state":
+                _, generations = _gate_group_progress(record)
+                group = record.get("group")
+                for offset, value in generations.items():
+                    current = generation.get(group, value)
+                    if value < current:
+                        failures.append(
+                            f"stale generation {value} saved offset {offset} while "
+                            f"{current} is current"
+                        )
+                    generation[group] = max(current, value)
+        if isinstance(expected_epoch, int):
+            for record in journal:
+                if record.get("event") not in ("publication_attempt", "publication_committed"):
+                    continue
+                epoch = record.get("owner_epoch")
+                if not isinstance(epoch, int):
+                    continue
+                partition = _gate_partition(record.get("partition"))
+                observed = epochs_by_partition.get(partition)
+                expected = max(observed) if observed else (
+                    expected_epoch if partition is None else None
+                )
+                if expected is not None and epoch < expected:
+                    failures.append(
+                        f"stale ownership epoch {epoch} mutated state while "
+                        f"{expected} is current"
+                    )
+
+        # -- 9. the Q1 and Q2 domains justify only their own acknowledgment --
+        if q1_partition is not None and q1_partition == q2_partition:
+            failures.append(
+                "Q1/Q2 domain substitution: both routes name the same partition"
+            )
+        for record in journal:
+            acknowledgment = str(record.get("acknowledgment", "")).upper()
+            outcome = str(record.get("outcome", "")).lower()
+            partition = _gate_partition(record.get("partition"))
+            if outcome == "committed_quorum":
+                if q1_partition is not None and partition == q1_partition:
+                    failures.append(
+                        "COMMITTED_QUORUM justified only by Q1 evidence"
+                    )
+                elif q2_partition is not None and partition is not None and partition != q2_partition:
+                    failures.append(
+                        "COMMITTED_QUORUM outside the declared Q2 partition"
+                    )
+            if acknowledgment == "COMMITTED_LOCAL":
+                if outcome in ("committed_quorum", "ack_committed"):
+                    failures.append(
+                        "COMMITTED_LOCAL presented as a quorum result"
+                    )
+                elif q2_partition is not None and partition == q2_partition:
+                    failures.append(
+                        "COMMITTED_LOCAL presented as a quorum result on the Q2 partition"
+                    )
+            if (
+                record.get("event") == "q1_commits_without_q2_quorum"
+                and acknowledgment == "COMMITTED_QUORUM"
+            ):
+                failures.append("COMMITTED_QUORUM justified only by Q1 evidence")
+
+        # -- 10. a corrupted replica stops continuation or is detected and recovered --
+        for index, record in enumerate(journal):
+            if record.get("event") not in (
+                "replica_corrupted",
+                "replica_corruption",
+                "corrupted_replica",
+            ):
+                continue
+            later = journal[index + 1:]
+            detected = record.get("detected") is True or bool(record.get("detection"))
+            detected = detected or any(
+                item.get("event") in (
+                    "replica_corruption_detected",
+                    "replica_checksum_mismatch",
+                    "publication_refused",
+                )
+                for item in later
+            )
+            recovered = any(
+                item.get("event") in (
+                    "replica_recovered",
+                    "replica_restored",
+                    "voter_restarted_on_original_storage",
+                )
+                for item in later
+            )
+            continued = any(
+                item.get("event") in ("publication_committed", "consumer_result")
+                and (
+                    str(item.get("acknowledgment", "")).upper() in ("COMMITTED_LOCAL", "COMMITTED_QUORUM")
+                    or _gate_consumer_outcome(item).get("outcome") == "ack_committed"
+                )
+                for item in later
+            ) or any(
+                item.get("event") == "conclusion" and item.get("verdict") == PASS
+                for item in later
+            )
+            if continued and not detected and not recovered:
+                failures.append(
+                    "continuation claimed after a corrupted replica without detection "
+                    "or recovery"
+                )
+
+    # -- the reuse check: a cited evidence file exists and records PASS --
+    reused = [record for record in records if record.get("event") == "reused_evidence"]
+    counts["reused_evidence"] = len(reused)
+    for record in reused:
+        cited = record.get("path") or record.get("file")
+        if not isinstance(cited, str) or not cited:
+            invalid.append("reused evidence without a cited path")
+            continue
+        resolved = Path(cited)
+        if not resolved.is_absolute():
+            resolved = (REPOSITORY_ROOT / resolved).resolve()
+        try:
+            resolved.relative_to(EVIDENCE_ROOT)
+        except ValueError:
+            continue
+        if not resolved.is_file():
+            invalid.append(f"cited evidence {cited} does not exist")
+            continue
+        try:
+            verdicts = _gate_cited_verdicts(resolved)
+        except OSError as error:
+            invalid.append(f"cited evidence {cited} is unreadable: {error}")
+            continue
+        for verdict in verdicts:
+            if verdict != PASS:
+                invalid.append(f"cited evidence {cited} records verdict {verdict}")
+
+    unique_failures = list(dict.fromkeys(failures))
+    unique_invalid = list(dict.fromkeys(invalid))
+    counts["witness_fields"] = witness_fields
+    counts["violations"] = len(unique_failures)
+    if unique_failures:
+        return _result(FAIL, unique_failures + unique_invalid, counts)
+    if unique_invalid:
+        return _result(INVALID, unique_invalid, counts)
+    if counts["scenarios"] == 0:
+        return _result(NOT_RUN, ["no cluster fault gate evidence"], counts)
+    return _result(PASS, [], counts)

@@ -1,0 +1,19 @@
+{
+  "counts": {
+    "ack_committed": 2,
+    "conclusions": 4,
+    "majority_proofs": 4,
+    "q1_committed": 6,
+    "q2_committed": 4,
+    "records": 133,
+    "refusals": 2,
+    "reused_evidence": 0,
+    "scenario_passes": 4,
+    "scenarios": 4,
+    "uncertain": 1,
+    "violations": 0,
+    "witness_fields": 24
+  },
+  "reasons": [],
+  "verdict": "PASS"
+}
