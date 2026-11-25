@@ -3241,7 +3241,18 @@ def _gate_cited_verdicts(path: Path) -> list:
     except json.JSONDecodeError:
         document = None
     if isinstance(document, dict):
-        return [document["verdict"]] if "verdict" in document else []
+        if "verdict" in document:
+            return [document["verdict"]]
+        # Some campaign summaries record one verdict per execution window
+        # (e.g. the C-02 migration crash matrix's ``verdicts`` array).
+        recorded = document.get("verdicts")
+        if isinstance(recorded, list):
+            return [
+                item["verdict"]
+                for item in recorded
+                if isinstance(item, dict) and "verdict" in item
+            ]
+        return []
     verdicts = []
     for line in text.splitlines():
         if not line.strip():

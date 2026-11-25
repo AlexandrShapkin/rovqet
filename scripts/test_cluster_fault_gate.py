@@ -35,8 +35,9 @@ directory under a disposable temporary root; all listeners are loopback. If Q0
 cannot be exercised the way q0_smoke.py exercises it against this broker, the
 scenario is journaled NOT_RUN with the exact reason — never PASS. If a
 delivery lease expires before a quorum-loss ACK can be attempted, the
-scenario is INVALID, never PASS. No oracle reconciler runs in this
-increment.
+scenario is INVALID, never PASS. After the scenarios the campaign reconciles its
+own journal, verifies every reused-evidence citation and exits non-zero on any
+non-PASS verdict.
 """
 from __future__ import annotations
 
@@ -1288,6 +1289,43 @@ def scenario_f7b(journal):
 SCENARIOS = ((F1, scenario_f1), (F3B, scenario_f3b),
              (F7A, scenario_f7a), (F7B, scenario_f7b))
 
+# C-07 deliberately does not re-run properties that C-02..C-06 already proved.
+# Each citation names the C-07 scenario it supports; the reconciler verifies the
+# cited file exists and that every verdict it records is PASS, so "reuse, don't
+# repeat" is a checked claim rather than a comment.
+REUSED_EVIDENCE = {
+    F1: (
+        ("benchmarks/evidence/c04-q2-publish/q2-publish.jsonl",
+         "C-04 scenario 12: premajority leader-crash Q2 publication safety"),
+        ("benchmarks/evidence/c04-q2-publish/q2-publish.jsonl",
+         "C-04 scenario 14: postmajority leader-crash Q2 publication safety"),
+        ("benchmarks/evidence/c04-q2-publish/q2-publish.jsonl",
+         "C-04 scenario 13: one-unavailable-follower Q2 publication"),
+        ("benchmarks/evidence/c05-q2-consumer/oracle.json",
+         "C-05: consumer ACK crash windows, sparse cursor and generation fencing"),
+        ("benchmarks/evidence/c03-q2-raft/scenario-14.jsonl",
+         "C-03 scenario 14: corrupted committed replica is refused"),
+        ("benchmarks/evidence/c03-q2-raft/scenario-15.jsonl",
+         "C-03 scenario 15: a healthy majority preserves committed history"),
+    ),
+    F3B: (
+        ("benchmarks/evidence/c06-q1-q2-isolation/oracle.json",
+         "C-06: Q1 commits while the Q2 data domain lacks quorum"),
+        ("benchmarks/evidence/c02-safety-matrix/D2-pending-terminal-at-migration.jsonl",
+         "C-02 D2: durable PENDING terminal survives migration without duplication"),
+    ),
+    F7A: (
+        ("benchmarks/evidence/c02-crash-matrix/verdicts.json",
+         "C-02: 16-window Q1 migration crash matrix (fencing/ownership boundaries)"),
+        ("benchmarks/evidence/c06-q1-q2-isolation/oracle.json",
+         "C-06: Q2 history survives isolated Q1 storage loss"),
+    ),
+    F7B: (
+        ("benchmarks/evidence/c02-bundle-campaign/verdict.json",
+         "C-02 bundle: no duplicate DLQ publication, exactly-once disposition"),
+    ),
+}
+
 
 def main() -> int:
     missing = [str(path) for path in
@@ -1320,6 +1358,9 @@ def main() -> int:
                     reason = f"{type(error).__name__}: {error}"
                     journal.append("scenario_failure", scenario=name,
                                    detail=traceback.format_exc())
+            for cited_path, proves in REUSED_EVIDENCE.get(name, ()):
+                journal.append("reused_evidence", scenario=name,
+                               path=cited_path, proves=proves)
             if name in (F7A, F7B):
                 journal.conclusion(
                     verdict, reason, scenario=name,
@@ -1333,8 +1374,21 @@ def main() -> int:
             print(f"{verdict} {name}: {reason}", flush=True)
     finally:
         journal.close()
-    return 0 if all(verdict == oracle.PASS
-                    for verdict in verdicts.values()) else 1
+    try:
+        records = oracle.load(EVIDENCE / "fault-gate.jsonl")
+        result = oracle.reconcile_cluster_fault_gate(records)
+    except oracle.JournalError as error:
+        result = {"verdict": oracle.INVALID, "reasons": [str(error)], "counts": {}}
+    (EVIDENCE / "oracle.json").write_text(
+        json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"{result['verdict']} oracle-cluster-fault-gate: "
+          f"{result['counts'].get('reused_evidence', 0)} reused-evidence "
+          f"citations verified, {result['counts'].get('scenario_passes', 0)}/4 "
+          f"scenarios PASS", flush=True)
+    for reason in result["reasons"]:
+        print(f"  {reason}", flush=True)
+    return 0 if (all(verdict == oracle.PASS for verdict in verdicts.values())
+                 and result["verdict"] == oracle.PASS) else 1
 
 
 if __name__ == "__main__":
