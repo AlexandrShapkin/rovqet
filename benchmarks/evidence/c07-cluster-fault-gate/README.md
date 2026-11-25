@@ -166,3 +166,35 @@ no `|| true`. Every pre-existing job is unchanged.
 5. **ACK uncertainty may resolve later.** In F3b the uncertain ACK is not proof
    of non-delivery; exactly-once resolution is established only by the post-
    restore evidence and the unchanged record count.
+
+## 9. Flake reproduction and resolution
+
+Two intermittent failures seen while building this gate were diagnosed to their
+root cause and fixed in code. Neither was retired by a retry, a longer timeout
+or a weakened assertion.
+
+### 9.1 `AddrInUse` on metadata voter restart
+
+| | before the fix | after the fix (`02f4605`) |
+|---|---|---|
+| failure mode | deterministic `EADDRINUSE`: bind loopback port 0, read the endpoint, close the listener, let a competitor bind that endpoint, then the node's bind of the same endpoint fails | the node is handed the already-bound listener descriptor (a clone of the socket), so no release/rebind interval exists and the endpoint stays reserved through shutdown and restart |
+| repetition campaign | the ownership gap is demonstrated with a controlled interleaving only; no spontaneous failure of the unmodified test is claimed | **120/120** executed test-binary runs (80 isolated + 40 concurrent across `authority`, `three_voters`, `migration_quorum`, `asymmetric_partition`) with **0** test failures and **0** `AddrInUse`; additionally 10/10 simultaneous `cargo test -p rovqet-metadata-raft` processes, 49 tests each, zero `AddrInUse` |
+
+Commits: `fe82242` (hand the bound listeners to the node), `6908a94` (the tests
+retain voter sockets across startup and restart), evidence recorded in `02f4605`
+(`crates/metadata-raft/tests/LISTENER_OWNERSHIP.md`).
+
+### 9.2 D2 pending-terminal-at-migration intermittency
+
+| | baseline | fixed |
+|---|---|---|
+| build | `02f4605` | `001bd1d` + `3cbc312` |
+| D2 executions | 10 run: **6 failures**, 4 PASS (every failure the same mode: the source never printed the dependent 1 ms `Q1 DLQ authority` line) | **20/20 PASS** (exit 0, scenario PASS, oracle PASS; all 20 printed six source DLQ authority lines) |
+
+Commits: `001bd1d` (an identical `{owner, epoch, lease}` re-install keeps its
+original installation clock and can no longer renew an expired lease) and
+`3cbc312` (the server installs authority from the committed Raft snapshot rather
+than the asynchronously published routing-store copy). The full diagnosis,
+deterministic lease probe and both measurement tables are in
+`benchmarks/evidence/c02-safety-matrix/D2-intermittency-diagnostic.md` (committed
+by `dd3facb`); the C-02 ledger note records the same resolution.

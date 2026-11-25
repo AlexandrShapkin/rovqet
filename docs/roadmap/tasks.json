@@ -962,7 +962,7 @@
         "fencing_implemented": "The durable partition owns the fencing state, not only the routing layer. Partition::set_authority installs Authority {owner, epoch, lease} from committed control-plane metadata; the command is ordered with durable mutations in the actor. Publication, deduplicated retry, consumer FETCH, ACK, NACK and terminal disposition (quarantine and DLQ) all check the authority before starting and fail closed with a stale-epoch error when the local node is not the committed owner. The lease is bounded and counted from local installation, so an expired lease fails closed and a restart never extends it. An older epoch can never replace a newer authority. A mutation whose lease expires during its barrier is reported as an uncertain outcome, never a false COMMITTED_LOCAL. Standalone partitions (no installed authority) keep the previous single-node behaviour.",
         "fencing_evidence": "Actor tests prove: standalone partitions are unfenced; a foreign owner is fenced for publish, fetch, ack and nack; an expired lease fails closed; a newer authority fences the previous owner and an older epoch cannot replace it. Two real broker processes prove: a publication to the non-owner is forwarded once to the owner, the owner performs the durable commit and returns its own offset, the producer token retry returns the same offset without a second record, and an expired ownership lease stops the old owner from committing while its committed history stays readable.",
         "raft_library_decision": "openraft 0.9.26 selected deliberately (the architecture references 0.9.x; 0.10 changes the storage and network contracts). It is pinned exactly with the features serde and storage-v2. The v2 traits are used as published: RaftLogStorage with a LogFlushed completion callback, RaftLogReader, vote and committed-index persistence, RaftStateMachine with a snapshot builder, RaftNetwork (vote, append entries, install snapshot) and RaftNetworkFactory. Library types stay inside the dedicated crates/metadata-raft adapter; the public control-plane model does not depend on OpenRaft internals, and the Raft log index is unrelated to Q1 application offsets.",
-        "remaining_work": "Re-establish D2 on the current build before treating the DLQ uncertainty matrix as green: the dependency placement must install the expired dependent authority observably, the quiescence barrier must report the pending terminal, and the successor must complete exactly one preserved disposition (the 05e1b5f journal shows that path; the 153440f/0d31df3 rerun fails before it). Until then D2 is unproven and is not a completion condition met by this package. C-03 (the Q2 Raft storage adapter) is the next unblocked package.",
+        "remaining_work": "D2 diagnosed and fixed, not remaining work. The intermittent failure was reproduced (baseline 6 of 10 D2 executions failed at 02f4605, all the same mode: the source never printed the dependent 1 ms 'Q1 DLQ authority' line) and repaired by two commits: 001bd1d keeps the original installation clock when an identical {owner, epoch, lease} authority is re-installed, so an unchanged placement can no longer renew an already-expired lease, and 3cbc312 makes the server install authority from the committed Raft snapshot instead of the asynchronously published routing-store copy. The fixed build passed 20 of 20 consecutive D2 executions. The full diagnosis, the deterministic lease probe and both measurement tables are recorded in benchmarks/evidence/c02-safety-matrix/D2-intermittency-diagnostic.md. C-03 (the Q2 Raft storage adapter) is the next unblocked package.",
         "limitations": "The lease-expiry fallback stays unsupported: a handover needs the durable fence of the actual old owner, and the campaigns never infer a remote lease expiry from a local clock. A fatal storage fault on the dependent partition fail-stops its actor, which refuses the dependent fence and therefore blocks the coordinated handover until the source restarts: that is fail-closed (no activation without a fence) but it is a liveness limit, recorded by the superseded diagnostic. The installed ownership authority's epoch is not compared with the route's configured epoch, so an older installed authority alone does not fence a route; the enforced rules are that a newer installed authority fences the previous owner and that a client epoch differing from the configured epoch is refused, and the metadata keeps epochs monotonic so the unenforced state is unreachable through the committed path. The transfer re-sends the final inventory rather than resuming per segment. All processes share one machine, so the evidence proves protocol behaviour and not independent physical failure domains.",
         "next_unblocked": [
           "C-03"
@@ -1244,13 +1244,71 @@
         "C-05",
         "C-06"
       ],
-      "status": "TODO",
+      "status": "DONE",
       "architecture": "14",
       "proof": "Independent oracle, one-node failure and no-quorum rejection",
       "paths": [
         "crates/testkit/"
       ],
-      "evidence": null
+      "evidence": {
+        "validation_run": "Executed 2026-11-25 on 890ab6d (clean tree, CI green) as one scripted pass that records the exit status of every command. A first pass ran the hook-driven scripts after the normal binaries had replaced the fault-injection build and exited 1 for test_q1_dlq_uncertainty, test_q1_migration_partition, test_q1_consumer, test_q1_terminal and test_q1_durability: each refused the missing feature (\"Q1 test hooks require the explicit fault-injection build feature\") and the partition script never reached its ROVQET_MIGRATION_BARRIER=before_fence barrier. That is a build-ordering defect, not a result, so the whole list was re-run in dependency order: normal binaries first (fault gate, isolation, routing, migration, bundle, oracle, Q0/Q1 smokes), then fault-injection binaries for rovqet-server, rovqet-sdk and metadata-raft-node before the hook-driven campaigns. Every command in validation_commands exited 0 in that corrected pass.",
+        "validation_commands": [
+          "cargo fmt --all -- --check",
+          "cargo check --workspace --locked",
+          "cargo test --workspace --locked",
+          "cargo test -p rovqet-consensus --locked",
+          "cargo test -p rovqet-metadata-raft --locked",
+          "cargo test -p rovqet-durable --locked",
+          "cargo test -p rovqet-server --locked",
+          "cargo test -p rovqet-sdk --locked",
+          "cargo test -p rovqet-testkit --locked",
+          "python3 scripts/check_docs.py",
+          "cargo build -p rovqet-server -p rovqet-sdk --examples --bins --locked",
+          "cargo build -p rovqet-metadata-raft --bin metadata-raft-node --locked",
+          "python3 scripts/test_cluster_fault_gate.py",
+          "python3 scripts/test_q2_raft.py",
+          "python3 scripts/test_q1_q2_isolation.py",
+          "python3 scripts/test_metadata_raft.py",
+          "python3 scripts/test_cluster_routing.py",
+          "python3 scripts/test_q1_migration.py",
+          "python3 scripts/test_q1_migration_bundle.py",
+          "python3 scripts/test_q1_oracle.py",
+          "python3 scripts/q0_smoke.py",
+          "python3 scripts/q1_smoke.py --check-hooks-disabled",
+          "cargo build -p rovqet-server -p rovqet-sdk --examples --bins --features fault-injection --locked",
+          "cargo build -p rovqet-metadata-raft --features fault-injection --bins --locked",
+          "python3 scripts/test_q2_publish.py",
+          "python3 scripts/test_q2_consumer.py",
+          "python3 scripts/test_q1_dlq_uncertainty.py",
+          "python3 scripts/test_q1_consumer.py",
+          "python3 scripts/test_q1_terminal.py",
+          "python3 scripts/test_q1_durability.py",
+          "python3 scripts/test_q1_migration_partition.py",
+          "git diff --check"
+        ],
+        "exit_codes": "32 of 32 executed commands exited 0 in the corrected pass: cargo fmt --all -- --check 0; cargo check --workspace --locked 0; cargo test --workspace --locked 0; cargo test -p rovqet-consensus 0; cargo test -p rovqet-metadata-raft 0; cargo test -p rovqet-durable 0; cargo test -p rovqet-server 0; cargo test -p rovqet-sdk 0; cargo test -p rovqet-testkit 0; check_docs 0; normal rovqet-server/rovqet-sdk build 0; metadata-raft-node build 0; test_cluster_fault_gate 0; test_q2_raft 0; test_q1_q2_isolation 0; test_metadata_raft 0; test_cluster_routing 0; test_q1_migration 0; test_q1_migration_bundle 0; test_q1_oracle 0; q0_smoke 0; q1_smoke --check-hooks-disabled 0; fault-injection rovqet-server/rovqet-sdk build 0; fault-injection metadata-raft-node build 0; test_q2_publish 0; test_q2_consumer 0; test_q1_dlq_uncertainty 0; test_q1_consumer 0; test_q1_terminal 0; test_q1_durability 0; test_q1_migration_partition 0; git diff --check 0.",
+        "scenario_ids": [
+          "healthy-q0-q1-q2-baseline",
+          "consumer-ack-refused-without-q2-majority",
+          "metadata-election-preserves-ownership-epoch",
+          "expired-authority-fails-closed"
+        ],
+        "observed_values": "healthy-q0-q1-q2-baseline: Q0 admitted with two subscriber deliveries, Q1 COMMITTED_LOCAL incarnation 42 at offsets [0, 2], Q2 COMMITTED_QUORUM at offset 0 with payload digest c9b832517ae5c476650c25c095a65bfdeadb072c8f29a264d7757184539ebe48, and the ACK at generation 1 advancing the durable group cursor to 1 on all three voters ({1: 1, 2: 1, 3: 1}); a dedup retry of the same producer token returned offset 0 with no second record. consumer-ack-refused-without-q2-majority: after two of three Q2 voters were SIGKILLed the identical ACK returned OutcomeUnknown with no cursor advance ({1: None, 2: None, 3: None} to {1: None}) and no fabricated ACK_COMMITTED, while Q1 kept committing (COMMITTED_LOCAL 42 0); after the voters restarted on their original storage the same ACK identity resolved committed exactly once at offset 0 with the durable cursor at 1 on all voters, and a second retry stayed idempotent (one record per voter). metadata-election-preserves-ownership-epoch: the metadata leader moved 1 to 2 and the term 1 to 2, the committed placement kept ownership epoch 7 to 7, and Q1 committed COMMITTED_LOCAL 42 0 and COMMITTED_LOCAL 42 2 both before and after the election. expired-authority-fails-closed: the witness line \"Q1 DLQ authority: epoch=7 owner=3 lease_ms=200\" upper-bounds expiry, a publication after 302.3 ms (at least 200 ms) was refused with StaleEpoch and exit 1, and no durable record was created (manifest 2 to 2, externally read history 1 to 1).",
+        "oracle": "Independent oracle verdict PASS with counts records 144, scenarios 4, majority_proofs 4, ack_committed 2, refusals 2, reused_evidence 11, violations 0 (benchmarks/evidence/c07-cluster-fault-gate/oracle.json).",
+        "flake_fixes": "Two intermittent failures were diagnosed to root cause and fixed in code, never retired by a retry or a weakened assertion. (1) AddrInUse on metadata voter restart: fixed by fe82242 (hand the bound listener to the node) and 6908a94 (tests retain voter sockets across startup and restart), recorded in 02f4605; measurement 120/120 executed test-binary repetitions (80 isolated plus 40 concurrent across authority, three_voters, migration_quorum and asymmetric_partition) with zero failures and zero AddrInUse, plus 10/10 simultaneous cargo test -p rovqet-metadata-raft processes. (2) D2 pending-terminal-at-migration intermittency: fixed by 001bd1d (an identical authority re-install keeps its original installation clock and no longer renews an expired lease) and 3cbc312 (the server reads the committed Raft snapshot instead of the asynchronously published routing-store copy); baseline 6 of 10 D2 executions failed at 02f4605 versus 20/20 PASS after the fixes, with the diagnostic at benchmarks/evidence/c02-safety-matrix/D2-intermittency-diagnostic.md. Both are tabulated in benchmarks/evidence/c07-cluster-fault-gate/README.md section 9.",
+        "partition_test": "c28b23e adds crates/consensus/tests/three_voters.rs::two_partitions_in_one_shard_group_stay_independent, which proves two partitions in one shard group stay independent through a real three-voter Raft group; it is the cross-partition property this build can demonstrate (see limitations).",
+        "evidence": "benchmarks/evidence/c07-cluster-fault-gate/: fault-gate.jsonl (144-record parent-owned journal), oracle.json (independent reconciliation), METADATA-AUTHORITY.md, README.md (index, including section 9 flake reproduction and resolution) and SHA256SUMS, which verifies with sha256sum -c.",
+        "commit": "Campaign commits 356d036, b0d0627, f5282d2, bc56efd, 6e6d84a, d2c90d1, c28b23e, 7eabdf3, 000d02c and 890ab6d; this executed matrix and the evidence-index update are the documentation commit \"docs(c07): record the executed fault gate matrix\" on top of 890ab6d.",
+        "verification": "Four fault-gate scenarios executed against real processes and reconciled independently: oracle.json verdict PASS with records 144, scenarios 4, majority_proofs 4, ack_committed 2, refusals 2, reused_evidence 11, violations 0. The full validation list ran as one scripted pass with every command exiting 0 after the build order was corrected (validation_run and exit_codes above); python3 scripts/check_docs.py passes; benchmarks/evidence/c07-cluster-fault-gate/SHA256SUMS was regenerated with sha256sum and verifies with sha256sum -c.",
+        "ci_run": "GitHub Actions run 45523659863 for 890ab6d, the validated source, is green with all six jobs (docs, rust, q2-publish, q1-q2-wire, q1-q2-isolation, c07-fault-gate). The recording commit on top changes only this ledger and the C-07 evidence index; its own run is verified after push.",
+        "limitations": [
+          "The broker exposes one Q2 route per process, so cross-partition isolation is proven at the shard and adapter level with a real three-voter Raft group (crates/consensus/tests/three_voters.rs::two_partitions_in_one_shard_group_stay_independent) and not at the client route level; no two-route wire isolation is claimed.",
+          "All campaigns are loopback on one host with three processes; they do not establish independent physical failure domains, multi-host independence or a production operating profile.",
+          "The crash scenarios are process crashes (SIGKILL) on disposable storage; they do not certify power-loss safety.",
+          "Metadata authority expiry is observed through the DLQ-configured route's authority line (\"Q1 DLQ authority: epoch=7 owner=3 lease_ms=200\"); no separate metadata-expiry probe is claimed."
+        ],
+        "next_action": "C-07 is DONE. D-01 remains TODO and is not started by this package."
+      }
     },
     {
       "id": "D-01",

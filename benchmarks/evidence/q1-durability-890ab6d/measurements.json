@@ -1,0 +1,179 @@
+{
+  "broker_cpu_jiffies": 22,
+  "broker_peak_rss_kib": 12252,
+  "consume": {
+    "ack": {
+      "max_ns": 1980934,
+      "min_ns": 629487,
+      "n": 200,
+      "p50_ns": 1085627,
+      "p95_ns": 1440075,
+      "p999_ns": 1980934,
+      "p99_ns": 1571938
+    },
+    "acked": 200,
+    "delivered": 200,
+    "elapsed_ns": 283826118,
+    "fetch": {
+      "max_ns": 24017951,
+      "min_ns": 2829586,
+      "n": 4,
+      "p50_ns": 20971366,
+      "p95_ns": 24017951,
+      "p999_ns": 24017951,
+      "p99_ns": 24017951
+    },
+    "mode": "consume",
+    "next": 384,
+    "schema": "rovqet-q1-measure-v1"
+  },
+  "final_metrics": "BROKER_METRICS {\"time_mono_ns\":664179694,\"max_connections\":1024,\"connection_envelope_bytes\":1380352,\"offered\":0,\"admitted\":0,\"rejected\":0,\"enqueued\":0,\"dropped_overflow\":0,\"dropped_expired\":0,\"dropped_unsubscribed\":0,\"dropped_shutdown_ingress\":0,\"egress_rejected\":0,\"flow_rejected\":0,\"overload_transitions\":0,\"overload_state\":\"Drain\",\"delivered\":0,\"delivered_bytes\":0,\"outbound_enqueued\":0,\"writer_expired\":0,\"write_failed\":0,\"dropped_newest\":0,\"dropped_oldest\":0,\"coalesced\":0,\"dropped_closed\":0,\"dropped_shutdown_outbound\":0,\"ingress_messages\":0,\"ingress_bytes\":0,\"egress_messages\":0,\"egress_bytes\":0,\"active_subscriptions\":0,\"broker_work_sessions\":0}",
+  "machine": {
+    "cpu_count": 8,
+    "filesystem": "ext4",
+    "kernel": "7.3.4-zen2-2-zen",
+    "machine": "x86_64",
+    "os_release": {
+      "ANSI_COLOR": "38;2;23;147;209",
+      "BUG_REPORT_URL": "https://gitlab.archlinux.org/groups/archlinux/-/issues",
+      "BUILD_ID": "rolling",
+      "DOCUMENTATION_URL": "https://wiki.archlinux.org/",
+      "HOME_URL": "https://archlinux.org/",
+      "ID": "arch",
+      "LOGO": "archlinux-logo",
+      "NAME": "Arch Linux",
+      "PRETTY_NAME": "Arch Linux",
+      "PRIVACY_POLICY_URL": "https://terms.archlinux.org/docs/privacy-policy/",
+      "SUPPORT_URL": "https://bbs.archlinux.org/"
+    },
+    "platform": "Linux-7.3.4-zen2-2-zen-x86_64-with-glibc2.44",
+    "python": "3.14.10",
+    "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09) (Arch Linux rust 1:1.100.0-1)"
+  },
+  "publish": {
+    "count": 200,
+    "elapsed_ns": 265354334,
+    "first_offset": 0,
+    "last_offset": 398,
+    "latency": {
+      "max_ns": 1891605,
+      "min_ns": 769312,
+      "n": 200,
+      "p50_ns": 1347604,
+      "p95_ns": 1675583,
+      "p999_ns": 1891605,
+      "p99_ns": 1788797
+    },
+    "mode": "publish",
+    "payload_bytes": 128,
+    "schema": "rovqet-q1-measure-v1"
+  },
+  "read": {
+    "elapsed_ns": 38867723,
+    "latency_ns": 38863043,
+    "mode": "read",
+    "next": 607,
+    "records": 200,
+    "schema": "rovqet-q1-measure-v1"
+  },
+  "recovery_seconds": [
+    {
+      "scenario": "consumer-before-append-seed44",
+      "seconds": 0.006775528017897159
+    },
+    {
+      "scenario": "consumer-before-append-seed45",
+      "seconds": 0.006164758000522852
+    },
+    {
+      "scenario": "consumer-after-append-before-sync-seed44",
+      "seconds": 0.005507893016329035
+    },
+    {
+      "scenario": "consumer-after-append-before-sync-seed45",
+      "seconds": 0.00577210501069203
+    },
+    {
+      "scenario": "consumer-after-sync-before-reply-seed44",
+      "seconds": 0.009131442988291383
+    },
+    {
+      "scenario": "consumer-after-sync-before-reply-seed45",
+      "seconds": 0.008361223997781053
+    },
+    {
+      "scenario": "consumer-checkpoint-after-append-before-sync-seed44",
+      "seconds": 0.009241166000720114
+    },
+    {
+      "scenario": "consumer-checkpoint-after-append-before-sync-seed45",
+      "seconds": 0.00813954501063563
+    },
+    {
+      "scenario": "publication-before-append-seed42",
+      "seconds": 0.007866602012654766
+    },
+    {
+      "scenario": "publication-before-append-seed43",
+      "seconds": 0.00467565399594605
+    },
+    {
+      "scenario": "publication-after-append-before-sync-seed42",
+      "seconds": 0.007295084011275321
+    },
+    {
+      "scenario": "publication-after-append-before-sync-seed43",
+      "seconds": 0.006594217993551865
+    },
+    {
+      "scenario": "publication-after-sync-before-reply-seed42",
+      "seconds": 0.00806264899438247
+    },
+    {
+      "scenario": "publication-after-sync-before-reply-seed43",
+      "seconds": 0.008235648012487218
+    }
+  ],
+  "schema": "rovqet-q1-durability-measurements-v1",
+  "source_sha": "890ab6d54319e5df7f541b405817784d02bcc818",
+  "unavailable": {
+    "active_groups_and_leases": "UNAVAILABLE: internal actor state",
+    "active_producers_and_outcomes": "UNAVAILABLE: internal actor state",
+    "p99_9_interpretation": "n=200 nearest-rank; p99.9 is not statistically stable",
+    "q1_queue_utilization": "UNAVAILABLE: no Q1 queue metric endpoint",
+    "sparse_ack_entries": "UNAVAILABLE: internal actor state"
+  },
+  "wal_fsync": {
+    "append": {
+      "max_ns": 200587,
+      "min_ns": 46585,
+      "p50_ns": 68724,
+      "p95_ns": 107627,
+      "p999_ns": 200587,
+      "p99_ns": 152186
+    },
+    "append_plus_sync": {
+      "max_ns": 287820,
+      "min_ns": 94427,
+      "p50_ns": 130186,
+      "p95_ns": 207501,
+      "p999_ns": 287820,
+      "p99_ns": 255273
+    },
+    "committed_position": 399,
+    "count": 200,
+    "directory": "/tmp/rovqet-b07-fsync-k1ydsd8f",
+    "payload_bytes": 128,
+    "records": 400,
+    "schema": "rovqet-wal-fsync-profile-v1",
+    "sync": {
+      "max_ns": 170554,
+      "min_ns": 44769,
+      "p50_ns": 58249,
+      "p95_ns": 94427,
+      "p999_ns": 170554,
+      "p99_ns": 154560
+    },
+    "wall_ns": 28935818
+  }
+}

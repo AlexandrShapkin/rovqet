@@ -1,0 +1,365 @@
+{
+  "generated_at_utc": "2026-11-25T01:33:43Z",
+  "runs": [
+    {
+      "checkpoint": false,
+      "counts": {
+        "acknowledged": 1,
+        "application_offsets": 3,
+        "cursor": 2,
+        "redelivered": 2,
+        "uncertain_committed": 0
+      },
+      "fault": "before-append",
+      "reasons": [],
+      "recovery_seconds": 0.006775528017897159,
+      "run": "consumer-before-append-seed44",
+      "seed": 44,
+      "verdict": "PASS"
+    },
+    {
+      "checkpoint": false,
+      "counts": {
+        "acknowledged": 1,
+        "application_offsets": 3,
+        "cursor": 2,
+        "redelivered": 2,
+        "uncertain_committed": 0
+      },
+      "fault": "before-append",
+      "reasons": [],
+      "recovery_seconds": 0.006164758000522852,
+      "run": "consumer-before-append-seed45",
+      "seed": 45,
+      "verdict": "PASS"
+    },
+    {
+      "checkpoint": false,
+      "counts": {
+        "acknowledged": 1,
+        "application_offsets": 3,
+        "cursor": 2,
+        "redelivered": 2,
+        "uncertain_committed": 0
+      },
+      "fault": "after-append-before-sync",
+      "reasons": [],
+      "recovery_seconds": 0.005507893016329035,
+      "run": "consumer-after-append-before-sync-seed44",
+      "seed": 44,
+      "verdict": "PASS"
+    },
+    {
+      "checkpoint": false,
+      "counts": {
+        "acknowledged": 1,
+        "application_offsets": 3,
+        "cursor": 2,
+        "redelivered": 2,
+        "uncertain_committed": 0
+      },
+      "fault": "after-append-before-sync",
+      "reasons": [],
+      "recovery_seconds": 0.00577210501069203,
+      "run": "consumer-after-append-before-sync-seed45",
+      "seed": 45,
+      "verdict": "PASS"
+    },
+    {
+      "checkpoint": false,
+      "counts": {
+        "acknowledged": 1,
+        "application_offsets": 3,
+        "cursor": 4,
+        "redelivered": 1,
+        "uncertain_committed": 1
+      },
+      "fault": "after-sync-before-reply",
+      "reasons": [],
+      "recovery_seconds": 0.009131442988291383,
+      "run": "consumer-after-sync-before-reply-seed44",
+      "seed": 44,
+      "verdict": "PASS"
+    },
+    {
+      "checkpoint": false,
+      "counts": {
+        "acknowledged": 1,
+        "application_offsets": 3,
+        "cursor": 4,
+        "redelivered": 1,
+        "uncertain_committed": 1
+      },
+      "fault": "after-sync-before-reply",
+      "reasons": [],
+      "recovery_seconds": 0.008361223997781053,
+      "run": "consumer-after-sync-before-reply-seed45",
+      "seed": 45,
+      "verdict": "PASS"
+    },
+    {
+      "checkpoint": true,
+      "counts": {
+        "acknowledged": 1,
+        "application_offsets": 3,
+        "cursor": 4,
+        "redelivered": 1,
+        "uncertain_committed": 1
+      },
+      "fault": "checkpoint-after-append-before-sync",
+      "reasons": [],
+      "recovery_seconds": 0.009241166000720114,
+      "run": "consumer-checkpoint-after-append-before-sync-seed44",
+      "seed": 44,
+      "verdict": "PASS"
+    },
+    {
+      "checkpoint": true,
+      "counts": {
+        "acknowledged": 1,
+        "application_offsets": 3,
+        "cursor": 4,
+        "redelivered": 1,
+        "uncertain_committed": 1
+      },
+      "fault": "checkpoint-after-append-before-sync",
+      "reasons": [],
+      "recovery_seconds": 0.00813954501063563,
+      "run": "consumer-checkpoint-after-append-before-sync-seed45",
+      "seed": 45,
+      "verdict": "PASS"
+    },
+    {
+      "counts": {
+        "corruption": 1,
+        "missing": 1
+      },
+      "reasons": [],
+      "run": "storage-fail-closed",
+      "verdict": "PASS"
+    },
+    {
+      "counts": {
+        "generation": 1,
+        "records": 1
+      },
+      "reasons": [],
+      "run": "generation-claim",
+      "verdict": "PASS"
+    },
+    {
+      "counts": {
+        "acknowledged": 3,
+        "failed": 0,
+        "recovered": 3,
+        "uncertain": 1
+      },
+      "fault": "before-append",
+      "reasons": [],
+      "recovery_seconds": 0.007866602012654766,
+      "run": "publication-before-append-seed42",
+      "seed": 42,
+      "verdict": "PASS"
+    },
+    {
+      "counts": {
+        "acknowledged": 3,
+        "failed": 0,
+        "recovered": 3,
+        "uncertain": 1
+      },
+      "fault": "before-append",
+      "reasons": [],
+      "recovery_seconds": 0.00467565399594605,
+      "run": "publication-before-append-seed43",
+      "seed": 43,
+      "verdict": "PASS"
+    },
+    {
+      "counts": {
+        "acknowledged": 3,
+        "failed": 0,
+        "recovered": 3,
+        "uncertain": 1
+      },
+      "fault": "after-append-before-sync",
+      "reasons": [],
+      "recovery_seconds": 0.007295084011275321,
+      "run": "publication-after-append-before-sync-seed42",
+      "seed": 42,
+      "verdict": "PASS"
+    },
+    {
+      "counts": {
+        "acknowledged": 3,
+        "failed": 0,
+        "recovered": 3,
+        "uncertain": 1
+      },
+      "fault": "after-append-before-sync",
+      "reasons": [],
+      "recovery_seconds": 0.006594217993551865,
+      "run": "publication-after-append-before-sync-seed43",
+      "seed": 43,
+      "verdict": "PASS"
+    },
+    {
+      "counts": {
+        "acknowledged": 3,
+        "failed": 0,
+        "recovered": 4,
+        "uncertain": 1
+      },
+      "fault": "after-sync-before-reply",
+      "reasons": [],
+      "recovery_seconds": 0.00806264899438247,
+      "run": "publication-after-sync-before-reply-seed42",
+      "seed": 42,
+      "verdict": "PASS"
+    },
+    {
+      "counts": {
+        "acknowledged": 3,
+        "failed": 0,
+        "recovered": 4,
+        "uncertain": 1
+      },
+      "fault": "after-sync-before-reply",
+      "reasons": [],
+      "recovery_seconds": 0.008235648012487218,
+      "run": "publication-after-sync-before-reply-seed43",
+      "seed": 43,
+      "verdict": "PASS"
+    },
+    {
+      "counts": {
+        "fixtures": 1
+      },
+      "reasons": [],
+      "run": "q0-isolation",
+      "verdict": "PASS"
+    },
+    {
+      "counts": {
+        "acknowledged": 1,
+        "application_offsets": 3,
+        "cursor": 0,
+        "redelivered": 2,
+        "uncertain_committed": 0
+      },
+      "reasons": [],
+      "run": "sparse-generation",
+      "scenario": "sparse",
+      "verdict": "PASS"
+    },
+    {
+      "counts": {
+        "acknowledged": 3,
+        "failed": 0,
+        "recovered": 3,
+        "uncertain": 1
+      },
+      "fault": "append",
+      "reasons": [],
+      "run": "wal-append",
+      "segments": 2,
+      "uncertain": true,
+      "verdict": "PASS"
+    },
+    {
+      "counts": {
+        "acknowledged": 3,
+        "failed": 0,
+        "recovered": 3,
+        "uncertain": 1
+      },
+      "fault": "partial-append",
+      "reasons": [],
+      "run": "wal-partial-append",
+      "segments": 2,
+      "uncertain": true,
+      "verdict": "PASS"
+    },
+    {
+      "counts": {
+        "acknowledged": 3,
+        "failed": 0,
+        "recovered": 3,
+        "uncertain": 1
+      },
+      "fault": "segment-sync",
+      "reasons": [],
+      "run": "wal-segment-sync",
+      "segments": 2,
+      "uncertain": true,
+      "verdict": "PASS"
+    },
+    {
+      "counts": {
+        "acknowledged": 3,
+        "failed": 0,
+        "recovered": 3,
+        "uncertain": 1
+      },
+      "fault": "manifest-write",
+      "reasons": [],
+      "run": "wal-manifest-write",
+      "segments": 2,
+      "uncertain": true,
+      "verdict": "PASS"
+    },
+    {
+      "counts": {
+        "acknowledged": 3,
+        "failed": 0,
+        "recovered": 3,
+        "uncertain": 1
+      },
+      "fault": "manifest-sync",
+      "reasons": [],
+      "run": "wal-manifest-sync",
+      "segments": 2,
+      "uncertain": true,
+      "verdict": "PASS"
+    },
+    {
+      "counts": {
+        "acknowledged": 3,
+        "failed": 0,
+        "recovered": 3,
+        "uncertain": 1
+      },
+      "fault": "manifest-rename",
+      "reasons": [],
+      "run": "wal-manifest-rename",
+      "segments": 2,
+      "uncertain": true,
+      "verdict": "PASS"
+    },
+    {
+      "counts": {
+        "acknowledged": 3,
+        "failed": 0,
+        "recovered": 4,
+        "uncertain": 1
+      },
+      "fault": "directory-sync",
+      "reasons": [],
+      "run": "wal-directory-sync",
+      "segments": 3,
+      "uncertain": true,
+      "verdict": "PASS"
+    },
+    {
+      "counts": {
+        "consume": 200,
+        "publish": 200
+      },
+      "reasons": [],
+      "run": "measurements",
+      "verdict": "PASS"
+    }
+  ],
+  "schema": "rovqet-q1-durability-matrix-v1",
+  "source_sha": "890ab6d54319e5df7f541b405817784d02bcc818"
+}
