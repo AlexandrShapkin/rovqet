@@ -3,7 +3,7 @@
 //! The test drives the real node lifecycle: three voters on free loopback ports with
 //! separate data directories, TCP transport, a leader change, a restart and a log
 //! compaction that forces a snapshot transfer. Every wait is bounded.
-use rovqet_consensus::sm::ShardState;
+use rovqet_consensus::sm::{PartitionKey, PartitionState, ShardState};
 use rovqet_consensus::types::{
     ShardCommand, ShardCommandResponse, ShardNodeId, ShardPayload, ShardPublish, ShardRequest,
 };
@@ -607,6 +607,500 @@ async fn a_three_voter_shard_group_replicates_and_recovers() {
         );
         assert_eq!(partition.applied_count, 1);
     }
+
+    for id in cluster.live() {
+        cluster.shutdown(id).await;
+    }
+}
+
+/// The identity of a partition in the shared test tenant.
+fn at(topic_id: u64, partition_id: u32) -> PartitionRef {
+    PartitionRef {
+        tenant_id: 1,
+        topic_id,
+        partition_id,
+    }
+}
+
+/// A Q2 publication of `("abc", message_id)` for `partition` at `sequence` of producer 7
+/// epoch 1 — the same payload and digest as [`publish`], but for an arbitrary partition
+/// and sequence.
+fn publish_at(partition: PartitionRef, sequence: u64, message_id: u128) -> ShardCommand {
+    ShardCommand::Publish(ShardPublish {
+        partition,
+        durable_class: 2,
+        incarnation: 1,
+        metadata_epoch: EPOCH,
+        principal: 1,
+        producer_id: 7,
+        producer_epoch: 1,
+        sequence,
+        message_id,
+        payload: b"abc".to_vec(),
+        payload_digest: ABC_DIGEST,
+    })
+}
+
+/// A partition-wide consumer generation claim on `partition`.
+fn group_claim(partition: PartitionRef, generation: u64) -> ShardCommand {
+    ShardCommand::GroupClaim {
+        partition,
+        incarnation: 1,
+        metadata_epoch: EPOCH,
+        requested_generation: generation,
+    }
+}
+
+/// A committed delivery ACK of `(offset, message_id)` on `partition`.
+fn group_ack(
+    partition: PartitionRef,
+    generation: u64,
+    group_id: u64,
+    offset: u64,
+    message_id: u128,
+) -> ShardCommand {
+    ShardCommand::GroupAck {
+        partition,
+        incarnation: 1,
+        metadata_epoch: EPOCH,
+        generation,
+        group_id,
+        offset,
+        message_id,
+        principal: 1,
+        lease_id: 11,
+        attempt: 0,
+    }
+}
+
+/// The committed state of one partition on `node`, if applied at least once.
+fn committed_partition(node: &ShardNode, partition: &PartitionRef) -> Option<PartitionState> {
+    node.applied_state()
+        .partitions
+        .get(&PartitionKey::from(partition))
+        .cloned()
+}
+
+fn published_fields(response: &ShardCommandResponse) -> (u64, u128, bool) {
+    match response {
+        ShardCommandResponse::Published {
+            logical_offset,
+            message_id,
+            duplicate,
+            ..
+        } => (*logical_offset, *message_id, *duplicate),
+        other => panic!("expected a published response, got {other:?}"),
+    }
+}
+
+fn acked_fields(response: &ShardCommandResponse) -> (u64, u64, u64, u64) {
+    match response {
+        ShardCommandResponse::GroupAcked {
+            generation,
+            group_id,
+            offset,
+            cursor,
+        } => (*generation, *group_id, *offset, *cursor),
+        other => panic!("expected a group ACK response, got {other:?}"),
+    }
+}
+
+/// Two partitions of one shard group keep independent publication offsets, producer
+/// deduplication, consumer generations/cursors and ACK validation, and all of it survives
+/// a snapshot transfer to a restarted voter.
+///
+/// Limitation: the development broker exposes one Q2 route per process, so this proves
+/// the shard/adapter level of two-partition isolation inside a real three-voter Raft
+/// group. It does not claim a client-level multi-partition route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_partitions_in_one_shard_group_stay_independent() {
+    let mut cluster = VoterSet::new(3);
+    for id in 0..3 {
+        cluster.start(id).await;
+    }
+    let (leader, term) = cluster.wait_for_leader(None).await;
+    assert!(term >= 1, "an elected leader has a term, observed {term}");
+    for id in cluster.live() {
+        cluster.node(id).install_authority(Some(ShardAuthority {
+            owner: leader,
+            epoch: EPOCH,
+        }));
+    }
+    let leader_id = leader as usize;
+
+    // A and B differ in `partition_id` inside one topic; `cross_topic` keeps tenant and
+    // partition number of A but names another topic.
+    let a = at(9, 0);
+    let b = at(9, 5);
+    let cross_topic = at(10, 0);
+
+    // 1. Offsets advance independently: A, then B, then A again.
+    let first = publish_at(a.clone(), 0, 0xa001);
+    let first_fields = published_fields(&propose(cluster.node(leader_id), first).await);
+    assert_eq!(
+        first_fields,
+        (0, 0xa001, false),
+        "A's first publication is logical offset 0"
+    );
+    let a_after_first = committed_partition(cluster.node(leader_id), &a).expect("A committed");
+    assert_eq!(
+        a_after_first.next_logical_offset, 1,
+        "A advanced to offset 1"
+    );
+    assert_eq!(
+        committed_partition(cluster.node(leader_id), &b),
+        None,
+        "publishing to A must not open B"
+    );
+
+    let second = publish_at(b.clone(), 0, 0xb001);
+    let second_fields = published_fields(&propose(cluster.node(leader_id), second).await);
+    assert_eq!(
+        second_fields,
+        (0, 0xb001, false),
+        "B allocates its own logical offset 0"
+    );
+    assert_eq!(
+        committed_partition(cluster.node(leader_id), &a),
+        Some(a_after_first.clone()),
+        "publishing to B must not mutate A"
+    );
+    let b_after_first = committed_partition(cluster.node(leader_id), &b).expect("B committed");
+    assert_eq!(
+        b_after_first.next_logical_offset, 1,
+        "B advanced to offset 1"
+    );
+
+    let third = publish_at(a.clone(), 1, 0xa002);
+    let third_fields = published_fields(&propose(cluster.node(leader_id), third).await);
+    assert_eq!(
+        third_fields,
+        (1, 0xa002, false),
+        "A's second publication takes A's offset 1"
+    );
+    assert_eq!(
+        committed_partition(cluster.node(leader_id), &b),
+        Some(b_after_first.clone()),
+        "A's second publication must not mutate B"
+    );
+    let a_after_third = committed_partition(cluster.node(leader_id), &a).expect("A committed");
+    assert_eq!(a_after_third.next_logical_offset, 2);
+    assert_eq!(a_after_third.messages.len(), 2, "A retains two records");
+
+    // 2. Deduplication is per partition: A's token replays to A's offset, while the same
+    // (producer, epoch, sequence) in B is a distinct token that already wrote its own
+    // record at B's own offset 0.
+    let replay = publish_at(a.clone(), 0, 0xa001);
+    let replay_fields = published_fields(&propose(cluster.node(leader_id), replay).await);
+    assert_eq!(
+        replay_fields,
+        (0, 0xa001, true),
+        "A's replayed token returns A's original offset without a new record"
+    );
+    assert_eq!(
+        committed_partition(cluster.node(leader_id), &a),
+        Some(a_after_third),
+        "a duplicate consumes no offset and adds no record"
+    );
+    assert_eq!(
+        committed_partition(cluster.node(leader_id), &b),
+        Some(b_after_first.clone()),
+        "A's replay must not alter B"
+    );
+
+    let b_replay = publish_at(b.clone(), 0, 0xb001);
+    let b_replay_fields = published_fields(&propose(cluster.node(leader_id), b_replay).await);
+    assert_eq!(
+        b_replay_fields,
+        (0, 0xb001, true),
+        "B's replayed token returns B's offset 0"
+    );
+    assert_eq!(
+        committed_partition(cluster.node(leader_id), &b),
+        Some(b_after_first.clone()),
+        "B's duplicate consumes no offset"
+    );
+
+    // 3. Group generations and cursors are per partition: claiming A does not fence B,
+    // and B's own claim succeeds at its own (independent) generation.
+    let claim_a = group_claim(a.clone(), 1);
+    match propose(cluster.node(leader_id), claim_a).await {
+        ShardCommandResponse::GroupClaimed { generation } => {
+            assert_eq!(generation, 1, "A claimed generation 1")
+        }
+        other => panic!("expected A's claim to commit, got {other:?}"),
+    }
+    let a_claimed = committed_partition(cluster.node(leader_id), &a).expect("A committed");
+    assert_eq!(a_claimed.group_generation, 1, "A committed its fence");
+    assert_eq!(
+        committed_partition(cluster.node(leader_id), &b),
+        Some(b_after_first.clone()),
+        "A's claim must not fence or mutate B"
+    );
+
+    let claim_b = group_claim(b.clone(), 1);
+    match propose(cluster.node(leader_id), claim_b).await {
+        ShardCommandResponse::GroupClaimed { generation } => {
+            assert_eq!(generation, 1, "B claims generation 1 independently of A")
+        }
+        other => panic!("expected B's claim to commit, got {other:?}"),
+    }
+    assert_eq!(
+        committed_partition(cluster.node(leader_id), &a),
+        Some(a_claimed.clone()),
+        "B's claim must not mutate A"
+    );
+    let b_claimed = committed_partition(cluster.node(leader_id), &b).expect("B committed");
+    assert_eq!(b_claimed.group_generation, 1);
+
+    // A third committed publication gives A a sparse (non-cursor) offset to ACK.
+    let fourth = publish_at(a.clone(), 2, 0xa003);
+    let fourth_fields = published_fields(&propose(cluster.node(leader_id), fourth).await);
+    assert_eq!(fourth_fields, (2, 0xa003, false), "A advances to offset 2");
+
+    // B's cursor advances through group 6 only.
+    let a_before_ack = committed_partition(cluster.node(leader_id), &a).expect("A committed");
+    let b_ack = group_ack(b.clone(), 1, 6, 0, 0xb001);
+    let b_ack_fields = acked_fields(&propose(cluster.node(leader_id), b_ack).await);
+    assert_eq!(
+        b_ack_fields,
+        (1, 6, 0, 1),
+        "B's contiguous ACK at offset 0 moves B's cursor to 1"
+    );
+    let b_acked = committed_partition(cluster.node(leader_id), &b).expect("B committed");
+    assert_eq!(b_acked.groups[&6].cursor, 1);
+    assert_eq!(
+        committed_partition(cluster.node(leader_id), &a),
+        Some(a_before_ack.clone()),
+        "A must not change while B ACKs"
+    );
+    assert!(
+        !a_before_ack.groups.contains_key(&5),
+        "B's ACK opened no group on A"
+    );
+
+    // A's cursor advances through group 5 independently.
+    let a_ack = group_ack(a.clone(), 1, 5, 0, 0xa001);
+    let a_ack_fields = acked_fields(&propose(cluster.node(leader_id), a_ack).await);
+    assert_eq!(
+        a_ack_fields,
+        (1, 5, 0, 1),
+        "A's contiguous ACK at offset 0 moves A's cursor to 1"
+    );
+    assert_eq!(
+        committed_partition(cluster.node(leader_id), &b),
+        Some(b_acked.clone()),
+        "A's ACK must not mutate B"
+    );
+
+    // A sparse ACK above the cursor is retained without moving the cursor.
+    let sparse_ack = group_ack(a.clone(), 1, 5, 2, 0xa003);
+    let sparse_fields = acked_fields(&propose(cluster.node(leader_id), sparse_ack).await);
+    assert_eq!(
+        sparse_fields,
+        (1, 5, 2, 1),
+        "a sparse ACK is saved without advancing the cursor past the gap"
+    );
+    let a_acked = committed_partition(cluster.node(leader_id), &a).expect("A committed");
+    assert_eq!(a_acked.groups[&5].cursor, 1, "A's cursor stays at the gap");
+    assert_eq!(
+        a_acked.groups[&5]
+            .sparse_acks
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![2],
+        "A retains the sparse ACK"
+    );
+    assert_eq!(
+        committed_partition(cluster.node(leader_id), &b),
+        Some(b_acked.clone()),
+        "A's sparse ACK must not mutate B"
+    );
+
+    // The cross-topic partition needs its own committed record before it can be claimed.
+    let cross_publish = publish_at(cross_topic.clone(), 0, 0xc001);
+    let cross_fields = published_fields(&propose(cluster.node(leader_id), cross_publish).await);
+    assert_eq!(cross_fields, (0, 0xc001, false));
+    let cross_claim = group_claim(cross_topic.clone(), 1);
+    assert!(matches!(
+        propose(cluster.node(leader_id), cross_claim).await,
+        ShardCommandResponse::GroupClaimed { generation: 1 }
+    ));
+    let cross_claimed =
+        committed_partition(cluster.node(leader_id), &cross_topic).expect("cross-topic committed");
+    assert_eq!(
+        cross_claimed.group_generation, 1,
+        "the cross-topic partition claimed its own generation"
+    );
+    assert_eq!(cross_claimed.messages.len(), 1);
+    assert_eq!(
+        a_acked,
+        committed_partition(cluster.node(leader_id), &a).unwrap(),
+        "the cross-topic partition's claim must not mutate A"
+    );
+    assert_eq!(
+        b_acked,
+        committed_partition(cluster.node(leader_id), &b).unwrap()
+    );
+
+    // 4. An ACK addressed to one partition that carries another partition's committed
+    // identity is refused, and no partition's records, cursor or generation change.
+    let revision_before_rejections = cluster.node(leader_id).applied_state().revision;
+    let a_before_rejections =
+        committed_partition(cluster.node(leader_id), &a).expect("A committed");
+    let b_before_rejections =
+        committed_partition(cluster.node(leader_id), &b).expect("B committed");
+    let cross_before_rejections =
+        committed_partition(cluster.node(leader_id), &cross_topic).expect("cross-topic committed");
+
+    let cross_into_b = group_ack(b.clone(), 1, 6, 0, 0xa001);
+    let rejected = propose(cluster.node(leader_id), cross_into_b).await;
+    assert!(
+        matches!(rejected, ShardCommandResponse::Rejected { .. }),
+        "B must refuse A's (offset, message_id) identity, observed {rejected:?}"
+    );
+
+    let cross_into_a = group_ack(a.clone(), 1, 5, 0, 0xb001);
+    let rejected = propose(cluster.node(leader_id), cross_into_a).await;
+    assert!(
+        matches!(rejected, ShardCommandResponse::Rejected { .. }),
+        "A must refuse B's (offset, message_id) identity, observed {rejected:?}"
+    );
+
+    let cross_into_topic = group_ack(cross_topic.clone(), 1, 5, 0, 0xa001);
+    let rejected = propose(cluster.node(leader_id), cross_into_topic).await;
+    assert!(
+        matches!(rejected, ShardCommandResponse::Rejected { .. }),
+        "the same tenant/partition number in another topic must refuse A's identity, \
+         observed {rejected:?}"
+    );
+
+    assert_eq!(
+        committed_partition(cluster.node(leader_id), &a),
+        Some(a_before_rejections),
+        "a refused cross-partition ACK must not mutate A"
+    );
+    assert_eq!(
+        committed_partition(cluster.node(leader_id), &b),
+        Some(b_before_rejections),
+        "a refused cross-partition ACK must not mutate B"
+    );
+    assert_eq!(
+        committed_partition(cluster.node(leader_id), &cross_topic),
+        Some(cross_before_rejections),
+        "a refused cross-topic ACK must not mutate the other topic"
+    );
+    assert_eq!(
+        cluster.node(leader_id).applied_state().revision,
+        revision_before_rejections,
+        "a refused ACK consumes no committed revision"
+    );
+
+    // 5. A snapshot transfer preserves both partitions' generation, cursor and sparse ACK.
+    let stopped = cluster
+        .live()
+        .into_iter()
+        .find(|id| *id as u64 != leader)
+        .expect("a follower to stop");
+    cluster.wait_for_log_caught_up(stopped).await;
+    let stopped_index = cluster
+        .node(stopped)
+        .last_applied_index()
+        .await
+        .expect("the follower applied a committed entry");
+    cluster.shutdown(stopped).await;
+
+    cluster
+        .node(leader_id)
+        .trigger_snapshot()
+        .await
+        .expect("force a snapshot");
+    let mut last_index = 0;
+    for request_id in 100..=106 {
+        let response = propose(cluster.node(leader_id), command(request_id, 9)).await;
+        last_index = applied_fields(&response).0;
+    }
+    cluster
+        .node(leader_id)
+        .trigger_snapshot()
+        .await
+        .expect("force a second snapshot");
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut purged = None;
+    let mut snapshot = None;
+    while Instant::now() < deadline {
+        snapshot = cluster.node(leader_id).last_snapshot().await;
+        purged = cluster.node(leader_id).purged_index().await;
+        if let (Some(snapshot), Some(purged)) = (snapshot, purged) {
+            if purged > stopped_index && snapshot.0 >= last_index {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let purged = purged.unwrap_or_else(|| {
+        panic!("the leader did not compact its log, observed snapshot={snapshot:?}")
+    });
+    assert!(
+        purged > stopped_index,
+        "the leader must purge what the stopped voter needs, observed purged={purged} \
+         stopped_index={stopped_index}"
+    );
+
+    let expected_revision = cluster.node(leader_id).applied_state().revision;
+    let expected_a = committed_partition(cluster.node(leader_id), &a).expect("A committed");
+    let expected_b = committed_partition(cluster.node(leader_id), &b).expect("B committed");
+    let expected_cross =
+        committed_partition(cluster.node(leader_id), &cross_topic).expect("cross-topic committed");
+
+    cluster.restart(stopped).await;
+    cluster
+        .node(stopped)
+        .install_authority(Some(ShardAuthority {
+            owner: leader,
+            epoch: EPOCH,
+        }));
+    cluster.wait_for_revision(stopped, expected_revision).await;
+    cluster.wait_for_applied_index(stopped, last_index).await;
+
+    assert_eq!(
+        cluster.node(stopped).applied_state().revision,
+        expected_revision,
+        "the restarted voter restored another revision"
+    );
+    let recovered_a = committed_partition(cluster.node(stopped), &a).expect("A restored");
+    assert_eq!(
+        recovered_a, expected_a,
+        "A's records, generation, cursor and sparse ACKs must survive the snapshot"
+    );
+    assert_eq!(
+        recovered_a.group_generation, 1,
+        "A's generation survived the snapshot"
+    );
+    assert_eq!(recovered_a.groups[&5].cursor, 1, "A's cursor survived");
+    assert_eq!(
+        recovered_a.groups[&5]
+            .sparse_acks
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![2],
+        "A's sparse ACK survived"
+    );
+    let recovered_b = committed_partition(cluster.node(stopped), &b).expect("B restored");
+    assert_eq!(
+        recovered_b, expected_b,
+        "B's records, generation and cursor must survive the snapshot"
+    );
+    assert_eq!(recovered_b.group_generation, 1);
+    assert_eq!(recovered_b.groups[&6].cursor, 1);
+    assert_eq!(
+        committed_partition(cluster.node(stopped), &cross_topic),
+        Some(expected_cross),
+        "the cross-topic partition restored unchanged"
+    );
 
     for id in cluster.live() {
         cluster.shutdown(id).await;
