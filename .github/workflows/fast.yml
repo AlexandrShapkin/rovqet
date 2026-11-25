@@ -107,5 +107,18 @@ jobs:
       - name: Q1 restart, fail-closed history loss and Q2 quorum-loss isolation (C-06 partial)
         run: python3 scripts/test_q1_q2_isolation.py
 
+  c07-fault-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build normal broker and SDK examples
+        run: cargo build -p rovqet-server -p rovqet-sdk --examples --bins --locked
+      - name: Build the metadata Raft voter
+        run: cargo build -p rovqet-metadata-raft --bin metadata-raft-node --locked
+      - name: Cluster fault gate (C-07)
+        run: python3 scripts/test_cluster_fault_gate.py
+
 # Fast checks only. No PR requirement, mandatory human review, release build,
 # long-running soak or full benchmark suite on ordinary main commits.
